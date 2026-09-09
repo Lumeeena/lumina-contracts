@@ -13,8 +13,18 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    Address, Env, Symbol, String, Vec,
+    Address, BytesN, Env, Symbol, String, Vec,
 };
+
+// ─── Version ───────────────────────────────────────────────────────────────
+
+/// Version of the deployed code, returned by [`LuminaRegistry::get_version`].
+///
+/// A Soroban upgrade swaps a contract's code while keeping its address, so an
+/// off-chain caller cannot tell which build it is talking to from the address
+/// alone. Bump this in the same commit as any change to the exported interface
+/// or to the storage shapes below, so indexers and frontends can branch on it.
+pub const CONTRACT_VERSION: u32 = 1;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -31,9 +41,34 @@ pub enum RegistryError {
     /// `Unauthorized`, which also covers calls an admin would have been
     /// allowed to make.
     NotOwner            = 6,
+    /// The registry has no admin because `initialize` was never called.
+    NotInitialized      = 7,
 }
 
 // ─── Types ─────────────────────────────────────────────────────────────────
+//
+// ## Storage compatibility rules
+//
+// `upgrade()` replaces this contract's code but leaves every ledger entry it
+// has already written exactly as it is. The new code therefore has to decode
+// data the *old* code wrote, and the two types below are that wire format. When
+// changing them:
+//
+// - Adding a `DataKey` variant is safe — old entries keep their own keys.
+//   Renaming or repurposing one is not: a `#[contracttype]` enum is encoded by
+//   variant *name*, so a rename orphans every entry stored under the old name.
+// - Adding, removing, renaming or retyping a `ContractEntry` field breaks every
+//   entry already in storage. A `#[contracttype]` struct is encoded as a map
+//   keyed by field name, so a decode of an old entry into a new shape fails
+//   rather than defaulting.
+// - A release that must change `ContractEntry` needs a migration: keep reading
+//   the old shape into an `EntryV1`-style type, write the new shape back, and
+//   do it lazily on first access (or in a batched, admin-gated `migrate()`)
+//   rather than assuming a single transaction can touch every entry.
+// - Bump [`CONTRACT_VERSION`] alongside any such change.
+//
+// `registry-v2/src/lib.rs` re-declares both types independently and reads back
+// storage written by this version — that test is what keeps these rules honest.
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +110,36 @@ impl LuminaRegistry {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::ContractCount, &0u32);
+        Ok(())
+    }
+
+    /// Replace this contract's code with the already-uploaded wasm identified by
+    /// `new_wasm_hash`, keeping the contract's address and all of its storage.
+    ///
+    /// Gated on the same `DataKey::Admin` every other admin-privileged call
+    /// reads, and on `admin.require_auth()` — there is deliberately no separate
+    /// path (no owner override, no "admin unset means anyone") into this
+    /// function. The wasm must already be on the ledger; upload it first.
+    ///
+    /// The new code inherits this contract's storage untouched, so it has to
+    /// stay compatible with the shapes documented on [`DataKey`] and
+    /// [`ContractEntry`]. See `DEPLOY.md` for the live upgrade runbook.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError> {
+        admin.require_auth();
+
+        if admin != Self::read_admin(&env)? {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Published before the invocation ends, while the old code is still the
+        // one running — the swap only takes effect for *subsequent* calls.
+        env.events().publish(
+            (Symbol::new(&env, "registry_upgraded"),),
+            (admin, new_wasm_hash, CONTRACT_VERSION),
+        );
+
         Ok(())
     }
 
@@ -131,8 +196,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != entry.owner && caller != admin {
+        if caller != entry.owner && caller != Self::read_admin(&env)? {
             return Err(RegistryError::Unauthorized);
         }
 
@@ -148,6 +212,19 @@ impl LuminaRegistry {
     }
 
     // ─── View ──────────────────────────────────────────────────────────────
+
+    /// Which build of the registry is live at this address. Callers that need
+    /// to work across an upgrade should branch on this rather than assume the
+    /// interface they were compiled against.
+    pub fn get_version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
+
+    /// The address allowed to `upgrade` (and to `deactivate` /
+    /// `transfer_ownership` on anyone's behalf).
+    pub fn get_admin(env: Env) -> Result<Address, RegistryError> {
+        Self::read_admin(&env)
+    }
 
     pub fn get_contract(env: Env, contract_id: Address) -> Result<ContractEntry, RegistryError> {
         env.storage().persistent()
@@ -253,8 +330,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != entry.owner && caller != admin {
+        if caller != entry.owner && caller != Self::read_admin(&env)? {
             return Err(RegistryError::Unauthorized);
         }
 
@@ -290,6 +366,18 @@ impl LuminaRegistry {
 // Deliberately outside the `#[contractimpl]` block so they stay off the
 // contract's exported interface.
 impl LuminaRegistry {
+    /// The single place `DataKey::Admin` is read, so every admin-gated call
+    /// answers the same question the same way. Returns `NotInitialized` rather
+    /// than panicking when `initialize` was never called — `register_contract`
+    /// does not require initialization, so an uninitialized registry can hold
+    /// entries whose `deactivate`/`transfer_ownership` would otherwise trap.
+    fn read_admin(env: &Env) -> Result<Address, RegistryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)
+    }
+
     /// The `OwnerContracts` index lives in persistent storage (like the
     /// entries themselves) rather than instance storage, since it grows with
     /// the number of owners rather than being a single bounded value.
@@ -309,6 +397,32 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
+
+    // ─── Upgrade-path fixtures ─────────────────────────────────────────────
+    //
+    // The upgrade tests below deploy the registry the way the network does —
+    // from its compiled wasm — because `upgrade()` swaps a *wasm hash*, and a
+    // natively registered `LuminaRegistry` has no wasm to swap. Both artifacts
+    // therefore have to exist before `cargo test` runs, which is why README's
+    // build recipe is `cargo build --target wasm32v1-none --release` and *then*
+    // `cargo test`. If they are missing, `build.rs` says so and the imports
+    // below fail with `No such file or directory (os error 2)`.
+    //
+    // The target has to be `wasm32v1-none`, not `wasm32-unknown-unknown`: the
+    // latter emits the reference-types proposal, which the Soroban host rejects
+    // at module-load time with `Error(WasmVm, InvalidAction)`.
+
+    mod registry_v1_wasm {
+        soroban_sdk::contractimport!(
+            file = "../target/wasm32v1-none/release/lumina_registry.wasm"
+        );
+    }
+
+    mod registry_v2_wasm {
+        soroban_sdk::contractimport!(
+            file = "../target/wasm32v1-none/release/lumina_registry_v2.wasm"
+        );
+    }
 
     fn setup() -> (Env, LuminaRegistryClient<'static>, Address) {
         let env = Env::default();
@@ -834,6 +948,252 @@ mod test {
         }]);
 
         client.transfer_ownership(&owner, &target, &new_owner);
+    }
+
+    // ─── Version / admin views ─────────────────────────────────────────────
+
+    #[test]
+    fn get_version_reports_the_compiled_version() {
+        let (_, client, _admin) = setup();
+        assert_eq!(client.get_version(), CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn get_admin_returns_the_initialized_admin() {
+        let (_, client, admin) = setup();
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn get_admin_before_initialize_reports_not_initialized() {
+        let env = Env::default();
+        let contract_id = env.register(LuminaRegistry, ());
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+
+        assert_eq!(client.try_get_admin(), Err(Ok(RegistryError::NotInitialized)));
+    }
+
+    #[test]
+    fn admin_gated_calls_on_an_uninitialized_registry_error_rather_than_trap() {
+        // `register_contract` never required `initialize`, so entries can exist
+        // with no admin stored. Reading the admin must not trap in that state.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(LuminaRegistry, ());
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        assert_eq!(
+            client.try_deactivate(&stranger, &target),
+            Err(Ok(RegistryError::NotInitialized)),
+        );
+        assert_eq!(
+            client.try_transfer_ownership(&stranger, &target, &new_owner),
+            Err(Ok(RegistryError::NotInitialized)),
+        );
+    }
+
+    // ─── upgrade ───────────────────────────────────────────────────────────
+
+    /// Deploy the registry from its compiled wasm — the only form that can
+    /// actually be upgraded — and initialize it.
+    fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
+        let contract_id = env.register(registry_v1_wasm::WASM, ());
+        let client = registry_v1_wasm::Client::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        (client, admin, contract_id)
+    }
+
+    fn register_via(env: &Env, client: &registry_v1_wasm::Client, owner: &Address) -> Address {
+        let target = Address::generate(env);
+        client.register_contract(
+            owner,
+            &target,
+            &String::from_str(env, "Test Contract"),
+            &String::from_str(env, "A test contract"),
+        );
+        target
+    }
+
+    #[test]
+    fn upgrade_swaps_the_code_and_preserves_every_registration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+
+        let owner = Address::generate(&env);
+        let kept_active = register_via(&env, &v1, &owner);
+        let deactivated = register_via(&env, &v1, &owner);
+        let other_owners = register_via(&env, &v1, &Address::generate(&env));
+        v1.deactivate(&owner, &deactivated);
+
+        assert_eq!(v1.get_version(), CONTRACT_VERSION);
+        assert_eq!(v1.get_contract_count(), 3);
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+
+        // Same address, new code.
+        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
+        assert_eq!(v2.get_version(), 2);
+
+        // Instance storage survived...
+        assert_eq!(v2.get_contract_count(), 3);
+
+        // ...and so did the persistent entries, decoded by independently
+        // declared v2 types.
+        let entry = v2.get_contract(&kept_active);
+        assert_eq!(entry.contract_id, kept_active);
+        assert_eq!(entry.owner, owner);
+        assert_eq!(entry.name, String::from_str(&env, "Test Contract"));
+        assert!(entry.active);
+        assert!(!v2.get_contract(&deactivated).active);
+        assert_ne!(v2.get_contract(&other_owners).owner, owner);
+
+        // The owner index survived too.
+        let owned = v2.get_contracts_by_owner(&owner, &0, &10);
+        assert_eq!(owned.len(), 2);
+
+        // And v2's own new entrypoint — which v1 never exported — works against
+        // the inherited data.
+        assert_eq!(v2.count_active(), 2);
+    }
+
+    #[test]
+    fn upgrade_retires_the_previous_interface() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, _) = deploy_v1(&env);
+        register_via(&env, &v1, &Address::generate(&env));
+
+        assert_eq!(v1.get_active_contracts(&0, &10).len(), 1);
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+
+        // `get_active_contracts` is not part of v2. If the swap were cosmetic
+        // this call would still succeed.
+        assert!(v1.try_get_active_contracts(&0, &10).is_err());
+    }
+
+    #[test]
+    fn upgrade_by_non_admin_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, _admin, contract_id) = deploy_v1(&env);
+        let owner = Address::generate(&env);
+        let target = register_via(&env, &v1, &owner);
+        let stranger = Address::generate(&env);
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        // Neither an unrelated address nor a registered owner may upgrade.
+        assert_eq!(
+            v1.try_upgrade(&stranger, &v2_hash),
+            Err(Ok(registry_v1_wasm::RegistryError::Unauthorized)),
+        );
+        assert_eq!(
+            v1.try_upgrade(&owner, &v2_hash),
+            Err(Ok(registry_v1_wasm::RegistryError::Unauthorized)),
+        );
+
+        // The old code is still live and the registration is untouched.
+        assert_eq!(v1.get_version(), CONTRACT_VERSION);
+        assert_eq!(v1.get_contract(&target).owner, owner);
+        assert!(registry_v2_wasm::Client::new(&env, &contract_id).try_count_active().is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn upgrade_without_the_admins_signature_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, _) = deploy_v1(&env);
+        let stranger = Address::generate(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        // Someone else signs an invocation that names the admin as the caller.
+        // `admin.require_auth()` has to reject it before the address comparison
+        // ever gets a chance to pass.
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &v1.address,
+                fn_name: "upgrade",
+                args: (admin.clone(), v2_hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        v1.upgrade(&admin, &v2_hash);
+    }
+
+    #[test]
+    fn upgrade_with_the_admins_own_signature_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &v1.address,
+                fn_name: "upgrade",
+                args: (admin.clone(), v2_hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        v1.upgrade(&admin, &v2_hash);
+        assert_eq!(registry_v2_wasm::Client::new(&env, &contract_id).get_version(), 2);
+    }
+
+    #[test]
+    fn an_upgraded_registry_can_be_rolled_back() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let owner = Address::generate(&env);
+        let target = register_via(&env, &v1, &owner);
+
+        let v1_hash = env.deployer().upload_contract_wasm(registry_v1_wasm::WASM);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        v1.upgrade(&admin, &v2_hash);
+        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
+        assert_eq!(v2.get_version(), 2);
+
+        // Rolling back is just another upgrade, to the previous wasm hash —
+        // which is why DEPLOY.md tells you to keep the old hash around.
+        v2.upgrade(&admin, &v1_hash);
+
+        assert_eq!(v1.get_version(), CONTRACT_VERSION);
+        assert_eq!(v1.get_contract(&target).owner, owner);
+        assert_eq!(v1.get_active_contracts(&0, &10).len(), 1);
+    }
+
+    #[test]
+    fn upgrade_carries_the_admin_across_the_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        v1.upgrade(&admin, &v2_hash);
+        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
+
+        // The upgraded code reads the same `DataKey::Admin`, so the original
+        // admin — and only it — can upgrade again.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            v2.try_upgrade(&stranger, &v2_hash),
+            Err(Ok(registry_v2_wasm::RegistryError::Unauthorized)),
+        );
+        v2.upgrade(&admin, &v2_hash);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["registry"]
+members = ["registry", "registry-v2"]
 resolver = "2"
 
 [workspace.dependencies]
