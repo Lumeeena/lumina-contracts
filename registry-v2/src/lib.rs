@@ -31,9 +31,11 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
 };
 
-/// Mirrors `lumina_registry::CONTRACT_VERSION`, bumped — the value the upgrade
-/// test reads back to confirm the new code is the one now executing.
-pub const CONTRACT_VERSION: u32 = 2;
+/// Always `lumina_registry::CONTRACT_VERSION + 1` — the value the upgrade test
+/// reads back to confirm the new code is the one now executing. The tests
+/// assert the relationship rather than the literal, so bumping the registry's
+/// version means bumping this one too, and nothing else.
+pub const CONTRACT_VERSION: u32 = 3;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]

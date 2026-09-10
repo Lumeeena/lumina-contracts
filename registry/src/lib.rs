@@ -30,7 +30,7 @@
 //!    be superseded by a new proposal for the same action or simply ignored.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror,
+    contract, contractimpl, contracttype, contracterror, token,
     Address, BytesN, Env, Symbol, String, Vec,
 };
 
@@ -40,7 +40,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -54,6 +54,23 @@ pub const TIMELOCK_LEDGERS: u32 = 17_280;
 
 #[cfg(test)]
 pub const TIMELOCK_LEDGERS: u32 = 10;
+
+/// How long a registration's *remaining* stake stays locked after a slash.
+///
+/// This is what "good standing" means for [`LuminaRegistry::withdraw_stake`]:
+/// a slash is evidence that something is wrong, and letting the owner pull the
+/// rest of their collateral out in the next ledger would make the first slash
+/// the only one governance ever lands. The window is deliberately the same
+/// ~24 h as [`TIMELOCK_LEDGERS`], which is exactly how long it takes to get a
+/// follow-up slash proposal through the timelock.
+///
+/// As with the timelock, tests use a small value so the ledger can be advanced
+/// past it without archiving instance storage.
+#[cfg(not(test))]
+pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
+
+#[cfg(test)]
+pub const SLASH_LOCK_LEDGERS: u32 = 10;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -85,6 +102,16 @@ pub enum RegistryError {
     InvalidThreshold    = 13,
     /// The proposal has already been executed.
     AlreadyExecuted     = 14,
+    /// No stake token / treasury has been set, so staking is not open yet.
+    StakingNotConfigured = 15,
+    /// A stake or slash amount was zero or negative.
+    InvalidAmount       = 16,
+    /// The registration's staked balance is smaller than the requested amount.
+    InsufficientStake   = 17,
+    /// The stake is still inside the post-slash lock window.
+    StakeLocked         = 18,
+    /// The registration is still active — deactivate before withdrawing.
+    RegistrationActive  = 19,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -121,6 +148,53 @@ pub struct ContractEntry {
     pub active: bool,
 }
 
+// ─── Reputation types ──────────────────────────────────────────────────────
+//
+// Reputation is stored *beside* `ContractEntry`, never inside it. Adding
+// fields to `ContractEntry` would break every entry already written by v1 —
+// see the upgrade-compatibility rules above — and would force a migration on
+// the live testnet deployment for what is, from storage's point of view,
+// purely additive data. New `DataKey` variants cost nothing and are safe.
+//
+// [`ContractProfile`] is what closes the gap for callers: it joins the entry
+// and its reputation at read time, so a consumer that wants both gets both in
+// one call without the stored shape ever changing.
+
+/// One slash levied against a registration, kept forever so the reason stays
+/// auditable after the fact.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlashRecord {
+    /// How much stake was taken.
+    pub amount: i128,
+    /// Why governance slashed — recorded on-chain for accountability.
+    pub reason: String,
+    /// Ledger at which the slash executed.
+    pub slashed_at: u32,
+}
+
+/// The reputation signal attached to a registration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reputation {
+    /// Currently staked, withdrawable balance.
+    pub stake: i128,
+    /// Whether governance has attested this registration.
+    pub verified: bool,
+    /// Lifetime total slashed, which unlike `stake` never goes down.
+    pub slashed_total: i128,
+    /// Ledger before which `withdraw_stake` is refused. Zero once clear.
+    pub withdraw_locked_until: u32,
+}
+
+/// A registration joined with its reputation — what a discovery client wants.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractProfile {
+    pub entry: ContractEntry,
+    pub reputation: Reputation,
+}
+
 // ─── Proposal types ────────────────────────────────────────────────────────
 
 /// The action a governance proposal will execute once it clears threshold and
@@ -138,6 +212,12 @@ pub enum ProposalAction {
     RemoveAdmin(Address),
     /// Change the approval threshold.
     ChangeThreshold(u32),
+    /// Point staking at a token and a treasury: `(stake_token, treasury)`.
+    ConfigureStaking(Address, Address),
+    /// Attest (or revoke) verified status for a registration.
+    SetVerified(Address, bool),
+    /// Take `(contract_id, amount, reason)` of a registration's stake.
+    Slash(Address, i128, String),
 }
 
 /// State stored for every open (or executed) proposal.
@@ -176,6 +256,20 @@ pub enum DataKey {
     Contract(Address),
     OwnerContracts(Address), // owner → Vec<Address>
     AllContracts,            // insertion-ordered Vec<Address> of every registered contract
+
+    // ── Staking & reputation ────────────────────────────────────────────────
+    /// Address — the SEP-41 token stakes are denominated in.
+    StakeToken,
+    /// Address — where slashed stake is sent.
+    Treasury,
+    /// i128 — currently staked balance for a registration.
+    Stake(Address),
+    /// bool — governance-attested verified status.
+    Verified(Address),
+    /// Vec<SlashRecord> — every slash ever levied, oldest first.
+    Slashes(Address),
+    /// u32 — ledger before which `withdraw_stake` is refused.
+    WithdrawLockedUntil(Address),
 
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 initialize.  Retained so
@@ -347,6 +441,105 @@ impl LuminaRegistry {
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (proposal_id, proposer, Symbol::new(&env, "upgrade"), new_wasm_hash),
+        );
+
+        Ok(proposal_id)
+    }
+
+    /// Propose pointing staking at `token`, with slashed stake going to
+    /// `treasury`.
+    ///
+    /// Deliberately a proposal rather than a setter on `initialize`: whoever
+    /// sets the treasury decides where every future slash lands, and the live
+    /// registry was already initialized under the old signature — routing this
+    /// through governance lets a deployed registry adopt staking after an
+    /// upgrade instead of needing to be redeployed.
+    pub fn propose_configure_staking(
+        env: Env,
+        proposer: Address,
+        token: Address,
+        treasury: Address,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::ConfigureStaking(token.clone(), treasury.clone()),
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "configure_staking"), token),
+        );
+
+        Ok(proposal_id)
+    }
+
+    /// Propose attesting — or revoking — verified status for a registration.
+    ///
+    /// There is no non-governance path to this: a registrant cannot mark
+    /// themselves verified, which is the whole point of the signal.
+    pub fn propose_set_verified(
+        env: Env,
+        proposer: Address,
+        contract_id: Address,
+        verified: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+
+        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetVerified(contract_id.clone(), verified),
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_verified"), contract_id),
+        );
+
+        Ok(proposal_id)
+    }
+
+    /// Propose slashing `amount` of a registration's stake, with a reason that
+    /// is recorded on-chain.
+    ///
+    /// Validated here as well as at execution time so an obviously bad
+    /// proposal (unknown contract, non-positive amount) fails at proposal time
+    /// rather than sitting through the timelock only to revert.
+    pub fn propose_slash(
+        env: Env,
+        proposer: Address,
+        contract_id: Address,
+        amount: i128,
+        reason: String,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+
+        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::Slash(contract_id.clone(), amount, reason.clone()),
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "slash"), (contract_id, amount, reason)),
         );
 
         Ok(proposal_id)
@@ -546,6 +739,117 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    // ── Staking ─────────────────────────────────────────────────────────────
+
+    /// Post collateral against a registration you own.
+    ///
+    /// Staking is a separate call rather than a `register_contract` parameter
+    /// on purpose: registration stays free and permissionless (anyone can list
+    /// a contract for indexing), and stake is the *optional* signal layered on
+    /// top. It also means the registrations that already exist can acquire a
+    /// stake without re-registering.
+    ///
+    /// Additive — calling it again tops the stake up.
+    pub fn stake(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        amount: i128,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let (token_id, _) = Self::staking_config(&env)?;
+
+        // Moves real tokens into the registry's own balance. `owner` has
+        // already authorized this invocation, and the token's own
+        // `from.require_auth()` runs as a sub-invocation of it.
+        token::Client::new(&env, &token_id).transfer(
+            &owner,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let staked = Self::stake_of(&env, &contract_id) + amount;
+        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &staked);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_deposited"),),
+            (contract_id, owner, amount, staked),
+        );
+
+        Ok(())
+    }
+
+    /// Reclaim the full remaining stake for a registration.
+    ///
+    /// "Good standing" is three conditions, all checked here:
+    ///
+    /// 1. the caller is the registered owner;
+    /// 2. the registration is **deactivated** — you get your collateral back
+    ///    by leaving, not while still listed and benefiting from the stake;
+    /// 3. no slash has landed within the last [`SLASH_LOCK_LEDGERS`] ledgers,
+    ///    so an owner cannot front-run governance by emptying the stake as
+    ///    soon as the first slash reveals it is being watched.
+    ///
+    /// Returns the amount returned to the owner.
+    pub fn withdraw_stake(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+    ) -> Result<i128, RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+        if entry.active {
+            return Err(RegistryError::RegistrationActive);
+        }
+        if env.ledger().sequence() < Self::withdraw_locked_until(&env, &contract_id) {
+            return Err(RegistryError::StakeLocked);
+        }
+
+        let staked = Self::stake_of(&env, &contract_id);
+        if staked <= 0 {
+            return Err(RegistryError::InsufficientStake);
+        }
+
+        let (token_id, _) = Self::staking_config(&env)?;
+
+        // The registry is the `from` here, and a contract authorizes moving
+        // its own balance by virtue of being the invoker.
+        token::Client::new(&env, &token_id).transfer(
+            &env.current_contract_address(),
+            &owner,
+            &staked,
+        );
+
+        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &0i128);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_withdrawn"),),
+            (contract_id, owner, staked),
+        );
+
+        Ok(staked)
+    }
+
     // ─── View ──────────────────────────────────────────────────────────────
 
     /// Which build of the registry is live at this address.
@@ -587,6 +891,75 @@ impl LuminaRegistry {
     /// Retrieve a proposal by ID.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError> {
         Self::load_proposal(&env, proposal_id)
+    }
+
+    /// `(stake_token, treasury)`, or `StakingNotConfigured` if governance has
+    /// not opened staking yet.
+    pub fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError> {
+        Self::staking_config(&env)
+    }
+
+    /// Currently staked balance. Zero for a registration that never staked.
+    pub fn get_stake(env: Env, contract_id: Address) -> i128 {
+        Self::stake_of(&env, &contract_id)
+    }
+
+    /// Whether governance has attested this registration.
+    pub fn is_verified(env: Env, contract_id: Address) -> bool {
+        env.storage().persistent()
+            .get(&DataKey::Verified(contract_id))
+            .unwrap_or(false)
+    }
+
+    /// Every slash levied against a registration, oldest first.
+    pub fn get_slashes(env: Env, contract_id: Address) -> Vec<SlashRecord> {
+        Self::slash_history(&env, &contract_id)
+    }
+
+    /// The full reputation signal for a registration. Returns zeroed values
+    /// rather than erroring for an unregistered address, mirroring
+    /// `is_registered`'s tolerance.
+    pub fn get_reputation(env: Env, contract_id: Address) -> Reputation {
+        Self::reputation_of(&env, &contract_id)
+    }
+
+    /// A registration joined with its reputation — one call instead of a
+    /// `get_contract` plus a `get_reputation`.
+    pub fn get_contract_profile(
+        env: Env,
+        contract_id: Address,
+    ) -> Result<ContractProfile, RegistryError> {
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        Ok(ContractProfile {
+            reputation: Self::reputation_of(&env, &contract_id),
+            entry,
+        })
+    }
+
+    /// `get_active_contracts`, with each entry's reputation attached. Same
+    /// offset/limit and active-filtering semantics.
+    pub fn get_active_profiles(env: Env, offset: u32, limit: u32) -> Vec<ContractProfile> {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut result = Vec::new(&env);
+
+        let mut i = offset;
+        while i < all.len() && result.len() < limit {
+            let contract_id = all.get(i).unwrap();
+            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                if entry.active {
+                    result.push_back(ContractProfile {
+                        reputation: Self::reputation_of(&env, &contract_id),
+                        entry,
+                    });
+                }
+            }
+            i += 1;
+        }
+
+        result
     }
 
     pub fn get_contract(env: Env, contract_id: Address) -> Result<ContractEntry, RegistryError> {
@@ -858,8 +1231,116 @@ impl LuminaRegistry {
                     (*new_threshold,),
                 );
             }
+            ProposalAction::ConfigureStaking(token_id, treasury) => {
+                env.storage().instance().set(&DataKey::StakeToken, token_id);
+                env.storage().instance().set(&DataKey::Treasury, treasury);
+                env.events().publish(
+                    (Symbol::new(env, "staking_configured"),),
+                    (token_id.clone(), treasury.clone()),
+                );
+            }
+            ProposalAction::SetVerified(contract_id, verified) => {
+                if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+                    return Err(RegistryError::ContractNotFound);
+                }
+                env.storage().persistent()
+                    .set(&DataKey::Verified(contract_id.clone()), verified);
+                env.events().publish(
+                    (Symbol::new(env, "verification_set"),),
+                    (contract_id.clone(), *verified),
+                );
+            }
+            ProposalAction::Slash(contract_id, amount, reason) => {
+                if *amount <= 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+
+                let staked = Self::stake_of(env, contract_id);
+                if staked < *amount {
+                    return Err(RegistryError::InsufficientStake);
+                }
+
+                let (token_id, treasury) = Self::staking_config(env)?;
+
+                token::Client::new(env, &token_id).transfer(
+                    &env.current_contract_address(),
+                    &treasury,
+                    amount,
+                );
+
+                env.storage().persistent()
+                    .set(&DataKey::Stake(contract_id.clone()), &(staked - *amount));
+
+                let slashed_at = env.ledger().sequence();
+                let mut history = Self::slash_history(env, contract_id);
+                history.push_back(SlashRecord {
+                    amount: *amount,
+                    reason: reason.clone(),
+                    slashed_at,
+                });
+                env.storage().persistent()
+                    .set(&DataKey::Slashes(contract_id.clone()), &history);
+
+                // Freeze what is left, so the owner cannot empty the stake
+                // before a second slash can clear the timelock.
+                env.storage().persistent().set(
+                    &DataKey::WithdrawLockedUntil(contract_id.clone()),
+                    &(slashed_at + SLASH_LOCK_LEDGERS),
+                );
+
+                env.events().publish(
+                    (Symbol::new(env, "stake_slashed"),),
+                    (contract_id.clone(), *amount, reason.clone(), treasury),
+                );
+            }
         }
         Ok(())
+    }
+
+    /// `(stake_token, treasury)`, or `StakingNotConfigured` if the
+    /// `ConfigureStaking` proposal has never been executed.
+    fn staking_config(env: &Env) -> Result<(Address, Address), RegistryError> {
+        let token_id: Address = env.storage().instance()
+            .get(&DataKey::StakeToken)
+            .ok_or(RegistryError::StakingNotConfigured)?;
+        let treasury: Address = env.storage().instance()
+            .get(&DataKey::Treasury)
+            .ok_or(RegistryError::StakingNotConfigured)?;
+        Ok((token_id, treasury))
+    }
+
+    fn stake_of(env: &Env, contract_id: &Address) -> i128 {
+        env.storage().persistent()
+            .get(&DataKey::Stake(contract_id.clone()))
+            .unwrap_or(0)
+    }
+
+    fn slash_history(env: &Env, contract_id: &Address) -> Vec<SlashRecord> {
+        env.storage().persistent()
+            .get(&DataKey::Slashes(contract_id.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn withdraw_locked_until(env: &Env, contract_id: &Address) -> u32 {
+        env.storage().persistent()
+            .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
+            .unwrap_or(0)
+    }
+
+    fn reputation_of(env: &Env, contract_id: &Address) -> Reputation {
+        let mut slashed_total: i128 = 0;
+        for record in Self::slash_history(env, contract_id).iter() {
+            slashed_total += record.amount;
+        }
+
+        Reputation {
+            stake: Self::stake_of(env, contract_id),
+            verified: env.storage().persistent()
+                .get(&DataKey::Verified(contract_id.clone()))
+                .unwrap_or(false),
+            slashed_total,
+            withdraw_locked_until: Self::withdraw_locked_until(env, contract_id),
+        }
     }
 
     fn owner_index(env: &Env, owner: &Address) -> Vec<Address> {
@@ -1527,14 +2008,14 @@ mod test {
         let other_owner = register_via(&env, &v1, &Address::generate(&env));
         v1.deactivate(&owner, &deactivated);
 
-        assert_eq!(v1.get_version(), 1);
+        assert_eq!(v1.get_version(), CONTRACT_VERSION);
         assert_eq!(v1.get_contract_count(), 3);
 
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
         v1.upgrade(&admin, &v2_hash);
 
         let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
-        assert_eq!(v2.get_version(), 2);
+        assert_eq!(v2.get_version(), CONTRACT_VERSION + 1);
         assert_eq!(v2.get_contract_count(), 3);
 
         let entry = v2.get_contract(&kept_active);
@@ -1612,7 +2093,7 @@ mod test {
             },
         }]);
         v1.upgrade(&admin, &v2_hash);
-        assert_eq!(registry_v2_wasm::Client::new(&env, &contract_id).get_version(), 2);
+        assert_eq!(registry_v2_wasm::Client::new(&env, &contract_id).get_version(), CONTRACT_VERSION + 1);
     }
 
     #[test]
@@ -1628,7 +2109,7 @@ mod test {
 
         v1.upgrade(&admin, &v2_hash);
         let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
-        assert_eq!(v2.get_version(), 2);
+        assert_eq!(v2.get_version(), CONTRACT_VERSION + 1);
 
         v2.upgrade(&admin, &v1_hash);
         assert_eq!(v1.get_version(), CONTRACT_VERSION);
@@ -1772,5 +2253,561 @@ mod test {
             },
         }]);
         client.update_metadata(&owner, &target, &name, &desc);
+    }
+
+    // ── Staking, verification & slashing ────────────────────────────────────
+
+    /// A registry with a live Stellar Asset Contract as its stake token and
+    /// staking already opened through governance.
+    ///
+    /// Returns `(env, client, admin, token_id, treasury)`.
+    fn setup_staking() -> (Env, LuminaRegistryClient<'static>, Address, Address, Address) {
+        let (env, client, admin) = setup();
+
+        let issuer = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(issuer).address();
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        (env, client, admin, token_id, treasury)
+    }
+
+    /// Drive a proposal through the 1-of-1 governance flow: approve, wait out
+    /// the timelock, execute.
+    fn pass_proposal(env: &Env, client: &LuminaRegistryClient, admin: &Address, pid: u32) {
+        client.approve_proposal(admin, &pid);
+        advance_ledger(env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+    }
+
+    fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token_id).mint(to, &amount);
+    }
+
+    fn balance(env: &Env, token_id: &Address, of: &Address) -> i128 {
+        token::Client::new(env, token_id).balance(of)
+    }
+
+    /// Register a contract and stake `amount` against it.
+    fn register_and_stake(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        token_id: &Address,
+        amount: i128,
+    ) -> (Address, Address) {
+        let (owner, target) = register_sample(env, client);
+        mint(env, token_id, &owner, amount);
+        client.stake(&owner, &target, &amount);
+        (owner, target)
+    }
+
+    // ── Configuration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn staking_is_closed_until_governance_opens_it() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+
+        assert_eq!(
+            client.try_get_staking_config(),
+            Err(Ok(RegistryError::StakingNotConfigured)),
+        );
+        assert_eq!(
+            client.try_stake(&owner, &target, &100),
+            Err(Ok(RegistryError::StakingNotConfigured)),
+        );
+    }
+
+    #[test]
+    fn configure_staking_records_token_and_treasury() {
+        let (_env, client, _admin, token_id, treasury) = setup_staking();
+        assert_eq!(client.get_staking_config(), (token_id, treasury));
+    }
+
+    #[test]
+    fn configure_staking_cannot_be_proposed_by_a_non_admin() {
+        let (env, client, _admin) = setup();
+        let stranger = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+
+        assert_eq!(
+            client.try_propose_configure_staking(&stranger, &token_id, &stranger),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+    }
+
+    // ── Staking ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stake_moves_real_tokens_into_the_registry() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
+
+        client.stake(&owner, &target, &400);
+
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(balance(&env, &token_id, &owner), 600);
+        assert_eq!(balance(&env, &token_id, &client.address), 400);
+    }
+
+    #[test]
+    fn stake_tops_up_an_existing_stake() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 300);
+
+        mint(&env, &token_id, &owner, 200);
+        client.stake(&owner, &target, &200);
+
+        assert_eq!(client.get_stake(&target), 500);
+        assert_eq!(balance(&env, &token_id, &client.address), 500);
+    }
+
+    #[test]
+    fn stake_rejects_a_caller_who_is_not_the_owner() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        mint(&env, &token_id, &stranger, 500);
+
+        assert_eq!(
+            client.try_stake(&stranger, &target, &100),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        assert_eq!(client.get_stake(&target), 0);
+    }
+
+    #[test]
+    fn stake_rejects_non_positive_amounts() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 500);
+
+        assert_eq!(
+            client.try_stake(&owner, &target, &0),
+            Err(Ok(RegistryError::InvalidAmount)),
+        );
+        assert_eq!(
+            client.try_stake(&owner, &target, &-100),
+            Err(Ok(RegistryError::InvalidAmount)),
+        );
+    }
+
+    #[test]
+    fn stake_rejects_an_unregistered_contract() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+        mint(&env, &token_id, &owner, 500);
+
+        assert_eq!(
+            client.try_stake(&owner, &unregistered, &100),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    // ── Verification ────────────────────────────────────────────────────────
+
+    #[test]
+    fn verification_is_unset_by_default() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+        assert!(!client.is_verified(&target));
+    }
+
+    #[test]
+    fn governance_can_attest_and_later_revoke_verification() {
+        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.is_verified(&target));
+
+        let pid = client.propose_set_verified(&admin, &target, &false);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(!client.is_verified(&target));
+    }
+
+    #[test]
+    fn a_registrant_cannot_verify_their_own_contract() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+
+        // The owner is not an admin, and there is no non-governance path to
+        // verified status at all — this is the entire value of the signal.
+        assert_eq!(
+            client.try_propose_set_verified(&owner, &target, &true),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+        assert!(!client.is_verified(&target));
+    }
+
+    #[test]
+    fn verification_cannot_be_proposed_for_an_unregistered_contract() {
+        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_set_verified(&admin, &unregistered, &true),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn verification_survives_the_timelock_without_early_effect() {
+        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        client.approve_proposal(&admin, &pid);
+
+        // Approved but not executed: the attestation must not be live yet.
+        assert!(!client.is_verified(&target));
+
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+        assert!(client.is_verified(&target));
+    }
+
+    // ── Slashing ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn slash_moves_stake_to_the_treasury_and_records_the_reason() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "indexed a phishing contract");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        assert_eq!(client.get_stake(&target), 600);
+        assert_eq!(balance(&env, &token_id, &treasury), 400);
+        assert_eq!(balance(&env, &token_id, &client.address), 600);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 1);
+        let record = slashes.get(0).unwrap();
+        assert_eq!(record.amount, 400);
+        assert_eq!(record.reason, reason);
+    }
+
+    #[test]
+    fn repeated_slashes_accumulate_in_the_history() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let first = String::from_str(&env, "first offence");
+        let pid = client.propose_slash(&admin, &target, &200, &first);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let second = String::from_str(&env, "second offence");
+        let pid = client.propose_slash(&admin, &target, &300, &second);
+        pass_proposal(&env, &client, &admin, pid);
+
+        assert_eq!(client.get_stake(&target), 500);
+        assert_eq!(balance(&env, &token_id, &treasury), 500);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 2);
+        assert_eq!(slashes.get(0).unwrap().reason, first);
+        assert_eq!(slashes.get(1).unwrap().reason, second);
+        assert_eq!(client.get_reputation(&target).slashed_total, 500);
+    }
+
+    #[test]
+    fn slash_cannot_exceed_the_staked_balance() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        let reason = String::from_str(&env, "over-slash");
+        let pid = client.propose_slash(&admin, &target, &500, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        // The proposal passes governance but reverts on execution rather than
+        // taking tokens the registry is not holding for this registration.
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::InsufficientStake)),
+        );
+        assert_eq!(client.get_stake(&target), 100);
+        assert_eq!(balance(&env, &token_id, &treasury), 0);
+    }
+
+    #[test]
+    fn slashing_a_registration_with_no_stake_is_rejected() {
+        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let reason = String::from_str(&env, "nothing at stake");
+        let pid = client.propose_slash(&admin, &target, &1, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::InsufficientStake)),
+        );
+    }
+
+    #[test]
+    fn slash_cannot_be_proposed_for_an_unregistered_contract() {
+        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+        let reason = String::from_str(&env, "unknown");
+
+        assert_eq!(
+            client.try_propose_slash(&admin, &unregistered, &100, &reason),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn slash_cannot_be_proposed_for_a_non_positive_amount() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+        let reason = String::from_str(&env, "zero");
+
+        assert_eq!(
+            client.try_propose_slash(&admin, &target, &0, &reason),
+            Err(Ok(RegistryError::InvalidAmount)),
+        );
+    }
+
+    #[test]
+    fn slash_cannot_be_proposed_by_a_non_admin() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 100);
+        let reason = String::from_str(&env, "self-serving");
+
+        assert_eq!(
+            client.try_propose_slash(&owner, &target, &50, &reason),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+    }
+
+    // ── Withdrawal ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn withdraw_returns_the_full_stake_once_the_owner_has_deactivated() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 750);
+
+        client.deactivate(&owner, &target);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(balance(&env, &token_id, &owner), 750);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+    }
+
+    #[test]
+    fn withdraw_is_refused_while_the_registration_is_still_active() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        // Still listed and still benefiting from the stake.
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::RegistrationActive)),
+        );
+        assert_eq!(client.get_stake(&target), 500);
+    }
+
+    #[test]
+    fn withdraw_is_refused_for_anyone_but_the_owner() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+        let stranger = Address::generate(&env);
+        client.deactivate(&owner, &target);
+
+        assert_eq!(
+            client.try_withdraw_stake(&stranger, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        assert_eq!(client.get_stake(&target), 500);
+    }
+
+    #[test]
+    fn withdraw_is_refused_when_there_is_nothing_staked() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        client.deactivate(&owner, &target);
+
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::InsufficientStake)),
+        );
+    }
+
+    #[test]
+    fn withdraw_is_frozen_while_a_slash_is_still_recent() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "under investigation");
+        let pid = client.propose_slash(&admin, &target, &200, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        client.deactivate(&owner, &target);
+
+        // Deactivated and owned by the caller, but the slash lock is what
+        // stops the owner emptying the remainder before a second slash can
+        // clear its own timelock.
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+        assert_eq!(client.get_stake(&target), 800);
+    }
+
+    #[test]
+    fn withdraw_reopens_once_the_slash_lock_elapses() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "under investigation");
+        let pid = client.propose_slash(&admin, &target, &200, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+        client.deactivate(&owner, &target);
+
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+
+        // Only what survived the slash comes back.
+        assert_eq!(client.withdraw_stake(&owner, &target), 800);
+        assert_eq!(balance(&env, &token_id, &owner), 800);
+        assert_eq!(client.get_stake(&target), 0);
+    }
+
+    // ── Reputation views ────────────────────────────────────────────────────
+
+    #[test]
+    fn reputation_of_an_untouched_registration_is_all_zeroes() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let reputation = client.get_reputation(&target);
+        assert_eq!(reputation.stake, 0);
+        assert!(!reputation.verified);
+        assert_eq!(reputation.slashed_total, 0);
+        assert_eq!(reputation.withdraw_locked_until, 0);
+    }
+
+    #[test]
+    fn contract_profile_joins_the_entry_with_its_reputation() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 600);
+
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.entry.contract_id, target);
+        assert_eq!(profile.entry.owner, owner);
+        assert!(profile.entry.active);
+        assert_eq!(profile.reputation.stake, 600);
+        assert!(profile.reputation.verified);
+    }
+
+    #[test]
+    fn contract_profile_rejects_an_unregistered_contract() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_get_contract_profile(&unregistered),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn active_profiles_track_active_contracts_and_carry_reputation() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_o1, staked) = register_and_stake(&env, &client, &token_id, 250);
+        let (owner2, plain) = register_sample(&env, &client);
+
+        let profiles = client.get_active_profiles(&0, &10);
+        assert_eq!(profiles.len(), client.get_active_contracts(&0, &10).len());
+        assert_eq!(profiles.len(), 2);
+
+        let with_stake = profiles.iter().find(|p| p.entry.contract_id == staked).unwrap();
+        assert_eq!(with_stake.reputation.stake, 250);
+        let without = profiles.iter().find(|p| p.entry.contract_id == plain).unwrap();
+        assert_eq!(without.reputation.stake, 0);
+
+        // Deactivation drops it from the profile listing exactly as it does
+        // from the plain listing.
+        client.deactivate(&owner2, &plain);
+        assert_eq!(client.get_active_profiles(&0, &10).len(), 1);
+    }
+
+    #[test]
+    fn active_profiles_paginate_like_active_contracts() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        for _ in 0..5 {
+            register_sample(&env, &client);
+        }
+
+        assert_eq!(client.get_active_profiles(&0, &2).len(), 2);
+        assert_eq!(client.get_active_profiles(&2, &2).len(), 2);
+        assert_eq!(client.get_active_profiles(&4, &2).len(), 1);
+        assert_eq!(client.get_active_profiles(&5, &2).len(), 0);
+        assert_eq!(client.get_active_profiles(&99, &2).len(), 0);
+    }
+
+    // ── End-to-end lifecycle ────────────────────────────────────────────────
+
+    #[test]
+    fn full_stake_verify_slash_withdraw_lifecycle() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+
+        // Register and post collateral.
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
+        client.stake(&owner, &target, &1_000);
+        assert_eq!(client.get_reputation(&target).stake, 1_000);
+
+        // Governance attests the project.
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.get_contract_profile(&target).reputation.verified);
+
+        // The project misbehaves and governance slashes a quarter of the stake.
+        let reason = String::from_str(&env, "misreported contract metadata");
+        let pid = client.propose_slash(&admin, &target, &250, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let reputation = client.get_reputation(&target);
+        assert_eq!(reputation.stake, 750);
+        assert_eq!(reputation.slashed_total, 250);
+        assert!(reputation.withdraw_locked_until > env.ledger().sequence());
+        assert_eq!(balance(&env, &token_id, &treasury), 250);
+
+        // Trying to exit immediately fails on both counts, in order: still
+        // listed first, then still locked.
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::RegistrationActive)),
+        );
+        client.deactivate(&owner, &target);
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+
+        // Once the lock expires the remainder — and only the remainder —
+        // comes back.
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(balance(&env, &token_id, &owner), 750);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+
+        // The slash record outlives the stake it was taken from.
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_eq!(client.get_reputation(&target).slashed_total, 250);
+        assert_eq!(client.get_reputation(&target).stake, 0);
     }
 }
