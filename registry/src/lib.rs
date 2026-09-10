@@ -40,7 +40,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -112,6 +112,8 @@ pub enum RegistryError {
     StakeLocked         = 18,
     /// The registration is still active — deactivate before withdrawing.
     RegistrationActive  = 19,
+    /// A registration must declare at least one category.
+    NoCategories        = 20,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -146,6 +148,48 @@ pub struct ContractEntry {
     pub registered_at: u32,
     /// Whether indexing is currently active for this contract.
     pub active: bool,
+}
+
+// ─── Category taxonomy ─────────────────────────────────────────────────────
+//
+// ## Why a fixed enum rather than free-form `Vec<Symbol>` tags
+//
+// Tags are more flexible, and that is exactly the problem. The point of
+// categories here is *browsing* — "show me the DeFi contracts" — and free-form
+// tags fragment that immediately: `DeFi`, `defi`, `De-Fi` and `Defi` become
+// four categories that each hold a slice of the answer, with no way for a
+// client to know they are the same thing. A discovery surface needs a shared
+// vocabulary more than it needs expressiveness.
+//
+// A fixed enum also keeps `DataKey::ByCategory` a bounded key space, so the
+// number of index entries is a property of the contract rather than of what
+// registrants happen to type.
+//
+// The cost is that adding a category needs a contract upgrade. That was a real
+// objection before the registry became upgradeable; now it is a normal release
+// (see `DEPLOY.md`), and adding a variant is safe under the storage rules above
+// because `#[contracttype]` enums encode by variant *name* — existing entries
+// keep decoding as long as current variants are neither renamed nor
+// repurposed. [`Category::Other`] is the escape hatch in the meantime, so
+// nothing is unclassifiable while waiting for that release.
+
+/// The category vocabulary a registration can be browsed under.
+///
+/// Append new variants at the end and never rename or repurpose an existing
+/// one — see the storage rules above.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Category {
+    DeFi,
+    Nft,
+    Gaming,
+    Identity,
+    Infrastructure,
+    Payments,
+    Oracle,
+    Dao,
+    /// Anything the vocabulary does not cover yet.
+    Other,
 }
 
 // ─── Reputation types ──────────────────────────────────────────────────────
@@ -270,6 +314,16 @@ pub enum DataKey {
     Slashes(Address),
     /// u32 — ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),
+
+    // ── Category taxonomy ───────────────────────────────────────────────────
+    /// Vec<Category> — the categories a registration declared, deduplicated.
+    Categories(Address),
+    /// Vec<Address> — insertion-ordered registrations in one category.
+    ///
+    /// Persistent rather than instance, following `OwnerContracts`: these grow
+    /// with the number of registrations, and instance storage is a single
+    /// bounded entry shared by everything in it.
+    ByCategory(Category),
 
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 initialize.  Retained so
@@ -696,18 +750,25 @@ impl LuminaRegistry {
 
     /// Register a Soroban contract for Lumina indexing.
     /// Anyone can register — the owner must authorize the call.
+    ///
+    /// `categories` must name at least one [`Category`]; duplicates are
+    /// collapsed, so passing the same category twice indexes it once. Use
+    /// [`Category::Other`] if none of the vocabulary fits.
     pub fn register_contract(
         env: Env,
         owner: Address,
         contract_id: Address,
         name: String,
         description: String,
+        categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
         if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::AlreadyRegistered);
         }
+
+        let categories = Self::dedup_categories(&env, &categories)?;
 
         let entry = ContractEntry {
             contract_id: contract_id.clone(),
@@ -731,9 +792,61 @@ impl LuminaRegistry {
         let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
         env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
 
+        Self::index_categories(&env, &contract_id, &categories);
+
         env.events().publish(
             (Symbol::new(&env, "contract_registered"),),
-            (contract_id, owner, name),
+            (contract_id, owner, name, categories),
+        );
+
+        Ok(())
+    }
+
+    /// Re-declare which categories a registration is browsable under.
+    ///
+    /// Only the registered owner — the same authority as `update_metadata`,
+    /// for the same reason: how a project files itself is metadata, not
+    /// something the admin set has a say in.
+    ///
+    /// This is also the migration path for registrations made before the
+    /// taxonomy existed. Those have no categories and so appear in no category
+    /// listing; their owners can classify them without re-registering.
+    pub fn set_categories(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        categories: Vec<Category>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let categories = Self::dedup_categories(&env, &categories)?;
+
+        // Drop the registration from any category it is leaving, so a stale
+        // index cannot resurface it under a category it no longer claims.
+        for previous in Self::categories_of(&env, &contract_id).iter() {
+            if !categories.contains(&previous) {
+                let mut index = Self::category_index(&env, &previous);
+                if let Some(i) = index.first_index_of(&contract_id) {
+                    index.remove(i);
+                    env.storage().persistent()
+                        .set(&DataKey::ByCategory(previous), &index);
+                }
+            }
+        }
+
+        Self::index_categories(&env, &contract_id, &categories);
+
+        env.events().publish(
+            (Symbol::new(&env, "categories_updated"),),
+            (contract_id, owner, categories),
         );
 
         Ok(())
@@ -891,6 +1004,48 @@ impl LuminaRegistry {
     /// Retrieve a proposal by ID.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError> {
         Self::load_proposal(&env, proposal_id)
+    }
+
+    /// The categories a registration declared. Empty for one registered
+    /// before the taxonomy existed — see `set_categories`.
+    pub fn get_categories(env: Env, contract_id: Address) -> Vec<Category> {
+        Self::categories_of(&env, &contract_id)
+    }
+
+    /// Paginated list of active registrations in one category, in
+    /// registration order.
+    ///
+    /// Semantics match [`LuminaRegistry::get_active_contracts`] exactly,
+    /// including the one that surprises people: `offset` indexes into the
+    /// category's raw index, not into the filtered result, so a page can come
+    /// back shorter than `limit` when it spans deactivated entries.
+    ///
+    /// `deactivate` deliberately does not touch category indices — filtering
+    /// here on `active` is what keeps a deactivated registration out of
+    /// browsing, exactly as it does for the global listing, and it means
+    /// reactivating a registration would restore it to every category it
+    /// already claimed.
+    pub fn get_active_contracts_by_category(
+        env: Env,
+        category: Category,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let index = Self::category_index(&env, &category);
+        let mut result = Vec::new(&env);
+
+        let mut i = offset;
+        while i < index.len() && result.len() < limit {
+            let contract_id = index.get(i).unwrap();
+            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                if entry.active {
+                    result.push_back(entry);
+                }
+            }
+            i += 1;
+        }
+
+        result
     }
 
     /// `(stake_token, treasury)`, or `StakingNotConfigured` if governance has
@@ -1343,6 +1498,56 @@ impl LuminaRegistry {
         }
     }
 
+    /// Collapse duplicates, rejecting an empty selection.
+    ///
+    /// Deduplication is what bounds the work `register_contract` does: without
+    /// it a registrant could pass the same category a thousand times and pay
+    /// for a thousand index writes. With it, the number of index writes is at
+    /// most the size of the [`Category`] vocabulary.
+    fn dedup_categories(env: &Env, categories: &Vec<Category>) -> Result<Vec<Category>, RegistryError> {
+        if categories.is_empty() {
+            return Err(RegistryError::NoCategories);
+        }
+
+        let mut unique = Vec::new(env);
+        for category in categories.iter() {
+            if !unique.contains(&category) {
+                unique.push_back(category);
+            }
+        }
+
+        Ok(unique)
+    }
+
+    fn categories_of(env: &Env, contract_id: &Address) -> Vec<Category> {
+        env.storage().persistent()
+            .get(&DataKey::Categories(contract_id.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn category_index(env: &Env, category: &Category) -> Vec<Address> {
+        env.storage().persistent()
+            .get(&DataKey::ByCategory(*category))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Record a registration's categories and append it to each category's
+    /// index. Idempotent per category, so re-declaring an existing category
+    /// does not list the registration under it twice.
+    fn index_categories(env: &Env, contract_id: &Address, categories: &Vec<Category>) {
+        env.storage().persistent()
+            .set(&DataKey::Categories(contract_id.clone()), categories);
+
+        for category in categories.iter() {
+            let mut index = Self::category_index(env, &category);
+            if !index.contains(contract_id) {
+                index.push_back(contract_id.clone());
+                env.storage().persistent()
+                    .set(&DataKey::ByCategory(category), &index);
+            }
+        }
+    }
+
     fn owner_index(env: &Env, owner: &Address) -> Vec<Address> {
         env.storage().persistent()
             .get(&DataKey::OwnerContracts(owner.clone()))
@@ -1410,6 +1615,21 @@ mod test {
         (env, client, admin)
     }
 
+    /// Build a `Vec<Category>` from a slice, for readability at call sites.
+    fn cats(env: &Env, list: &[Category]) -> Vec<Category> {
+        let mut v = Vec::new(env);
+        for category in list {
+            v.push_back(*category);
+        }
+        v
+    }
+
+    /// The category tests that don't care which category is used still need
+    /// one, since registration requires at least one.
+    fn default_cats(env: &Env) -> Vec<Category> {
+        cats(env, &[Category::Infrastructure])
+    }
+
     fn register_sample(env: &Env, client: &LuminaRegistryClient) -> (Address, Address) {
         let owner = Address::generate(env);
         let target = Address::generate(env);
@@ -1418,6 +1638,7 @@ mod test {
             &target,
             &String::from_str(env, "Test Contract"),
             &String::from_str(env, "A test contract"),
+            &default_cats(env),
         );
         (owner, target)
     }
@@ -1429,6 +1650,25 @@ mod test {
             &target,
             &String::from_str(env, "Test Contract"),
             &String::from_str(env, "A test contract"),
+            &default_cats(env),
+        );
+        target
+    }
+
+    /// Register under an explicit category selection.
+    fn register_in(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        owner: &Address,
+        categories: &[Category],
+    ) -> Address {
+        let target = Address::generate(env);
+        client.register_contract(
+            owner,
+            &target,
+            &String::from_str(env, "Test Contract"),
+            &String::from_str(env, "A test contract"),
+            &cats(env, categories),
         );
         target
     }
@@ -1795,6 +2035,7 @@ mod test {
             &target,
             &String::from_str(&env, "X"),
             &String::from_str(&env, "X"),
+            &default_cats(&env),
         );
         assert_eq!(result, Err(Ok(RegistryError::AlreadyRegistered)));
     }
@@ -1987,11 +2228,15 @@ mod test {
 
     fn register_via(env: &Env, client: &registry_v1_wasm::Client, owner: &Address) -> Address {
         let target = Address::generate(env);
+        // The imported wasm carries its own generated copy of `Category`.
+        let mut categories = Vec::new(env);
+        categories.push_back(registry_v1_wasm::Category::Infrastructure);
         client.register_contract(
             owner,
             &target,
             &String::from_str(env, "Test Contract"),
             &String::from_str(env, "A test contract"),
+            &categories,
         );
         target
     }
@@ -2809,5 +3054,317 @@ mod test {
         assert_eq!(client.get_slashes(&target).len(), 1);
         assert_eq!(client.get_reputation(&target).slashed_total, 250);
         assert_eq!(client.get_reputation(&target).stake, 0);
+    }
+
+    // ── Category taxonomy ───────────────────────────────────────────────────
+
+    #[test]
+    fn registration_requires_at_least_one_category() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            client.try_register_contract(
+                &owner,
+                &target,
+                &String::from_str(&env, "Uncategorized"),
+                &String::from_str(&env, "Uncategorized"),
+                &Vec::new(&env),
+            ),
+            Err(Ok(RegistryError::NoCategories)),
+        );
+        assert!(!client.is_registered(&target));
+    }
+
+    #[test]
+    fn registration_records_its_categories() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Payments]);
+
+        let recorded = client.get_categories(&target);
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.contains(&Category::DeFi));
+        assert!(recorded.contains(&Category::Payments));
+    }
+
+    #[test]
+    fn duplicate_categories_are_collapsed() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(
+            &env,
+            &client,
+            &owner,
+            &[Category::Gaming, Category::Gaming, Category::Gaming],
+        );
+
+        assert_eq!(client.get_categories(&target).len(), 1);
+        // And the index lists it once, not three times.
+        assert_eq!(client.get_active_contracts_by_category(&Category::Gaming, &0, &10).len(), 1);
+    }
+
+    #[test]
+    fn a_multi_category_registration_is_discoverable_under_each() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Oracle]);
+
+        for category in [Category::DeFi, Category::Oracle] {
+            let page = client.get_active_contracts_by_category(&category, &0, &10);
+            assert_eq!(page.len(), 1);
+            assert_eq!(page.get(0).unwrap().contract_id, target);
+        }
+    }
+
+    #[test]
+    fn category_listing_excludes_other_categories() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let defi = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let gaming = register_in(&env, &client, &owner, &[Category::Gaming]);
+
+        let defi_page = client.get_active_contracts_by_category(&Category::DeFi, &0, &10);
+        assert!(page_contains(&defi_page, &defi));
+        assert!(!page_contains(&defi_page, &gaming));
+
+        let gaming_page = client.get_active_contracts_by_category(&Category::Gaming, &0, &10);
+        assert!(page_contains(&gaming_page, &gaming));
+        assert!(!page_contains(&gaming_page, &defi));
+    }
+
+    #[test]
+    fn an_unused_category_returns_an_empty_page() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Dao, &0, &10).len(), 0);
+        // Including on a completely empty registry.
+        let (_env2, empty, _a) = setup();
+        assert_eq!(empty.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 0);
+    }
+
+    #[test]
+    fn deactivation_removes_a_contract_from_category_browsing() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::Identity]);
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Identity, &0, &10).len(), 1);
+
+        client.deactivate(&owner, &target);
+
+        // Filtered out of browsing, exactly like the global listing...
+        assert_eq!(client.get_active_contracts_by_category(&Category::Identity, &0, &10).len(), 0);
+        assert_eq!(client.get_active_contracts(&0, &10).len(), 0);
+        // ...but still recorded against the registration, because `deactivate`
+        // does not rewrite category indices.
+        assert_eq!(client.get_categories(&target).len(), 1);
+    }
+
+    #[test]
+    fn category_pagination_matches_the_global_listing() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        for _ in 0..5 {
+            register_in(&env, &client, &owner, &[Category::Nft]);
+        }
+        // A registration in another category must not leak into the pages.
+        register_in(&env, &client, &owner, &[Category::Gaming]);
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &0, &10).len(), 5);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &0, &2).len(), 2);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &2, &2).len(), 2);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &4, &2).len(), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &5, &2).len(), 0);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &99, &2).len(), 0);
+    }
+
+    #[test]
+    fn category_pages_are_in_registration_order() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let first = register_in(&env, &client, &owner, &[Category::Dao]);
+        let second = register_in(&env, &client, &owner, &[Category::Dao]);
+        let third = register_in(&env, &client, &owner, &[Category::Dao]);
+
+        let at = |offset: u32| {
+            client.get_active_contracts_by_category(&Category::Dao, &offset, &1)
+                .get(0).unwrap().contract_id
+        };
+        assert_eq!(at(0), first);
+        assert_eq!(at(1), second);
+        assert_eq!(at(2), third);
+    }
+
+    #[test]
+    fn category_paging_is_identical_to_the_global_listing_over_the_same_set() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+
+        // Every registration goes in one category, so the category index and
+        // the global index hold the same addresses in the same order. Any
+        // divergence between the two queries is then a real difference in
+        // paging semantics rather than a difference in the data.
+        let mut registered = Vec::new(&env);
+        for _ in 0..6 {
+            registered.push_back(register_in(&env, &client, &owner, &[Category::Oracle]));
+        }
+
+        // A hole in the middle and one at the very end, so the comparison
+        // covers pages that span skipped entries and pages that run off the
+        // end of the index.
+        client.deactivate(&owner, &registered.get(2).unwrap());
+        client.deactivate(&owner, &registered.get(5).unwrap());
+
+        for offset in 0..8u32 {
+            for limit in 0..8u32 {
+                assert_eq!(
+                    client.get_active_contracts_by_category(&Category::Oracle, &offset, &limit),
+                    client.get_active_contracts(&offset, &limit),
+                    "category paging diverged at offset {} limit {}",
+                    offset,
+                    limit,
+                );
+            }
+        }
+
+        // And the shared behaviour is the one worth naming: `offset` indexes
+        // the raw index, while deactivated entries are stepped over without
+        // consuming `limit`.
+        let page = client.get_active_contracts_by_category(&Category::Oracle, &2, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().contract_id, registered.get(3).unwrap());
+        assert_eq!(page.get(1).unwrap().contract_id, registered.get(4).unwrap());
+    }
+
+    // ── set_categories ──────────────────────────────────────────────────────
+
+    #[test]
+    fn set_categories_moves_a_registration_between_categories() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 0);
+        let page = client.get_active_contracts_by_category(&Category::Payments, &0, &10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().contract_id, target);
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::Payments]));
+    }
+
+    #[test]
+    fn set_categories_keeps_the_ones_that_are_retained() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Oracle]);
+
+        client.set_categories(&owner, &target, &cats(&env, &[Category::DeFi, Category::Dao]));
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Dao, &0, &10).len(), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Oracle, &0, &10).len(), 0);
+    }
+
+    #[test]
+    fn set_categories_does_not_duplicate_an_unchanged_category() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::Gaming]);
+
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Gaming]));
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Gaming, &0, &10).len(), 1);
+        assert_eq!(client.get_categories(&target).len(), 1);
+    }
+
+    #[test]
+    fn set_categories_is_owner_only() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_categories(&stranger, &target, &cats(&env, &[Category::Gaming])),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        // Not even the admin — how a project files itself is its own business,
+        // exactly as with `update_metadata`.
+        assert_eq!(
+            client.try_set_categories(&admin, &target, &cats(&env, &[Category::Gaming])),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::DeFi]));
+    }
+
+    #[test]
+    fn set_categories_rejects_an_empty_selection() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        assert_eq!(
+            client.try_set_categories(&owner, &target, &Vec::new(&env)),
+            Err(Ok(RegistryError::NoCategories)),
+        );
+        assert_eq!(client.get_categories(&target).len(), 1);
+    }
+
+    #[test]
+    fn set_categories_rejects_an_unregistered_contract() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_categories(&owner, &unregistered, &cats(&env, &[Category::DeFi])),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn set_categories_survives_a_transfer_of_ownership() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let new_owner = Address::generate(&env);
+
+        client.transfer_ownership(&owner, &target, &new_owner);
+
+        // The old owner has lost the right to refile it; the new one has it.
+        assert_eq!(
+            client.try_set_categories(&owner, &target, &cats(&env, &[Category::Gaming])),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        client.set_categories(&new_owner, &target, &cats(&env, &[Category::Gaming]));
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::Gaming]));
+    }
+
+    #[test]
+    fn categories_and_reputation_are_independent() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        mint(&env, &token_id, &owner, 500);
+        client.stake(&owner, &target, &500);
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Refiling the contract must not disturb its stake or attestation.
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.reputation.stake, 500);
+        assert!(profile.reputation.verified);
+        assert_eq!(
+            client.get_active_contracts_by_category(&Category::Payments, &0, &10).len(),
+            1,
+        );
     }
 }

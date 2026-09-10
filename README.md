@@ -13,10 +13,36 @@ Part of the Lumina project, split across three repos:
 `registry/` — an on-chain manifest of Soroban contracts registered for Lumina indexing. Any project can call `register_contract()` to add their contract; [lumina-backend](https://github.com/Lumeeena/lumina-backend)'s indexer can then discover and index their events.
 
 ```rust
-registry.register_contract(owner, contract_id, "My Protocol", "A DeFi protocol on Stellar")
+registry.register_contract(owner, contract_id, "My Protocol", "A DeFi protocol on Stellar", vec![Category::DeFi])
 ```
 
 `get_active_contracts(offset, limit)` returns a paginated list of active registrations for discovery.
+
+### Categories
+
+Every registration declares at least one category, so the Registry supports
+browsing rather than only a flat list:
+
+`DeFi` · `Nft` · `Gaming` · `Identity` · `Infrastructure` · `Payments` ·
+`Oracle` · `Dao` · `Other`
+
+| Method | Who can call it |
+| --- | --- |
+| `get_active_contracts_by_category(category, offset, limit)` | anyone — same paging semantics as `get_active_contracts` |
+| `get_categories(contract_id)` | anyone |
+| `set_categories(owner, contract_id, categories)` | the registered owner only |
+
+A contract can be filed under several categories and is discoverable under each.
+Duplicates are collapsed, so passing a category twice indexes it once.
+
+The vocabulary is a fixed enum rather than free-form tags because the point is
+browsing, and free-form tags fragment it immediately — `DeFi`, `defi` and `De-Fi`
+become three categories each holding part of the answer. Adding a category is a
+contract upgrade; `Other` is the escape hatch until then.
+
+`deactivate` does not rewrite category indices. `get_active_contracts_by_category`
+filters on `active`, exactly as the global listing does, which is what keeps a
+deactivated registration out of browsing.
 
 Registrations are also manageable after the fact:
 

@@ -66,8 +66,15 @@ stellar contract invoke \
   --owner <owner-address-G...> \
   --contract_id <target-contract-C...> \
   --name "My Protocol" \
-  --description "A DeFi protocol on Stellar"
+  --description "A DeFi protocol on Stellar" \
+  --categories '["DeFi","Payments"]'
 ```
+
+`categories` takes at least one of `DeFi`, `Nft`, `Gaming`, `Identity`,
+`Infrastructure`, `Payments`, `Oracle`, `Dao`, `Other`. An empty list is
+rejected with `NoCategories`; use `Other` if none of them fit. Duplicates are
+collapsed, and a contract filed under several categories is discoverable under
+each of them.
 
 ### Verify discovery works
 
@@ -77,6 +84,33 @@ stellar contract invoke \
   --source lumina-deployer \
   --network testnet \
   -- get_active_contracts --offset 0 --limit 10
+```
+
+Or browse one category — same offset/limit semantics, same `active` filtering:
+
+```bash
+stellar contract invoke \
+  --id lumina-registry \
+  --source lumina-deployer \
+  --network testnet \
+  -- get_active_contracts_by_category --category DeFi --offset 0 --limit 10
+```
+
+### Refile an existing registration
+
+Registrations created before the taxonomy existed carry no categories and so
+appear in no category listing. Their owners can classify them in place, without
+re-registering — this is also how you change categories later:
+
+```bash
+stellar contract invoke \
+  --id lumina-registry \
+  --source lumina-deployer \
+  --network testnet \
+  -- set_categories \
+  --owner <owner-address-G...> \
+  --contract_id <target-contract-C...> \
+  --categories '["Infrastructure"]'
 ```
 
 ### Manage your registration
