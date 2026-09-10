@@ -43,6 +43,41 @@ version must stay compatible with the storage shapes documented on `DataKey` and
 `ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
+### Staking & reputation
+
+Registration itself stays free and permissionless — anyone can list a contract
+for indexing. On top of that, a registrant can post collateral, and governance
+can attest or penalise, so consumers of the Registry can tell a well-run project
+apart from a name that was typed into a form:
+
+| Method | Who can call it |
+| --- | --- |
+| `stake(owner, contract_id, amount)` | the registered owner — additive, tops up an existing stake |
+| `withdraw_stake(owner, contract_id)` | the registered owner, in good standing (see below) |
+| `propose_set_verified(proposer, contract_id, verified)` | an admin — takes effect only after approval + timelock |
+| `propose_slash(proposer, contract_id, amount, reason)` | an admin — same |
+| `propose_configure_staking(proposer, token, treasury)` | an admin — same |
+| `get_reputation(contract_id)` | anyone — stake, verified, lifetime slashed, lock expiry |
+| `get_contract_profile(contract_id)` | anyone — the entry and its reputation in one call |
+| `get_active_profiles(offset, limit)` | anyone — `get_active_contracts` with reputation attached |
+| `get_stake` / `is_verified` / `get_slashes` / `get_staking_config` | anyone |
+
+Verified status has no non-governance path: a registrant cannot attest their own
+contract, which is the entire value of the signal. Slashes move stake to the
+treasury and record their reason on-chain permanently, so a penalty stays
+auditable long after the stake it was taken from is gone.
+
+**Good standing**, the condition for `withdraw_stake`, is three things: you are
+the registered owner, the registration is deactivated (you get collateral back
+by leaving, not while still listed), and no slash has landed within the last
+`SLASH_LOCK_LEDGERS` (~24 h). The lock is what stops an owner emptying the stake
+the moment a first slash reveals they are being watched.
+
+Staking is closed until governance runs `propose_configure_staking` to name a
+SEP-41 token (native XLM via its Stellar Asset Contract works) and a treasury.
+Routing that through governance rather than `initialize` means the already-live
+registry can adopt staking after an upgrade instead of being redeployed.
+
 ## Build & Test
 
 ```bash

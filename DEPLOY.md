@@ -120,6 +120,114 @@ stellar contract invoke \
   --new_owner <new-owner-G...>
 ```
 
+## Staking, verification and slashing
+
+Registration is free; stake is the optional signal on top of it. Nothing here
+works until governance opens staking.
+
+### Opening staking (governance, once)
+
+Name the token stakes are denominated in and the treasury slashed stake goes to.
+For native XLM, use the Stellar Asset Contract address for XLM on your network.
+
+```bash
+stellar contract invoke \
+  --id lumina-registry --source lumina-deployer --network testnet \
+  -- propose_configure_staking \
+  --proposer <admin-G...> \
+  --token <token-C...> \
+  --treasury <treasury-G...>
+```
+
+That prints a proposal ID. Collect approvals up to the threshold, wait out the
+timelock, then execute — the same three-step flow every privileged action uses:
+
+```bash
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- approve_proposal --admin <admin-G...> --proposal_id <id>
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- execute_proposal --proposal_id <id>
+```
+
+Whoever executes this decides where every future slash lands, which is exactly
+why it is a proposal and not a setter.
+
+### Posting a stake (registrant)
+
+```bash
+stellar contract invoke \
+  --id lumina-registry --source lumina-deployer --network testnet \
+  -- stake \
+  --owner <owner-G...> \
+  --contract_id <target-contract-C...> \
+  --amount 1000000000
+```
+
+Amounts are in the token's own stroops-equivalent base units (7 decimals for
+XLM, so `1000000000` is 100 XLM). Calling it again tops the stake up.
+
+### Attesting or revoking verified status (governance)
+
+```bash
+stellar contract invoke \
+  --id lumina-registry --source lumina-deployer --network testnet \
+  -- propose_set_verified \
+  --proposer <admin-G...> \
+  --contract_id <target-contract-C...> \
+  --verified true
+```
+
+Then approve and execute as above. There is no direct setter — a registrant
+cannot verify themselves.
+
+### Slashing (governance)
+
+```bash
+stellar contract invoke \
+  --id lumina-registry --source lumina-deployer --network testnet \
+  -- propose_slash \
+  --proposer <admin-G...> \
+  --contract_id <target-contract-C...> \
+  --amount 250000000 \
+  --reason "misreported contract metadata"
+```
+
+The reason is stored permanently and readable later via `get_slashes`. On
+execution the amount moves to the treasury, and the registration's *remaining*
+stake is frozen for `SLASH_LOCK_LEDGERS` (~24 h) — long enough for a follow-up
+slash proposal to clear its own timelock.
+
+A slash for more than the registration has staked passes governance but reverts
+at execution with `InsufficientStake`; check `get_stake` before proposing.
+
+### Reclaiming a stake (registrant)
+
+Withdrawal requires **good standing**: you are the registered owner, the
+registration is deactivated, and no slash has landed inside the lock window.
+
+```bash
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- deactivate --caller <owner-G...> --contract_id <C...>
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- withdraw_stake --owner <owner-G...> --contract_id <C...>
+```
+
+It returns the full remaining balance in one go. `RegistrationActive` means you
+have not deactivated; `StakeLocked` means a slash is still inside its window —
+check `get_reputation`'s `withdraw_locked_until` against the current ledger.
+
+### Reading reputation
+
+```bash
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- get_reputation --contract_id <C...>
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- get_active_profiles --offset 0 --limit 10
+```
+
+`get_active_profiles` is `get_active_contracts` with each entry's stake and
+verified status attached — one call for a discovery client that wants both.
+
 ## Upgrading a live registry
 
 A Soroban upgrade replaces the contract's **code** and keeps its **address and
