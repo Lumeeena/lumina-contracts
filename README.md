@@ -8,6 +8,96 @@ Part of the Lumina project, split across three repos:
 - [lumina-backend](https://github.com/Lumeeena/lumina-backend) — indexer + GraphQL API + PostgreSQL schema
 - [lumina-contracts](https://github.com/Lumeeena/lumina-contracts) — this repo
 
+## Where the registry fits
+
+Lumina indexes Soroban contract events, but an indexer has to know *which*
+contracts to watch. Without this contract, that list is a static
+`INDEXED_CONTRACT_IDS` env var that an operator edits by hand. The registry
+replaces the hand-edited list with an on-chain one. A project lists itself by
+calling `register_contract`, and every Lumina indexer pointed at the registry
+starts indexing that project's events on its next poll. No operator needs to
+act and no one needs to redeploy. Discovery is the reason the contract exists.
+Categories, staking and governance all exist to make that list worth trusting.
+
+```
+ project ──register_contract──▶ ┌──────────┐ ◀──get_active_contracts── indexer ──getEvents──▶ project's events
+                                │ registry │                              │
+ frontend ──read views─────────▶└──────────┘                              ▼
+    │                                │ emits contract_registered, …    PostgreSQL / GraphQL
+    └───────────── history view ◀────┴──────── indexed like any other contract's events
+```
+
+### How the indexer discovers contracts
+
+[lumina-backend](https://github.com/Lumeeena/lumina-backend)'s indexer
+(`indexer/src/registry.ts`) turns discovery on when `REGISTRY_CONTRACT_ID` and
+`REGISTRY_READ_ACCOUNT` are set. On a timer it then:
+
+1. Calls `get_active_contracts(offset, 50)` through `simulateTransaction`. This
+   is a read-only call, so the read account needs no key and pays no fee. It
+   keeps paging until a page comes back with fewer than 50 entries, with a
+   cap of 20 pages.
+2. Takes `contract_id` from each `ContractEntry`. It drops any address that is
+   not a `C…` contract address, because the registry accepts any `Address` and
+   one account address in the list would make the whole `getEvents` filter fail.
+3. Merges those IDs with the static list and indexes their events.
+
+Deactivating a registration therefore stops the indexer from polling that
+contract. Already-indexed events stay in the database.
+
+A note on paging semantics: `offset` is a position in *registration order*,
+counting deactivated entries, not a count of active ones. A page can come back
+with fewer than `limit` entries even when more active registrations follow,
+because the page skipped over deactivated entries. The same holds for
+`get_active_profiles` and `get_active_contracts_by_category`.
+
+### What the frontend reads
+
+[lumina-frontend](https://github.com/Lumeeena/lumina-frontend)'s `/registry`
+page (`lib/registry.ts`) reads the contract directly over Soroban RPC with the
+same simulate-only pattern. It uses `get_active_contracts`,
+`get_active_profiles`, `get_active_contracts_by_category`, `get_categories`,
+`get_contracts_by_owner`, `get_reputation` and `get_slashes`.
+
+The contract stores only current state. `ContractEntry.active` is a boolean,
+not a log, so "when was this deactivated, and by whom?" cannot be read from
+storage. The registration history view (`lib/registryHistory.ts`) rebuilds
+that history from the registry's **own events**. The indexer stores them
+because the registry is itself a registered contract, and the frontend queries
+them from the GraphQL API filtered to `contractId = <registry>`:
+
+| Event topic | Data tuple | History row |
+| --- | --- | --- |
+| `contract_registered` | `(contract_id, owner, name, categories)` | Registered |
+| `contract_deactivated` | `(contract_id, caller)`, or `(contract_id, "governance")` when deactivated by proposal | Deactivated |
+| `metadata_updated` | `(contract_id, owner, name)` | Metadata updated |
+| `ownership_transferred` | `(contract_id, previous_owner, new_owner)` | Ownership transferred |
+
+The history view matches on the **first topic** and treats the **first
+element of the data tuple** as the registration the event concerns. Other
+events (`categories_updated`, `stake_*`, `proposal_*`, `registry_upgraded`, …)
+still appear in the history, shown as a generic "Registry event" row.
+
+### What breaks downstream when the interface changes
+
+Neither sibling repo generates bindings from this contract. Both call methods by
+name, with arguments built by hand, and decode results as plain JS objects. A
+change here does not fail their builds. It fails at runtime, often quietly:
+
+| Change here | Effect downstream |
+| --- | --- |
+| Rename or remove `get_active_contracts`, or change its arguments | Indexer discovery fails every poll. Registered contracts stop being indexed, and the static list keeps working, which hides the failure. |
+| Rename a `ContractEntry` field (e.g. `contract_id`) | The indexer reads `undefined` IDs, filters them all out, and discovers nothing. The frontend renders blank rows. |
+| Change `offset`/`limit` semantics or the page cap | The indexer and the frontend stop paging too early or too late, so contracts are silently missed or duplicated. |
+| Change the arguments of `register_contract` | Every registrant's scripts and bindings break. This happened when `categories` was added. |
+| Rename an event topic, or move `contract_id` out of the first data slot | History rows turn into "Registry event" rows or lose their subject, so the per-contract history is empty. |
+| Add or reorder `Category` variants | The frontend's `CATEGORIES` list no longer matches, and category filters drop unknown values. |
+
+`registry/tests/interface.rs` guards the function and type half of this list.
+See [Interface snapshot](#interface-snapshot). Event topics and payloads are
+not part of the contract spec, so review changes to `env.events().publish`
+calls against the table above.
+
 ## Lumina Registry
 
 `registry/` — an on-chain manifest of Soroban contracts registered for Lumina indexing. Any project can call `register_contract()` to add their contract; [lumina-backend](https://github.com/Lumeeena/lumina-backend)'s indexer can then discover and index their events.
@@ -88,10 +178,12 @@ version must stay compatible with the storage shapes documented on `DataKey` and
 
 ### Staking & reputation
 
-Registration itself stays free and permissionless — anyone can list a contract
-for indexing. On top of that, a registrant can post collateral, and governance
-can attest or penalise, so consumers of the Registry can tell a well-run project
-apart from a name that was typed into a form:
+Registration stays free and permissionless by default — anyone can list a
+contract for indexing. Governance can optionally enable an allowlist or a
+per-owner registration limit for curated deployments. On top of that, a
+registrant can post collateral, and governance can attest or penalise, so
+consumers of the Registry can tell a well-run project apart from a name that
+was typed into a form:
 
 | Method | Who can call it |
 | --- | --- |
@@ -100,6 +192,9 @@ apart from a name that was typed into a form:
 | `propose_set_verified(proposer, contract_id, verified)` | an admin — takes effect only after approval + timelock |
 | `propose_slash(proposer, contract_id, amount, reason)` | an admin — same |
 | `propose_configure_staking(proposer, token, treasury)` | an admin — same |
+| `propose_set_allowlist_enabled(proposer, enabled)` | an admin — same |
+| `propose_set_allowlisted(proposer, owner, allowed)` | an admin — same |
+| `propose_configure_registration_rate_limit(proposer, limit, window_ledgers)` | an admin — same; zero limit disables it |
 | `get_reputation(contract_id)` | anyone — stake, verified, lifetime slashed, lock expiry |
 | `get_contract_profile(contract_id)` | anyone — the entry and its reputation in one call |
 | `get_active_profiles(offset, limit)` | anyone — `get_active_contracts` with reputation attached |
@@ -136,6 +231,25 @@ that test's upgrade target and is never deployed.
 Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
 
+### Interface snapshot
+
+[registry/interface.snap](./registry/interface.snap) is the registry's exported
+interface as read from the built wasm's contract spec: every function signature,
+struct, union, enum and error code, one per line and without doc comments.
+`cargo test` compares the current build against it, so CI fails on any change
+nobody reviewed, and the failure message lists the lines that changed.
+
+To accept an intended change, run one line after the wasm build and commit the
+updated snapshot along with the change:
+
+```bash
+UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
+```
+
+The snapshot diff in the PR is the review. A line that is only added is usually
+safe. A line that changes or disappears breaks the consumers described in
+[What breaks downstream](#what-breaks-downstream-when-the-interface-changes).
+
 ## Deploying
 
 Deployed on **testnet** at:
@@ -144,8 +258,25 @@ Deployed on **testnet** at:
 CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ
 ```
 
-[lumina-backend](https://github.com/Lumeeena/lumina-backend)'s indexer polls this contract for discovery when configured with `REGISTRY_CONTRACT_ID` (see that repo's README). See [DEPLOY.md](./DEPLOY.md) for the deployment steps used, and how to register your own contract.
+## Dependencies & Supply Chain Review
+
+This repository maintains a minimal dependency surface to minimize attack vectors, ensure strict `no_std` compliance, and keep compiled WebAssembly contract sizes small.
+
+### Direct Dependencies
+
+- **`soroban-sdk` (v22.0.0, workspace)**:
+  - **Why needed**: Core Soroban framework providing smart contract host abstractions, env bindings (`Env`, `Address`, `Vec`, `String`, `BytesN`, `Symbol`), token client bindings (`soroban_sdk::token::Client`), contract macros (`#[contract]`, `#[contractimpl]`, `#[contracttype]`, `#[contracterror]`), and storage access APIs.
+  - **Features**: Enabled with `alloc` feature for linear memory allocations in `no_std` WebAssembly runtime.
+- **`soroban-sdk` with `testutils` (dev-dependencies)**:
+  - **Why needed**: In-memory test environment, mock authorizations (`mock_all_auths`, `MockAuth`), and contract client test generation.
+
+### Supply Chain & `no_std` Guarantees
+
+- **`no_std` Contract Execution**: Smart contracts in this workspace are strictly `#![no_std]`. They do not link the standard library or depend on OS-level system calls.
+- **Pinned `ed25519-dalek`**: `ed25519-dalek` is pinned (v2.2.0) via `soroban-env-host` for cryptographic Ed25519 signature checks in off-chain host and test simulation environments (`testutils`). It is an off-chain/host dependency and is **never** linked into the deployed wasm bytecode on-chain (where cryptographic operations are provided natively by Soroban host functions).
+- **Automated Security Audits**: CI runs `cargo audit` against the RustSec Advisory Database on every pull request and push to main to detect known vulnerabilities.
 
 ## License
 
 MIT
+

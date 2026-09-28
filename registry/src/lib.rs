@@ -1,6 +1,7 @@
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
+#![warn(missing_docs)]
 //! Lumina Registry — on-chain contract registry for the Lumina indexer.
 //!
 //! Projects deploy their Soroban contracts and register them here so that
@@ -54,6 +55,7 @@ pub const CONTRACT_VERSION: u32 = 4;
 #[cfg(not(test))]
 pub const TIMELOCK_LEDGERS: u32 = 17_280;
 
+/// Test configuration for timelock ledgers.
 #[cfg(test)]
 pub const TIMELOCK_LEDGERS: u32 = 10;
 
@@ -71,19 +73,26 @@ pub const TIMELOCK_LEDGERS: u32 = 10;
 #[cfg(not(test))]
 pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 
+/// Test configuration for slash lock ledgers.
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
+/// Errors returned by the Lumina Registry contract operations.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
+    /// Contract is already initialized.
     AlreadyInitialized  = 1,
+    /// Caller lacks authorization for this action.
     Unauthorized        = 2,
+    /// Contract is already registered.
     AlreadyRegistered   = 3,
+    /// Referenced contract was not found.
     ContractNotFound    = 4,
+    /// Metadata provided is invalid.
     InvalidMetadata     = 5,
     /// Caller is not the registered owner of the contract.
     NotOwner            = 6,
@@ -137,6 +146,7 @@ pub enum RegistryError {
 // `registry-v2/src/lib.rs` re-declares both types independently and reads
 // back storage written by this version — that test keeps these rules honest.
 
+/// Stored entry describing a registered Soroban contract.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractEntry {
@@ -184,13 +194,21 @@ pub struct ContractEntry {
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Category {
+    /// Decentralized finance protocols and instruments.
     DeFi,
+    /// Non-fungible token contracts and collections.
     Nft,
+    /// On-chain gaming contracts and state.
     Gaming,
+    /// Identity and credential verification contracts.
     Identity,
+    /// Core infrastructure, routers, and utility contracts.
     Infrastructure,
+    /// Payment processors and payment rails.
     Payments,
+    /// Data oracles and price feeds.
     Oracle,
+    /// Decentralized autonomous organizations and governance contracts.
     Dao,
     /// Anything the vocabulary does not cover yet.
     Other,
@@ -239,7 +257,9 @@ pub struct Reputation {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractProfile {
+    /// The base registration metadata and status.
     pub entry: ContractEntry,
+    /// The reputation and staking signal.
     pub reputation: Reputation,
 }
 
@@ -266,6 +286,20 @@ pub enum ProposalAction {
     SetVerified(Address, bool),
     /// Take `(contract_id, amount, reason)` of a registration's stake.
     Slash(Address, i128, String),
+    /// Enable or disable permissioned registration.
+    SetAllowlistEnabled(bool),
+    /// Add or remove an owner from the registration allowlist.
+    SetAllowlisted(Address, bool),
+    /// Set the per-owner limit and ledger window; a zero limit disables it.
+    ConfigureRegistrationRateLimit(u32, u32),
+}
+
+/// Fixed-window registration counter for one owner.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegistrationWindow {
+    pub started_at: u32,
+    pub count: u32,
 }
 
 /// State stored for every open (or executed) proposal.
@@ -287,6 +321,7 @@ pub struct Proposal {
     pub executed: bool,
 }
 
+/// Storage keys used by the Lumina Registry contract.
 #[contracttype]
 pub enum DataKey {
     // ── Governance ──────────────────────────────────────────────────────────
@@ -312,8 +347,10 @@ pub enum DataKey {
     /// `ContractCount` in that case.
     TotalRegistered,
     Contract(Address),
-    OwnerContracts(Address), // owner → Vec<Address>
-    AllContracts,            // insertion-ordered Vec<Address> of every registered contract
+    /// Vec<Address> — list of contracts registered by a specific owner.
+    OwnerContracts(Address),
+    /// Vec<Address> — insertion-ordered list of every registered contract.
+    AllContracts,
 
     // ── Staking & reputation ────────────────────────────────────────────────
     /// Address — the SEP-41 token stakes are denominated in.
@@ -339,6 +376,18 @@ pub enum DataKey {
     /// bounded entry shared by everything in it.
     ByCategory(Category),
 
+    // ── Registration policy ─────────────────────────────────────────────────
+    /// bool — whether only allowlisted owners may register.
+    AllowlistEnabled,
+    /// bool — whether an owner is allowlisted.
+    Allowlisted(Address),
+    /// u32 — per-owner registrations per fixed window; zero disables limiting.
+    RegistrationRateLimit,
+    /// u32 — fixed registration window size in ledgers.
+    RegistrationRateWindow,
+    /// RegistrationWindow — the current fixed-window counter for one owner.
+    RegistrationWindow(Address),
+
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 initialize.  Retained so
     /// that the registry-v2 upgrade tests, which read `DataKey::Admin` from
@@ -348,11 +397,25 @@ pub enum DataKey {
 
 // ─── Contract ──────────────────────────────────────────────────────────────
 
+/// Main contract type implementing the Lumina on-chain contract registry.
 #[contract]
 pub struct LuminaRegistry;
 
 #[contractimpl]
 impl LuminaRegistry {
+    /// Atomically initialize a new deployment with one bootstrap admin.
+    /// The deployment transaction must include that admin's authorization.
+    pub fn __constructor(env: Env, bootstrap_admin: Address) {
+        bootstrap_admin.require_auth();
+        let mut admins = Vec::new(&env);
+        admins.push_back(bootstrap_admin.clone());
+        env.storage().instance().set(&DataKey::Admins, &admins);
+        env.storage().instance().set(&DataKey::Threshold, &1u32);
+        env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        env.storage().instance().set(&DataKey::ContractCount, &0u32);
+        env.storage().instance().set(&DataKey::Admin, &bootstrap_admin);
+    }
+
     // ── Initialization ──────────────────────────────────────────────────────
 
     /// One-time setup.  `admins` must be non-empty and `threshold` must be
@@ -374,8 +437,8 @@ impl LuminaRegistry {
         }
 
         // Every admin must authorize the initialization.
-        for i in 0..admins.len() {
-            admins.get(i).unwrap().require_auth();
+        for admin in admins.iter() {
+            admin.require_auth();
         }
 
         env.storage().instance().set(&DataKey::Admins, &admins);
@@ -386,7 +449,7 @@ impl LuminaRegistry {
 
         // Write the legacy Admin key with the first admin so the v2 upgrade
         // tests (which read DataKey::Admin) continue to pass unchanged.
-        let first_admin = admins.get(0).unwrap();
+        let first_admin = admins.get(0).ok_or(RegistryError::InvalidThreshold)?;
         env.storage().instance().set(&DataKey::Admin, &first_admin);
 
         Ok(())
@@ -611,6 +674,72 @@ impl LuminaRegistry {
             (proposal_id, proposer, Symbol::new(&env, "slash"), (contract_id, amount, reason)),
         );
 
+        Ok(proposal_id)
+    }
+
+    /// Govern whether new registrations require an allowlisted owner.
+    /// Permissionless registration remains the default until this proposal executes.
+    pub fn propose_set_allowlist_enabled(
+        env: Env,
+        proposer: Address,
+        enabled: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetAllowlistEnabled(enabled),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_allowlist"), enabled),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Govern an owner's membership in the registration allowlist.
+    pub fn propose_set_allowlisted(
+        env: Env,
+        proposer: Address,
+        owner: Address,
+        allowed: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetAllowlisted(owner.clone(), allowed),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_allowlisted"), (owner, allowed)),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Govern a fixed-window per-owner registration limit. Zero disables it.
+    pub fn propose_configure_registration_rate_limit(
+        env: Env,
+        proposer: Address,
+        limit: u32,
+        window_ledgers: u32,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
+            return Err(RegistryError::InvalidRateLimit);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::ConfigureRegistrationRateLimit(limit, window_ledgers),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "configure_rate_limit"), (limit, window_ledgers)),
+        );
         Ok(proposal_id)
     }
 
@@ -911,6 +1040,11 @@ impl LuminaRegistry {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
+        // `CONTRACT_VERSION` is the version being *replaced*, not the incoming
+        // one: the new wasm only takes over once this invocation returns, and
+        // this code cannot know what version the new wasm carries. Consumers
+        // read this field as "upgraded away from vN" — do not "fix" it to the
+        // new version. Pinned by `registry_upgraded_event_reports_the_replaced_version`.
         env.events().publish(
             (Symbol::new(&env, "registry_upgraded"),),
             (admin, new_wasm_hash, CONTRACT_VERSION),
@@ -937,11 +1071,19 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
+        if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
+            && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
+        {
+            return Err(RegistryError::NotAllowlisted);
+        }
+
         if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::AlreadyRegistered);
         }
 
         let categories = Self::dedup_categories(&env, &categories)?;
+
+        Self::consume_registration_rate(&env, &owner)?;
 
         let entry = ContractEntry {
             contract_id: contract_id.clone(),
@@ -1155,10 +1297,7 @@ impl LuminaRegistry {
             return Ok(a);
         }
         let admins = Self::admin_index(&env);
-        if admins.is_empty() {
-            return Err(RegistryError::NotInitialized);
-        }
-        Ok(admins.get(0).unwrap())
+        admins.get(0).ok_or(RegistryError::NotInitialized)
     }
 
     /// The full current admin set.
@@ -1213,10 +1352,11 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < index.len() && result.len() < limit {
-            let contract_id = index.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
-                    result.push_back(entry);
+            if let Some(contract_id) = index.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    if entry.active {
+                        result.push_back(entry);
+                    }
                 }
             }
             i += 1;
@@ -1279,13 +1419,14 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < all.len() && result.len() < limit {
-            let contract_id = all.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                if entry.active {
-                    result.push_back(ContractProfile {
-                        reputation: Self::reputation_of(&env, &contract_id),
-                        entry,
-                    });
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                    if entry.active {
+                        result.push_back(ContractProfile {
+                            reputation: Self::reputation_of(&env, &contract_id),
+                            entry,
+                        });
+                    }
                 }
             }
             i += 1;
@@ -1294,6 +1435,7 @@ impl LuminaRegistry {
         result
     }
 
+    /// Retrieve the metadata entry for a registered contract.
     pub fn get_contract(env: Env, contract_id: Address) -> Result<ContractEntry, RegistryError> {
         env.storage().persistent()
             .get(&DataKey::Contract(contract_id))
@@ -1348,10 +1490,11 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < all.len() && result.len() < limit {
-            let contract_id = all.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
-                    result.push_back(entry);
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    if entry.active {
+                        result.push_back(entry);
+                    }
                 }
             }
             i += 1;
@@ -1368,9 +1511,10 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < owned.len() && result.len() < limit {
-            let contract_id = owned.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                result.push_back(entry);
+            if let Some(contract_id) = owned.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    result.push_back(entry);
+                }
             }
             i += 1;
         }
@@ -1477,6 +1621,32 @@ impl LuminaRegistry {
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 impl LuminaRegistry {
+    fn consume_registration_rate(env: &Env, owner: &Address) -> Result<(), RegistryError> {
+        let limit: u32 = env.storage().instance().get(&DataKey::RegistrationRateLimit).unwrap_or(0);
+        if limit == 0 {
+            return Ok(());
+        }
+        let window: u32 = env.storage().instance().get(&DataKey::RegistrationRateWindow).unwrap_or(0);
+        if window == 0 {
+            return Err(RegistryError::InvalidRateLimit);
+        }
+        let now = env.ledger().sequence();
+        let key = DataKey::RegistrationWindow(owner.clone());
+        let mut state: RegistrationWindow = env.storage().persistent()
+            .get(&key)
+            .unwrap_or(RegistrationWindow { started_at: now, count: 0 });
+        if now.saturating_sub(state.started_at) >= window {
+            state = RegistrationWindow { started_at: now, count: 0 };
+        }
+        if state.count >= limit {
+            return Err(RegistryError::RegistrationRateLimited);
+        }
+        state.count += 1;
+        env.storage().persistent().set(&key, &state);
+        env.storage().persistent().extend_ttl(&key, window, window);
+        Ok(())
+    }
+
     /// Return the current admin set (may be empty before initialization).
     fn admin_index(env: &Env) -> Vec<Address> {
         env.storage()
@@ -1549,6 +1719,7 @@ impl LuminaRegistry {
             }
             ProposalAction::Upgrade(new_wasm_hash) => {
                 env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+                // The version being replaced, deliberately — see `upgrade`.
                 env.events().publish(
                     (Symbol::new(env, "registry_upgraded"),),
                     (new_wasm_hash.clone(), CONTRACT_VERSION),
@@ -1656,6 +1827,31 @@ impl LuminaRegistry {
                 env.events().publish(
                     (Symbol::new(env, "stake_slashed"),),
                     (contract_id.clone(), *amount, reason.clone(), treasury),
+                );
+            }
+            ProposalAction::SetAllowlistEnabled(enabled) => {
+                env.storage().instance().set(&DataKey::AllowlistEnabled, enabled);
+                env.events().publish(
+                    (Symbol::new(env, "allowlist_mode_changed"),),
+                    (*enabled,),
+                );
+            }
+            ProposalAction::SetAllowlisted(owner, allowed) => {
+                env.storage().persistent().set(&DataKey::Allowlisted(owner.clone()), allowed);
+                env.events().publish(
+                    (Symbol::new(env, "owner_allowlisted"),),
+                    (owner.clone(), *allowed),
+                );
+            }
+            ProposalAction::ConfigureRegistrationRateLimit(limit, window) => {
+                if *limit > 0 && (*window == 0 || *window > env.storage().max_ttl()) {
+                    return Err(RegistryError::InvalidRateLimit);
+                }
+                env.storage().instance().set(&DataKey::RegistrationRateLimit, limit);
+                env.storage().instance().set(&DataKey::RegistrationRateWindow, window);
+                env.events().publish(
+                    (Symbol::new(env, "registration_rate_limit_changed"),),
+                    (*limit, *window),
                 );
             }
         }
@@ -1774,8 +1970,8 @@ impl LuminaRegistry {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke};
-    use soroban_sdk::IntoVal;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::{IntoVal, TryFromVal};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
 
@@ -1797,17 +1993,21 @@ mod test {
     fn setup_multisig() -> (Env, LuminaRegistryClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
-        let client = LuminaRegistryClient::new(&env, &contract_id);
-
         let a1 = Address::generate(&env);
         let a2 = Address::generate(&env);
         let a3 = Address::generate(&env);
-        let mut admins = Vec::new(&env);
-        admins.push_back(a1.clone());
-        admins.push_back(a2.clone());
-        admins.push_back(a3.clone());
-        client.initialize(&admins, &2);
+        let contract_id = env.register(LuminaRegistry, (&a1,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+
+        let add_a2 = client.propose_add_admin(&a1, &a2);
+        pass_proposal(&env, &client, &a1, add_a2);
+        let add_a3 = client.propose_add_admin(&a1, &a3);
+        pass_proposal(&env, &client, &a1, add_a3);
+        let change_threshold = client.propose_change_threshold(&a1, &2);
+        client.approve_proposal(&a1, &change_threshold);
+        client.approve_proposal(&a2, &change_threshold);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&change_threshold);
         (env, client, a1, a2, a3)
     }
 
@@ -1815,13 +2015,9 @@ mod test {
     fn setup() -> (Env, LuminaRegistryClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
-        let client = LuminaRegistryClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
-        let mut admins = Vec::new(&env);
-        admins.push_back(admin.clone());
-        client.initialize(&admins, &1);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
         (env, client, admin)
     }
 
@@ -1913,33 +2109,18 @@ mod test {
     }
 
     #[test]
-    fn initialize_with_zero_threshold_fails() {
+    fn second_party_cannot_claim_a_new_deployment() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
-        let client = LuminaRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        let mut admins = Vec::new(&env);
-        admins.push_back(admin.clone());
-        assert_eq!(
-            client.try_initialize(&admins, &0),
-            Err(Ok(RegistryError::InvalidThreshold))
-        );
-    }
-
-    #[test]
-    fn initialize_with_threshold_exceeding_set_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
+        let contract_id = env.register(LuminaRegistry, (&admin,));
         let client = LuminaRegistryClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
         let mut admins = Vec::new(&env);
-        admins.push_back(admin.clone());
-        // threshold=2 but only 1 admin
+        admins.push_back(attacker);
         assert_eq!(
-            client.try_initialize(&admins, &2),
-            Err(Ok(RegistryError::InvalidThreshold))
+            client.try_initialize(&admins, &1),
+            Err(Ok(RegistryError::AlreadyInitialized))
         );
     }
 
@@ -2038,7 +2219,7 @@ mod test {
         // First approval succeeds.
         client.approve_proposal(&a1, &pid);
         // Second approval rejected.
-        client.try_approve_proposal(&a1, &pid).unwrap_err();
+        let _ = client.try_approve_proposal(&a1, &pid).unwrap_err();
 
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         // Still below threshold (need 2), so execution must fail.
@@ -2253,6 +2434,82 @@ mod test {
     }
 
     #[test]
+    fn allowlist_mode_is_off_by_default_and_governed() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let first_target = Address::generate(&env);
+        client.register_contract(
+            &owner, &first_target, &String::from_str(&env, "First"),
+            &String::from_str(&env, "First"), &default_cats(&env),
+        );
+        let enable = client.propose_set_allowlist_enabled(&admin, &true);
+        pass_proposal(&env, &client, &admin, enable);
+        let target = Address::generate(&env);
+        assert_eq!(
+            client.try_register_contract(
+                &owner, &target, &String::from_str(&env, "Blocked"),
+                &String::from_str(&env, "Blocked"), &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::NotAllowlisted)),
+        );
+        let allow = client.propose_set_allowlisted(&admin, &owner, &true);
+        pass_proposal(&env, &client, &admin, allow);
+        client.register_contract(
+            &owner, &target, &String::from_str(&env, "Allowed"),
+            &String::from_str(&env, "Allowed"), &default_cats(&env),
+        );
+        assert!(client.is_registered(&target));
+    }
+
+    #[test]
+    fn registration_rate_limit_resets_after_governed_window() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let configure = client.propose_configure_registration_rate_limit(&admin, &1, &3);
+        pass_proposal(&env, &client, &admin, configure);
+        let first = Address::generate(&env);
+        client.register_contract(
+            &owner, &first, &String::from_str(&env, "First"),
+            &String::from_str(&env, "First"), &default_cats(&env),
+        );
+        let second = Address::generate(&env);
+        assert_eq!(
+            client.try_register_contract(
+                &owner, &second, &String::from_str(&env, "Second"),
+                &String::from_str(&env, "Second"), &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::RegistrationRateLimited)),
+        );
+        advance_ledger(&env, 3);
+        client.register_contract(
+            &owner, &second, &String::from_str(&env, "Second"),
+            &String::from_str(&env, "Second"), &default_cats(&env),
+        );
+        assert!(client.is_registered(&second));
+    }
+
+    #[test]
+    fn bootstrap_admin_can_add_admin_and_raise_threshold_through_governance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        let second_admin = Address::generate(&env);
+        assert_eq!(client.get_admins().len(), 1);
+        assert_eq!(client.get_threshold(), 1);
+        let add = client.propose_add_admin(&admin, &second_admin);
+        pass_proposal(&env, &client, &admin, add);
+        let change = client.propose_change_threshold(&admin, &2);
+        client.approve_proposal(&admin, &change);
+        client.approve_proposal(&second_admin, &change);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&change);
+        assert_eq!(client.get_admins().len(), 2);
+        assert_eq!(client.get_threshold(), 2);
+    }
+
+    #[test]
     fn deactivate_by_owner_succeeds() {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
@@ -2411,10 +2668,11 @@ mod test {
     }
 
     #[test]
-    fn admin_gated_calls_on_uninitialized_registry_error() {
+    fn unauthorized_owner_management_call_is_rejected() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
         let client = LuminaRegistryClient::new(&env, &contract_id);
         let (_owner, target) = register_sample(&env, &client);
         let stranger = Address::generate(&env);
@@ -2422,19 +2680,16 @@ mod test {
 
         assert_eq!(
             client.try_transfer_ownership(&stranger, &target, &new_owner),
-            Err(Ok(RegistryError::NotInitialized)),
+            Err(Ok(RegistryError::Unauthorized)),
         );
     }
 
     // ── Upgrade-path tests ──────────────────────────────────────────────────
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
-        let contract_id = env.register(registry_v1_wasm::WASM, ());
-        let client = registry_v1_wasm::Client::new(env, &contract_id);
         let admin = Address::generate(env);
-        let mut admins = Vec::new(env);
-        admins.push_back(admin.clone());
-        client.initialize(&admins, &1);
+        let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
+        let client = registry_v1_wasm::Client::new(env, &contract_id);
         (client, admin, contract_id)
     }
 
@@ -2592,6 +2847,79 @@ mod test {
         v2.upgrade(&admin, &v2_hash);
     }
 
+    /// Data of the single `registry_upgraded` event emitted by `contract_id`
+    /// during the last invocation.
+    fn registry_upgraded_data(env: &Env, contract_id: &Address) -> soroban_sdk::Val {
+        let topic = Symbol::new(env, "registry_upgraded");
+        let mut found: Vec<soroban_sdk::Val> = Vec::new(env);
+        for (emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(env, &t).ok());
+            if &emitter == contract_id && first == Some(topic.clone()) {
+                found.push_back(data);
+            }
+        }
+        assert_eq!(found.len(), 1, "expected exactly one registry_upgraded event");
+        found.get(0).unwrap()
+    }
+
+    // The upgrade event carries the version of the code being *replaced*.
+    // Emitting the incoming version would be an equally plausible-looking
+    // choice, and it would silently invert every consumer's reading of the
+    // field — these tests pin the intent so that change cannot slip through.
+
+    #[test]
+    fn registry_upgraded_event_reports_the_replaced_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let replaced = v1.get_version();
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+        // Read the event before any further call: `events().all()` only
+        // covers the most recent invocation.
+        let (by, hash, version): (Address, BytesN<32>, u32) =
+            registry_upgraded_data(&env, &contract_id).into_val(&env);
+
+        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
+        assert_ne!(replaced, incoming, "fixture must make the two versions distinguishable");
+        assert_eq!(by, admin);
+        assert_eq!(hash, v2_hash);
+        assert_eq!(version, replaced);
+        assert_ne!(version, incoming);
+    }
+
+    #[test]
+    fn governance_upgrade_event_reports_the_replaced_version() {
+        // The v1 fixture is the release wasm, built without `cfg(test)`, so it
+        // enforces the production timelock. Stretch entry TTLs so waiting it
+        // out does not archive the registry's storage or code.
+        let production_timelock: u32 = 17_280;
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = production_timelock * 2;
+            li.min_temp_entry_ttl = production_timelock * 2;
+            li.max_entry_ttl = production_timelock * 4;
+        });
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let replaced = v1.get_version();
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        let pid = v1.propose_upgrade(&admin, &v2_hash);
+        v1.approve_proposal(&admin, &pid);
+        advance_ledger(&env, production_timelock);
+        v1.execute_proposal(&pid);
+        let (hash, version): (BytesN<32>, u32) =
+            registry_upgraded_data(&env, &contract_id).into_val(&env);
+
+        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
+        assert_ne!(replaced, incoming, "fixture must make the two versions distinguishable");
+        assert_eq!(hash, v2_hash);
+        assert_eq!(version, replaced);
+        assert_ne!(version, incoming);
+    }
+
     #[test]
     fn register_contract_populates_owner_index() {
         let (env, client, _admin) = setup();
@@ -2661,14 +2989,13 @@ mod test {
     }
 
     #[test]
-    fn get_admin_before_initialize_reports_not_initialized() {
+    fn constructor_sets_bootstrap_admin() {
         let env = Env::default();
-        let contract_id = env.register(LuminaRegistry, ());
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
         let client = LuminaRegistryClient::new(&env, &contract_id);
-        assert_eq!(
-            client.try_get_admin(),
-            Err(Ok(RegistryError::NotInitialized))
-        );
+        assert_eq!(client.get_admin(), admin);
     }
 
     #[test]
@@ -3333,6 +3660,229 @@ mod test {
         assert_eq!(client.get_reputation(&target).slashed_total, 250);
         assert_eq!(client.get_reputation(&target).stake, 0);
         assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Stake-token failure ─────────────────────────────────────────────────
+    //
+    // Real stake tokens can refuse a transfer — a frozen trustline, an
+    // insufficient balance, a clawback-enabled asset. Every staking path moves
+    // tokens before writing its own bookkeeping, and relies on the failed
+    // transfer aborting the whole invocation so that nothing it wrote
+    // survives. These tests use a token that fails on demand to check that the
+    // registry's stored balances never drift from what the token reports.
+
+    #[contracttype]
+    enum FailingTokenKey {
+        Balance(Address),
+        Failing,
+    }
+
+    /// A minimal SEP-41-shaped token whose `transfer` can be switched to fail.
+    #[contract]
+    struct FailingToken;
+
+    #[contractimpl]
+    impl FailingToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = FailingTokenKey::Balance(to);
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(current + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage().persistent().get(&FailingTokenKey::Balance(id)).unwrap_or(0)
+        }
+
+        pub fn set_failing(env: Env, failing: bool) {
+            env.storage().instance().set(&FailingTokenKey::Failing, &failing);
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            if env.storage().instance().get(&FailingTokenKey::Failing).unwrap_or(false) {
+                panic!("transfer refused: account frozen");
+            }
+            let from_balance = Self::balance(env.clone(), from.clone());
+            if from_balance < amount {
+                panic!("transfer refused: insufficient balance");
+            }
+            env.storage().persistent()
+                .set(&FailingTokenKey::Balance(from), &(from_balance - amount));
+            Self::mint(env, to, amount);
+        }
+    }
+
+    /// Like [`setup_staking`], but with a [`FailingToken`] as the stake token.
+    fn setup_failing_staking() -> (
+        Env,
+        LuminaRegistryClient<'static>,
+        Address,
+        FailingTokenClient<'static>,
+        Address,
+    ) {
+        let (env, client, admin) = setup();
+        let token_id = env.register(FailingToken, ());
+        let token = FailingTokenClient::new(&env, &token_id);
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        (env, client, admin, token, treasury)
+    }
+
+    /// The registry's recorded stakes must add up to exactly what the token
+    /// says the registry holds.
+    fn assert_accounting_matches_token(
+        client: &LuminaRegistryClient,
+        token: &FailingTokenClient,
+        registrations: &[&Address],
+    ) {
+        let recorded: i128 = registrations.iter().map(|r| client.get_stake(r)).sum();
+        assert_eq!(recorded, token.balance(&client.address));
+    }
+
+    #[test]
+    fn failed_stake_transfer_records_no_stake() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+
+        token.set_failing(&true);
+        assert!(client.try_stake(&owner, &target, &400).is_err());
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(client.get_reputation(&target).stake, 0);
+        assert_eq!(token.balance(&owner), 1_000);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        // Nothing was half-applied, so a retry once the token recovers counts
+        // the stake exactly once.
+        token.set_failing(&false);
+        client.stake(&owner, &target, &400);
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(token.balance(&owner), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn failed_top_up_leaves_the_existing_stake_untouched() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &400);
+
+        token.set_failing(&true);
+        assert!(client.try_stake(&owner, &target, &100).is_err());
+
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(token.balance(&owner), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn stake_beyond_the_owners_balance_records_nothing() {
+        // The same guarantee against a real Stellar Asset Contract, whose
+        // refusal here is an ordinary insufficient-balance error.
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 100);
+
+        assert!(client.try_stake(&owner, &target, &101).is_err());
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(balance(&env, &token_id, &owner), 100);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+    }
+
+    #[test]
+    fn failed_withdraw_transfer_keeps_the_stake_recorded() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &750);
+        client.stake(&owner, &target, &750);
+        client.deactivate(&owner, &target);
+
+        token.set_failing(&true);
+        assert!(client.try_withdraw_stake(&owner, &target).is_err());
+
+        // Zeroing the stake without the tokens leaving would strand them in
+        // the registry with no registration able to claim them.
+        assert_eq!(client.get_stake(&target), 750);
+        assert_eq!(token.balance(&owner), 0);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        token.set_failing(&false);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(token.balance(&owner), 750);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn failed_slash_transfer_leaves_stake_history_and_proposal_untouched() {
+        let (env, client, admin, token, treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &1_000);
+
+        let reason = String::from_str(&env, "indexed a phishing contract");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        token.set_failing(&true);
+        assert!(client.try_execute_proposal(&pid).is_err());
+
+        // No stake debited, no slash recorded, no withdraw lock applied, and
+        // — although `execute_proposal` marks the proposal executed before
+        // applying it — that mark is rolled back too, so it can be retried.
+        assert_eq!(client.get_stake(&target), 1_000);
+        assert_eq!(client.get_slashes(&target).len(), 0);
+        assert_eq!(client.get_reputation(&target).slashed_total, 0);
+        assert_eq!(client.get_reputation(&target).withdraw_locked_until, 0);
+        assert!(!client.get_proposal(&pid).executed);
+        assert_eq!(token.balance(&treasury), 0);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        token.set_failing(&false);
+        client.execute_proposal(&pid);
+        assert_eq!(client.get_stake(&target), 600);
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_eq!(token.balance(&treasury), 400);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        // The retried slash applied its lock as normal.
+        client.deactivate(&owner, &target);
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+    }
+
+    #[test]
+    fn a_failed_transfer_on_one_registration_does_not_disturb_another() {
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner_a, a) = register_sample(&env, &client);
+        let (owner_b, b) = register_sample(&env, &client);
+        token.mint(&owner_a, &500);
+        token.mint(&owner_b, &300);
+        client.stake(&owner_a, &a, &500);
+        client.stake(&owner_b, &b, &300);
+
+        let reason = String::from_str(&env, "spam");
+        let pid = client.propose_slash(&admin, &a, &200, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.deactivate(&owner_b, &b);
+
+        token.set_failing(&true);
+        assert!(client.try_execute_proposal(&pid).is_err());
+        assert!(client.try_withdraw_stake(&owner_b, &b).is_err());
+
+        assert_eq!(client.get_stake(&a), 500);
+        assert_eq!(client.get_stake(&b), 300);
+        assert_accounting_matches_token(&client, &token, &[&a, &b]);
     }
 
     // ── Category taxonomy ───────────────────────────────────────────────────
