@@ -738,6 +738,11 @@ impl LuminaRegistry {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
+        // `CONTRACT_VERSION` is the version being *replaced*, not the incoming
+        // one: the new wasm only takes over once this invocation returns, and
+        // this code cannot know what version the new wasm carries. Consumers
+        // read this field as "upgraded away from vN" — do not "fix" it to the
+        // new version. Pinned by `registry_upgraded_event_reports_the_replaced_version`.
         env.events().publish(
             (Symbol::new(&env, "registry_upgraded"),),
             (admin, new_wasm_hash, CONTRACT_VERSION),
@@ -1339,6 +1344,7 @@ impl LuminaRegistry {
             }
             ProposalAction::Upgrade(new_wasm_hash) => {
                 env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+                // The version being replaced, deliberately — see `upgrade`.
                 env.events().publish(
                     (Symbol::new(env, "registry_upgraded"),),
                     (new_wasm_hash.clone(), CONTRACT_VERSION),
@@ -1564,8 +1570,8 @@ impl LuminaRegistry {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke};
-    use soroban_sdk::IntoVal;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::{IntoVal, TryFromVal};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
 
@@ -2380,6 +2386,79 @@ mod test {
         v2.upgrade(&admin, &v2_hash);
     }
 
+    /// Data of the single `registry_upgraded` event emitted by `contract_id`
+    /// during the last invocation.
+    fn registry_upgraded_data(env: &Env, contract_id: &Address) -> soroban_sdk::Val {
+        let topic = Symbol::new(env, "registry_upgraded");
+        let mut found: Vec<soroban_sdk::Val> = Vec::new(env);
+        for (emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(env, &t).ok());
+            if &emitter == contract_id && first == Some(topic.clone()) {
+                found.push_back(data);
+            }
+        }
+        assert_eq!(found.len(), 1, "expected exactly one registry_upgraded event");
+        found.get(0).unwrap()
+    }
+
+    // The upgrade event carries the version of the code being *replaced*.
+    // Emitting the incoming version would be an equally plausible-looking
+    // choice, and it would silently invert every consumer's reading of the
+    // field — these tests pin the intent so that change cannot slip through.
+
+    #[test]
+    fn registry_upgraded_event_reports_the_replaced_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let replaced = v1.get_version();
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+        // Read the event before any further call: `events().all()` only
+        // covers the most recent invocation.
+        let (by, hash, version): (Address, BytesN<32>, u32) =
+            registry_upgraded_data(&env, &contract_id).into_val(&env);
+
+        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
+        assert_ne!(replaced, incoming, "fixture must make the two versions distinguishable");
+        assert_eq!(by, admin);
+        assert_eq!(hash, v2_hash);
+        assert_eq!(version, replaced);
+        assert_ne!(version, incoming);
+    }
+
+    #[test]
+    fn governance_upgrade_event_reports_the_replaced_version() {
+        // The v1 fixture is the release wasm, built without `cfg(test)`, so it
+        // enforces the production timelock. Stretch entry TTLs so waiting it
+        // out does not archive the registry's storage or code.
+        let production_timelock: u32 = 17_280;
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = production_timelock * 2;
+            li.min_temp_entry_ttl = production_timelock * 2;
+            li.max_entry_ttl = production_timelock * 4;
+        });
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let replaced = v1.get_version();
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        let pid = v1.propose_upgrade(&admin, &v2_hash);
+        v1.approve_proposal(&admin, &pid);
+        advance_ledger(&env, production_timelock);
+        v1.execute_proposal(&pid);
+        let (hash, version): (BytesN<32>, u32) =
+            registry_upgraded_data(&env, &contract_id).into_val(&env);
+
+        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
+        assert_ne!(replaced, incoming, "fixture must make the two versions distinguishable");
+        assert_eq!(hash, v2_hash);
+        assert_eq!(version, replaced);
+        assert_ne!(version, incoming);
+    }
+
     #[test]
     fn register_contract_populates_owner_index() {
         let (env, client, _admin) = setup();
@@ -3054,6 +3133,229 @@ mod test {
         assert_eq!(client.get_slashes(&target).len(), 1);
         assert_eq!(client.get_reputation(&target).slashed_total, 250);
         assert_eq!(client.get_reputation(&target).stake, 0);
+    }
+
+    // ── Stake-token failure ─────────────────────────────────────────────────
+    //
+    // Real stake tokens can refuse a transfer — a frozen trustline, an
+    // insufficient balance, a clawback-enabled asset. Every staking path moves
+    // tokens before writing its own bookkeeping, and relies on the failed
+    // transfer aborting the whole invocation so that nothing it wrote
+    // survives. These tests use a token that fails on demand to check that the
+    // registry's stored balances never drift from what the token reports.
+
+    #[contracttype]
+    enum FailingTokenKey {
+        Balance(Address),
+        Failing,
+    }
+
+    /// A minimal SEP-41-shaped token whose `transfer` can be switched to fail.
+    #[contract]
+    struct FailingToken;
+
+    #[contractimpl]
+    impl FailingToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = FailingTokenKey::Balance(to);
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(current + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage().persistent().get(&FailingTokenKey::Balance(id)).unwrap_or(0)
+        }
+
+        pub fn set_failing(env: Env, failing: bool) {
+            env.storage().instance().set(&FailingTokenKey::Failing, &failing);
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            if env.storage().instance().get(&FailingTokenKey::Failing).unwrap_or(false) {
+                panic!("transfer refused: account frozen");
+            }
+            let from_balance = Self::balance(env.clone(), from.clone());
+            if from_balance < amount {
+                panic!("transfer refused: insufficient balance");
+            }
+            env.storage().persistent()
+                .set(&FailingTokenKey::Balance(from), &(from_balance - amount));
+            Self::mint(env, to, amount);
+        }
+    }
+
+    /// Like [`setup_staking`], but with a [`FailingToken`] as the stake token.
+    fn setup_failing_staking() -> (
+        Env,
+        LuminaRegistryClient<'static>,
+        Address,
+        FailingTokenClient<'static>,
+        Address,
+    ) {
+        let (env, client, admin) = setup();
+        let token_id = env.register(FailingToken, ());
+        let token = FailingTokenClient::new(&env, &token_id);
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        (env, client, admin, token, treasury)
+    }
+
+    /// The registry's recorded stakes must add up to exactly what the token
+    /// says the registry holds.
+    fn assert_accounting_matches_token(
+        client: &LuminaRegistryClient,
+        token: &FailingTokenClient,
+        registrations: &[&Address],
+    ) {
+        let recorded: i128 = registrations.iter().map(|r| client.get_stake(r)).sum();
+        assert_eq!(recorded, token.balance(&client.address));
+    }
+
+    #[test]
+    fn failed_stake_transfer_records_no_stake() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+
+        token.set_failing(&true);
+        assert!(client.try_stake(&owner, &target, &400).is_err());
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(client.get_reputation(&target).stake, 0);
+        assert_eq!(token.balance(&owner), 1_000);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        // Nothing was half-applied, so a retry once the token recovers counts
+        // the stake exactly once.
+        token.set_failing(&false);
+        client.stake(&owner, &target, &400);
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(token.balance(&owner), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn failed_top_up_leaves_the_existing_stake_untouched() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &400);
+
+        token.set_failing(&true);
+        assert!(client.try_stake(&owner, &target, &100).is_err());
+
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(token.balance(&owner), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn stake_beyond_the_owners_balance_records_nothing() {
+        // The same guarantee against a real Stellar Asset Contract, whose
+        // refusal here is an ordinary insufficient-balance error.
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 100);
+
+        assert!(client.try_stake(&owner, &target, &101).is_err());
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(balance(&env, &token_id, &owner), 100);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+    }
+
+    #[test]
+    fn failed_withdraw_transfer_keeps_the_stake_recorded() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &750);
+        client.stake(&owner, &target, &750);
+        client.deactivate(&owner, &target);
+
+        token.set_failing(&true);
+        assert!(client.try_withdraw_stake(&owner, &target).is_err());
+
+        // Zeroing the stake without the tokens leaving would strand them in
+        // the registry with no registration able to claim them.
+        assert_eq!(client.get_stake(&target), 750);
+        assert_eq!(token.balance(&owner), 0);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        token.set_failing(&false);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(token.balance(&owner), 750);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn failed_slash_transfer_leaves_stake_history_and_proposal_untouched() {
+        let (env, client, admin, token, treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &1_000);
+
+        let reason = String::from_str(&env, "indexed a phishing contract");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        token.set_failing(&true);
+        assert!(client.try_execute_proposal(&pid).is_err());
+
+        // No stake debited, no slash recorded, no withdraw lock applied, and
+        // — although `execute_proposal` marks the proposal executed before
+        // applying it — that mark is rolled back too, so it can be retried.
+        assert_eq!(client.get_stake(&target), 1_000);
+        assert_eq!(client.get_slashes(&target).len(), 0);
+        assert_eq!(client.get_reputation(&target).slashed_total, 0);
+        assert_eq!(client.get_reputation(&target).withdraw_locked_until, 0);
+        assert!(!client.get_proposal(&pid).executed);
+        assert_eq!(token.balance(&treasury), 0);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        token.set_failing(&false);
+        client.execute_proposal(&pid);
+        assert_eq!(client.get_stake(&target), 600);
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_eq!(token.balance(&treasury), 400);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        // The retried slash applied its lock as normal.
+        client.deactivate(&owner, &target);
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+    }
+
+    #[test]
+    fn a_failed_transfer_on_one_registration_does_not_disturb_another() {
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner_a, a) = register_sample(&env, &client);
+        let (owner_b, b) = register_sample(&env, &client);
+        token.mint(&owner_a, &500);
+        token.mint(&owner_b, &300);
+        client.stake(&owner_a, &a, &500);
+        client.stake(&owner_b, &b, &300);
+
+        let reason = String::from_str(&env, "spam");
+        let pid = client.propose_slash(&admin, &a, &200, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.deactivate(&owner_b, &b);
+
+        token.set_failing(&true);
+        assert!(client.try_execute_proposal(&pid).is_err());
+        assert!(client.try_withdraw_stake(&owner_b, &b).is_err());
+
+        assert_eq!(client.get_stake(&a), 500);
+        assert_eq!(client.get_stake(&b), 300);
+        assert_accounting_matches_token(&client, &token, &[&a, &b]);
     }
 
     // ── Category taxonomy ───────────────────────────────────────────────────
