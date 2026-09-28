@@ -23,3 +23,12 @@ jobs:
       # tests deploy from these wasm artifacts.
       - run: cargo build --target wasm32v1-none --release
       - run: cargo test
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v1.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

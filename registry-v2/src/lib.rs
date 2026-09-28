@@ -1,4 +1,5 @@
 #![no_std]
+#![warn(missing_docs)]
 //! Lumina Registry v2 — the upgrade target used by the registry's upgrade tests.
 //!
 //! This crate exists so `registry`'s test suite can perform a *real* Soroban
@@ -37,12 +38,16 @@ use soroban_sdk::{
 /// version means bumping this one too, and nothing else.
 pub const CONTRACT_VERSION: u32 = 4;
 
+/// Errors returned by the Lumina Registry v2 contract.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
+    /// Caller lacks authorization for this action.
     Unauthorized     = 2,
+    /// Referenced contract was not found.
     ContractNotFound = 4,
+    /// The registry has no admin set.
     NotInitialized   = 7,
 }
 
@@ -50,33 +55,47 @@ pub enum RegistryError {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractEntry {
+    /// The registered Soroban contract address.
     pub contract_id: Address,
+    /// Owner/deployer who registered this contract.
     pub owner: Address,
+    /// Human-readable name.
     pub name: soroban_sdk::String,
+    /// Short description of what the contract does.
     pub description: soroban_sdk::String,
+    /// Ledger at which this contract was registered.
     pub registered_at: u32,
+    /// Whether indexing is currently active for this contract.
     pub active: bool,
 }
 
-/// Byte-compatible with `lumina_registry::DataKey`.
+/// Storage keys byte-compatible with `lumina_registry::DataKey`.
 #[contracttype]
 pub enum DataKey {
+    /// Single admin address storage key.
     Admin,
+    /// Total contract count storage key.
     ContractCount,
+    /// Contract metadata storage key by address.
     Contract(Address),
+    /// List of contract addresses owned by an address.
     OwnerContracts(Address),
+    /// List of all registered contract addresses.
     AllContracts,
 }
 
+/// Upgraded v2 registry contract target used for upgrade testing.
 #[contract]
 pub struct LuminaRegistryV2;
 
 #[contractimpl]
 impl LuminaRegistryV2 {
+    /// Return the contract version for v2.
     pub fn get_version(_env: Env) -> u32 {
         CONTRACT_VERSION
     }
 
+    /// Retrieve the metadata entry for a registered contract.
     pub fn get_contract(env: Env, contract_id: Address) -> Result<ContractEntry, RegistryError> {
         env.storage()
             .persistent()
@@ -84,10 +103,12 @@ impl LuminaRegistryV2 {
             .ok_or(RegistryError::ContractNotFound)
     }
 
+    /// Return the total count of registered contracts.
     pub fn get_contract_count(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
     }
 
+    /// Retrieve paginated contracts registered by a specific owner.
     pub fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry> {
         let owned: Vec<Address> = env
             .storage()
@@ -98,13 +119,14 @@ impl LuminaRegistryV2 {
 
         let mut i = offset;
         while i < owned.len() && result.len() < limit {
-            let contract_id = owned.get(i).unwrap();
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
-            {
-                result.push_back(entry);
+            if let Some(contract_id) = owned.get(i) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+                {
+                    result.push_back(entry);
+                }
             }
             i += 1;
         }

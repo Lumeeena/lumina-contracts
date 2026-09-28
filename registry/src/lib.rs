@@ -1,4 +1,5 @@
 #![no_std]
+#![warn(missing_docs)]
 //! Lumina Registry — on-chain contract registry for the Lumina indexer.
 //!
 //! Projects deploy their Soroban contracts and register them here so that
@@ -52,6 +53,7 @@ pub const CONTRACT_VERSION: u32 = 3;
 #[cfg(not(test))]
 pub const TIMELOCK_LEDGERS: u32 = 17_280;
 
+/// Test configuration for timelock ledgers.
 #[cfg(test)]
 pub const TIMELOCK_LEDGERS: u32 = 10;
 
@@ -69,19 +71,26 @@ pub const TIMELOCK_LEDGERS: u32 = 10;
 #[cfg(not(test))]
 pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 
+/// Test configuration for slash lock ledgers.
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
+/// Errors returned by the Lumina Registry contract operations.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
+    /// Contract is already initialized.
     AlreadyInitialized  = 1,
+    /// Caller lacks authorization for this action.
     Unauthorized        = 2,
+    /// Contract is already registered.
     AlreadyRegistered   = 3,
+    /// Referenced contract was not found.
     ContractNotFound    = 4,
+    /// Metadata provided is invalid.
     InvalidMetadata     = 5,
     /// Caller is not the registered owner of the contract.
     NotOwner            = 6,
@@ -133,6 +142,7 @@ pub enum RegistryError {
 // `registry-v2/src/lib.rs` re-declares both types independently and reads
 // back storage written by this version — that test keeps these rules honest.
 
+/// Stored entry describing a registered Soroban contract.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractEntry {
@@ -180,13 +190,21 @@ pub struct ContractEntry {
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Category {
+    /// Decentralized finance protocols and instruments.
     DeFi,
+    /// Non-fungible token contracts and collections.
     Nft,
+    /// On-chain gaming contracts and state.
     Gaming,
+    /// Identity and credential verification contracts.
     Identity,
+    /// Core infrastructure, routers, and utility contracts.
     Infrastructure,
+    /// Payment processors and payment rails.
     Payments,
+    /// Data oracles and price feeds.
     Oracle,
+    /// Decentralized autonomous organizations and governance contracts.
     Dao,
     /// Anything the vocabulary does not cover yet.
     Other,
@@ -235,7 +253,9 @@ pub struct Reputation {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractProfile {
+    /// The base registration metadata and status.
     pub entry: ContractEntry,
+    /// The reputation and staking signal.
     pub reputation: Reputation,
 }
 
@@ -283,6 +303,7 @@ pub struct Proposal {
     pub executed: bool,
 }
 
+/// Storage keys used by the Lumina Registry contract.
 #[contracttype]
 pub enum DataKey {
     // ── Governance ──────────────────────────────────────────────────────────
@@ -296,10 +317,14 @@ pub enum DataKey {
     ProposalData(u32),
 
     // ── Registry ────────────────────────────────────────────────────────────
+    /// u32 — total number of contracts registered.
     ContractCount,
+    /// ContractEntry — mapping from contract address to registration entry.
     Contract(Address),
-    OwnerContracts(Address), // owner → Vec<Address>
-    AllContracts,            // insertion-ordered Vec<Address> of every registered contract
+    /// Vec<Address> — list of contracts registered by a specific owner.
+    OwnerContracts(Address),
+    /// Vec<Address> — insertion-ordered list of every registered contract.
+    AllContracts,
 
     // ── Staking & reputation ────────────────────────────────────────────────
     /// Address — the SEP-41 token stakes are denominated in.
@@ -334,6 +359,7 @@ pub enum DataKey {
 
 // ─── Contract ──────────────────────────────────────────────────────────────
 
+/// Main contract type implementing the Lumina on-chain contract registry.
 #[contract]
 pub struct LuminaRegistry;
 
@@ -360,8 +386,8 @@ impl LuminaRegistry {
         }
 
         // Every admin must authorize the initialization.
-        for i in 0..admins.len() {
-            admins.get(i).unwrap().require_auth();
+        for admin in admins.iter() {
+            admin.require_auth();
         }
 
         env.storage().instance().set(&DataKey::Admins, &admins);
@@ -371,7 +397,7 @@ impl LuminaRegistry {
 
         // Write the legacy Admin key with the first admin so the v2 upgrade
         // tests (which read DataKey::Admin) continue to pass unchanged.
-        let first_admin = admins.get(0).unwrap();
+        let first_admin = admins.get(0).ok_or(RegistryError::InvalidThreshold)?;
         env.storage().instance().set(&DataKey::Admin, &first_admin);
 
         Ok(())
@@ -978,10 +1004,7 @@ impl LuminaRegistry {
             return Ok(a);
         }
         let admins = Self::admin_index(&env);
-        if admins.is_empty() {
-            return Err(RegistryError::NotInitialized);
-        }
-        Ok(admins.get(0).unwrap())
+        admins.get(0).ok_or(RegistryError::NotInitialized)
     }
 
     /// The full current admin set.
@@ -1036,10 +1059,11 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < index.len() && result.len() < limit {
-            let contract_id = index.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
-                    result.push_back(entry);
+            if let Some(contract_id) = index.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    if entry.active {
+                        result.push_back(entry);
+                    }
                 }
             }
             i += 1;
@@ -1102,13 +1126,14 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < all.len() && result.len() < limit {
-            let contract_id = all.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                if entry.active {
-                    result.push_back(ContractProfile {
-                        reputation: Self::reputation_of(&env, &contract_id),
-                        entry,
-                    });
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                    if entry.active {
+                        result.push_back(ContractProfile {
+                            reputation: Self::reputation_of(&env, &contract_id),
+                            entry,
+                        });
+                    }
                 }
             }
             i += 1;
@@ -1117,16 +1142,19 @@ impl LuminaRegistry {
         result
     }
 
+    /// Retrieve the metadata entry for a registered contract.
     pub fn get_contract(env: Env, contract_id: Address) -> Result<ContractEntry, RegistryError> {
         env.storage().persistent()
             .get(&DataKey::Contract(contract_id))
             .ok_or(RegistryError::ContractNotFound)
     }
 
+    /// Return the total count of registered contracts.
     pub fn get_contract_count(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
     }
 
+    /// Check whether a contract address is registered in the registry.
     pub fn is_registered(env: Env, contract_id: Address) -> bool {
         env.storage().persistent().has(&DataKey::Contract(contract_id))
     }
@@ -1138,10 +1166,11 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < all.len() && result.len() < limit {
-            let contract_id = all.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
-                    result.push_back(entry);
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    if entry.active {
+                        result.push_back(entry);
+                    }
                 }
             }
             i += 1;
@@ -1158,9 +1187,10 @@ impl LuminaRegistry {
 
         let mut i = offset;
         while i < owned.len() && result.len() < limit {
-            let contract_id = owned.get(i).unwrap();
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                result.push_back(entry);
+            if let Some(contract_id) = owned.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    result.push_back(entry);
+                }
             }
             i += 1;
         }
@@ -1826,7 +1856,7 @@ mod test {
         // First approval succeeds.
         client.approve_proposal(&a1, &pid);
         // Second approval rejected.
-        client.try_approve_proposal(&a1, &pid).unwrap_err();
+        let _ = client.try_approve_proposal(&a1, &pid).unwrap_err();
 
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         // Still below threshold (need 2), so execution must fail.
