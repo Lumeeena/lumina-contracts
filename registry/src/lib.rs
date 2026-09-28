@@ -43,7 +43,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 4;
+pub const CONTRACT_VERSION: u32 = 5;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -133,6 +133,10 @@ pub enum RegistryError {
     NotAllowlisted      = 23,
     /// The registration rate limit has been exceeded.
     RegistrationRateLimited = 24,
+    /// Registration fee was not paid.
+    InsufficientFee = 25,
+    /// Tag count or length exceeds bounds.
+    InvalidTags = 26,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -289,6 +293,36 @@ pub struct ContractProfilePage {
     pub has_more: bool,
 }
 
+/// Entry for batch registration.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RegistrationEntry {
+    /// Contract to register.
+    pub contract_id: Address,
+    /// Human-readable name.
+    pub name: String,
+    /// Short description.
+    pub description: String,
+    /// Categories for browsing.
+    pub categories: Vec<Category>,
+}
+
+/// Registry statistics aggregating key metrics.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RegistryStats {
+    /// Total number of registrations ever made.
+    pub total_registered: u32,
+    /// Number of currently active registrations.
+    pub active_count: u32,
+    /// Number of verified registrations.
+    pub verified_count: u32,
+    /// Number of registrations with non-zero stake.
+    pub staked_count: u32,
+    /// Total staked amount across all registrations.
+    pub total_staked: i128,
+}
+
 // ─── Proposal types ────────────────────────────────────────────────────────
 
 /// The action a governance proposal will execute once it clears threshold and
@@ -318,6 +352,8 @@ pub enum ProposalAction {
     SetAllowlisted(Address, bool),
     /// Set the per-owner limit and ledger window; a zero limit disables it.
     ConfigureRegistrationRateLimit(u32, u32),
+    /// Set the registration fee in the stake token; zero disables it.
+    SetRegistrationFee(i128),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -413,6 +449,20 @@ pub enum DataKey {
     RegistrationRateWindow,
     /// RegistrationWindow — the current fixed-window counter for one owner.
     RegistrationWindow(Address),
+
+    // ── Registration fee ────────────────────────────────────────────────────
+    /// i128 — governance-set registration fee in the stake token; zero disables it.
+    RegistrationFee,
+
+    // ── Tags ────────────────────────────────────────────────────────────────
+    /// Vec<Symbol> — owner-set normalized tags for a registration.
+    Tags(Address),
+
+    // ── Registry statistics ────────────────────────────────────────────────
+    /// i128 — total staked across all registrations.
+    TotalStaked,
+    /// u32 — count of verified registrations.
+    VerifiedCount,
 
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 initialize.  Retained so
@@ -769,6 +819,29 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// Set the registration fee. Zero disables it (registration becomes free).
+    pub fn propose_set_registration_fee(
+        env: Env,
+        proposer: Address,
+        fee: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if fee < 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetRegistrationFee(fee),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_registration_fee"), fee),
+        );
+        Ok(proposal_id)
+    }
+
     // ── Governance: approval ────────────────────────────────────────────────
 
     /// Record an admin's approval of a proposal.  When the number of unique
@@ -954,10 +1027,26 @@ impl LuminaRegistry {
 
         // Delete the entry and its live reputation state. Slashes are kept
         // for auditability (see docstring above).
+        let was_verified = env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+            .unwrap_or(false);
+        let staked = Self::stake_of(&env, &contract_id);
+
         env.storage().persistent().remove(&DataKey::Contract(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Stake(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Tags(contract_id.clone()));
+
+        if was_verified {
+            let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(1);
+            env.storage().instance().set(&DataKey::VerifiedCount, &count.saturating_sub(1));
+        }
+
+        if staked > 0 {
+            let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+            env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+        }
 
         // Live total goes down; lifetime total does not (see #141).
         let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(1);
@@ -1111,6 +1200,16 @@ impl LuminaRegistry {
 
         Self::consume_registration_rate(&env, &owner)?;
 
+        let fee: i128 = env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0);
+        if fee > 0 {
+            let (token_id, treasury) = Self::staking_config(&env)?;
+            token::Client::new(&env, &token_id).transfer(
+                &owner,
+                &treasury,
+                &fee,
+            );
+        }
+
         let entry = ContractEntry {
             contract_id: contract_id.clone(),
             owner: owner.clone(),
@@ -1143,6 +1242,89 @@ impl LuminaRegistry {
             (Symbol::new(&env, "contract_registered"),),
             (contract_id, owner, name, categories),
         );
+
+        Ok(())
+    }
+
+    /// Register multiple contracts in a single atomic transaction.
+    /// Fails and registers nothing if any entry is invalid or already registered.
+    /// The combined count of new registrations is subject to the per-owner cap
+    /// if registration rate limiting is enabled.
+    pub fn register_contracts(
+        env: Env,
+        owner: Address,
+        entries: Vec<RegistrationEntry>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        if entries.is_empty() {
+            return Err(RegistryError::InvalidMetadata);
+        }
+
+        let max_batch: u32 = 100;
+        if entries.len() > max_batch {
+            return Err(RegistryError::InvalidMetadata);
+        }
+
+        if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
+            && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
+        {
+            return Err(RegistryError::NotAllowlisted);
+        }
+
+        for entry in entries.iter() {
+            if env.storage().persistent().has(&DataKey::Contract(entry.contract_id.clone())) {
+                return Err(RegistryError::AlreadyRegistered);
+            }
+            Self::dedup_categories(&env, &entry.categories)?;
+        }
+
+        let fee: i128 = env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0);
+        if fee > 0 {
+            let total_fee = fee * (entries.len() as i128);
+            let (token_id, treasury) = Self::staking_config(&env)?;
+            token::Client::new(&env, &token_id).transfer(
+                &owner,
+                &treasury,
+                &total_fee,
+            );
+        }
+
+        for entry in entries.iter() {
+            Self::consume_registration_rate(&env, &owner)?;
+
+            let contract_entry = ContractEntry {
+                contract_id: entry.contract_id.clone(),
+                owner: owner.clone(),
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                registered_at: env.ledger().sequence(),
+                active: true,
+            };
+
+            env.storage().persistent().set(&DataKey::Contract(entry.contract_id.clone()), &contract_entry);
+
+            let mut owned = Self::owner_index(&env, &owner);
+            owned.push_back(entry.contract_id.clone());
+            Self::set_owner_index(&env, &owner, &owned);
+
+            let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+            all.push_back(entry.contract_id.clone());
+            env.storage().instance().set(&DataKey::AllContracts, &all);
+
+            let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
+            env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
+            let total: u32 = env.storage().instance().get(&DataKey::TotalRegistered).unwrap_or(count);
+            env.storage().instance().set(&DataKey::TotalRegistered, &(total + 1));
+
+            let categories = Self::dedup_categories(&env, &entry.categories)?;
+            Self::index_categories(&env, &entry.contract_id, &categories);
+
+            env.events().publish(
+                (Symbol::new(&env, "contract_registered"),),
+                (entry.contract_id.clone(), owner.clone(), entry.name.clone(), categories),
+            );
+        }
 
         Ok(())
     }
@@ -1197,6 +1379,56 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    /// Set normalized, owner-defined tags for a registration.
+    /// Tags complement categories (which are fixed and for browsing) and provide
+    /// owner-set search metadata. Max 10 tags, each max 16 characters.
+    pub fn set_tags(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        tags: Vec<Symbol>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        const MAX_TAG_COUNT: u32 = 10;
+        const MAX_TAG_LEN: u32 = 16;
+
+        if tags.len() > MAX_TAG_COUNT {
+            return Err(RegistryError::InvalidTags);
+        }
+
+        for tag in tags.iter() {
+            let s = tag.to_string(&env);
+            if s.len() > MAX_TAG_LEN {
+                return Err(RegistryError::InvalidTags);
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::Tags(contract_id.clone()), &tags);
+
+        env.events().publish(
+            (Symbol::new(&env, "tags_updated"),),
+            (contract_id, owner, tags.len()),
+        );
+
+        Ok(())
+    }
+
+    /// Get tags for a registration.
+    pub fn get_tags(env: Env, contract_id: Address) -> Vec<Symbol> {
+        env.storage().persistent()
+            .get(&DataKey::Tags(contract_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
     // ── Staking ─────────────────────────────────────────────────────────────
 
     /// Post collateral against a registration you own.
@@ -1241,6 +1473,9 @@ impl LuminaRegistry {
 
         let staked = Self::stake_of(&env, &contract_id) + amount;
         env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &staked);
+
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked + amount));
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
@@ -1299,6 +1534,9 @@ impl LuminaRegistry {
         );
 
         env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &0i128);
+
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
@@ -1446,6 +1684,11 @@ impl LuminaRegistry {
         Self::staking_config(&env)
     }
 
+    /// The current registration fee. Zero means registration is free.
+    pub fn get_registration_fee(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0)
+    }
+
     /// Currently staked balance. Zero for a registration that never staked.
     pub fn get_stake(env: Env, contract_id: Address) -> i128 {
         Self::stake_of(&env, &contract_id)
@@ -1456,6 +1699,37 @@ impl LuminaRegistry {
         env.storage().persistent()
             .get(&DataKey::Verified(contract_id))
             .unwrap_or(false)
+    }
+
+    /// Aggregate registry statistics: total, active, verified, staked counts and total staked.
+    /// This is a constant-cost view built on maintained counters.
+    pub fn get_registry_stats(env: Env) -> RegistryStats {
+        let total_registered = env.storage().instance()
+            .get::<DataKey, u32>(&DataKey::TotalRegistered)
+            .unwrap_or(0);
+        let active_count = Self::get_active_contract_count(&env);
+        let verified_count = env.storage().instance()
+            .get::<DataKey, u32>(&DataKey::VerifiedCount)
+            .unwrap_or(0);
+        let total_staked = env.storage().instance()
+            .get::<DataKey, i128>(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        let mut staked_count: u32 = 0;
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        for contract_id in all.iter() {
+            if Self::stake_of(&env, &contract_id) > 0 {
+                staked_count += 1;
+            }
+        }
+
+        RegistryStats {
+            total_registered,
+            active_count,
+            verified_count,
+            staked_count,
+            total_staked,
+        }
     }
 
     /// Every slash levied against a registration, oldest first.
@@ -1943,8 +2217,20 @@ impl LuminaRegistry {
                 if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
                     return Err(RegistryError::ContractNotFound);
                 }
+                let was_verified = env.storage().persistent()
+                    .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+                    .unwrap_or(false);
                 env.storage().persistent()
                     .set(&DataKey::Verified(contract_id.clone()), verified);
+
+                if *verified && !was_verified {
+                    let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(0);
+                    env.storage().instance().set(&DataKey::VerifiedCount, &(count + 1));
+                } else if !*verified && was_verified {
+                    let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(1);
+                    env.storage().instance().set(&DataKey::VerifiedCount, &count.saturating_sub(1));
+                }
+
                 env.events().publish(
                     (Symbol::new(env, "verification_set"),),
                     (contract_id.clone(), *verified),
@@ -1970,6 +2256,9 @@ impl LuminaRegistry {
 
                 env.storage().persistent()
                     .set(&DataKey::Stake(contract_id.clone()), &(staked - *amount));
+
+                let total_staked: i128 = env.storage().persistent().get(&DataKey::TotalStaked).unwrap_or(0);
+                env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - *amount));
 
                 let slashed_at = env.ledger().sequence();
                 let mut history = Self::slash_history(env, contract_id);
@@ -2016,6 +2305,16 @@ impl LuminaRegistry {
                 env.events().publish(
                     (Symbol::new(env, "registration_rate_limit_changed"),),
                     (*limit, *window),
+                );
+            }
+            ProposalAction::SetRegistrationFee(fee) => {
+                if *fee < 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                env.storage().instance().set(&DataKey::RegistrationFee, fee);
+                env.events().publish(
+                    (Symbol::new(env, "registration_fee_set"),),
+                    (*fee,),
                 );
             }
         }
