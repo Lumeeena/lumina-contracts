@@ -383,6 +383,10 @@ pub enum DataKey {
     StakeToken,
     /// Address — where slashed stake is sent.
     Treasury,
+    /// Address — the previous staking token, if any (for reconfiguration tracking).
+    PreviousStakeToken,
+    /// Address — the previous treasury, if any (for reconfiguration tracking).
+    PreviousTreasury,
     /// i128 — currently staked balance for a registration.
     Stake(Address),
     /// bool — governance-attested verified status.
@@ -1932,11 +1936,42 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
+                // Get previous values if they exist (first configuration has none)
+                let prev_token: Address = if env.storage().instance().has(&DataKey::StakeToken) {
+                    env.storage().instance().get(&DataKey::StakeToken).unwrap()
+                } else {
+                    // First configuration: use zero address
+                    Address::from_str(env, "")
+                };
+                let prev_treasury: Address = if env.storage().instance().has(&DataKey::Treasury) {
+                    env.storage().instance().get(&DataKey::Treasury).unwrap()
+                } else {
+                    // First configuration: use zero address
+                    Address::from_str(env, "")
+                };
+
+                // Refuse token change if any stake is held
+                let stake_total: i128 = {
+                    let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(env));
+                    let mut total: i128 = 0;
+                    for contract_id in all.iter() {
+                        total += env.storage().persistent().get(&DataKey::Stake(contract_id)).unwrap_or(0);
+                    }
+                    total
+                };
+                if stake_total > 0 && *token_id != prev_token {
+                    return Err(RegistryError::StakeNotEmpty);
+                }
+
+                // Store previous values before overwriting
+                env.storage().instance().set(&DataKey::PreviousStakeToken, &prev_token);
+                env.storage().instance().set(&DataKey::PreviousTreasury, &prev_treasury);
+
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
                     (Symbol::new(env, "staking_configured"),),
-                    (token_id.clone(), treasury.clone()),
+                    (prev_token, prev_treasury, token_id, treasury),
                 );
             }
             ProposalAction::SetVerified(contract_id, verified) => {
