@@ -4339,6 +4339,37 @@ mod test {
     }
 
     #[test]
+    fn ownership_transfer_preserves_stake_and_verification() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let new_owner = Address::generate(&env);
+
+        mint(&env, &token_id, &owner, 500);
+        client.stake(&owner, &target, &500);
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        client.transfer_ownership(&owner, &target, &new_owner);
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.entry.owner, new_owner);
+        assert_eq!(profile.reputation.stake, 500);
+        assert!(profile.reputation.verified);
+        assert_eq!(client.get_stake(&target), 500);
+
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        client.deactivate(&new_owner, &target);
+        assert_eq!(client.withdraw_stake(&new_owner, &target), 500);
+        assert_eq!(client.get_stake(&target), 0);
+        assert!(client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
     fn categories_and_reputation_are_independent() {
         let (env, client, admin, token_id, _treasury) = setup_staking();
         let owner = Address::generate(&env);
