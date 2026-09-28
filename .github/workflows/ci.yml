@@ -22,4 +22,7 @@ jobs:
       # This step also has to run before `cargo test`: the registry's upgrade
       # tests deploy from these wasm artifacts.
       - run: cargo build --target wasm32v1-none --release
+      # Includes registry/tests/interface.rs, which fails on any change to the
+      # exported interface that registry/interface.snap has not been updated
+      # for. See "Interface snapshot" in the README for how to accept one.
       - run: cargo test

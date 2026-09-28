@@ -119,6 +119,25 @@ that test's upgrade target and is never deployed.
 Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
 
+### Interface snapshot
+
+[registry/interface.snap](./registry/interface.snap) is the registry's exported
+interface as read from the built wasm's contract spec: every function signature,
+struct, union, enum and error code, one per line and without doc comments.
+`cargo test` compares the current build against it, so CI fails on any change
+nobody reviewed, and the failure message lists the lines that changed.
+
+To accept an intended change, run one line after the wasm build and commit the
+updated snapshot along with the change:
+
+```bash
+UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
+```
+
+The snapshot diff in the PR is the review. A line that is only added is usually
+safe. A line that changes or disappears breaks the consumers described in
+[What breaks downstream](#what-breaks-downstream-when-the-interface-changes).
+
 ## Deploying
 
 Deployed on **testnet** at:
