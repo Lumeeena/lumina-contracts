@@ -36,7 +36,8 @@ stellar contract deploy \
   --wasm target/wasm32v1-none/release/lumina_registry.wasm \
   --source lumina-deployer \
   --network testnet \
-  --alias lumina-registry
+  --alias lumina-registry \
+  -- --bootstrap_admin lumina-deployer
 ```
 
 This prints the deployed contract's `C...` address — save it as `REGISTRY_CONTRACT_ID`.
@@ -45,15 +46,64 @@ If the deploy step fails with `HostError: Error(Storage, MissingValue)` /
 rerun the same `deploy` command a few seconds later; it skips re-uploading
 and picks up from the create-contract step.
 
-### Initialize
+The registry is initialized atomically by `__constructor` as part of deployment.
+The deploying identity must also authorize `bootstrap_admin`; there is no
+uninitialized interval for a newly deployed registry.
+
+### Bootstrap multi-sig governance
+
+A new registry starts with one admin and a threshold of one so deployment only
+requires one signer. That bootstrap admin can add the remaining admins through
+the normal proposal flow, then propose a higher threshold. Until that higher
+threshold proposal executes, the registry is effectively single-signer; use a
+trusted bootstrap key and complete the transition promptly.
+
+For each additional admin, propose, approve, wait for the timelock, then execute:
 
 ```bash
 stellar contract invoke \
   --id lumina-registry \
   --source lumina-deployer \
   --network testnet \
-  -- initialize --admin <your-address-G...>
+  -- propose_add_admin \
+  --proposer <current-admin-G...> \
+  --new_admin <new-admin-G...>
+
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- approve_proposal \
+  --admin <current-admin-G...> --proposal_id <proposal-id>
+# Wait TIMELOCK_LEDGERS (17,280 on network builds), then execute:
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- execute_proposal --proposal_id <proposal-id>
 ```
+
+After adding the desired admins, propose `change_threshold`, have the required
+admins approve it, wait out the timelock, and execute it:
+
+```bash
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- propose_change_threshold \
+  --proposer <current-admin-G...> --new_threshold <threshold>
+```
+
+`initialize` remains in the interface for an already-deployed pre-constructor
+instance that has not yet been initialized. New deployments use the constructor
+flow above; calling `initialize` on them returns `AlreadyInitialized`.
+
+### Registration policy
+
+Registration remains permissionless by default: allowlist mode starts disabled,
+and the rate limit starts at zero (disabled). Governance can enable allowlist
+mode, add or remove owners from the allowlist, and configure a per-owner count
+within a fixed ledger window. Each change uses the standard proposal, approval,
+timelock, and execution flow. A zero rate limit disables rate limiting; a
+nonzero limit requires a nonzero window. Owners who hit the configured cap
+receive `RegistrationRateLimited`, and the counter resets when the window ends.
+Windows must fit within the network's maximum persistent-entry TTL so the
+counter cannot expire before its configured window.
+
+The governance entrypoints are `propose_set_allowlist_enabled`,
+`propose_set_allowlisted`, and `propose_configure_registration_rate_limit`.
 
 ### Register a contract for indexing
 

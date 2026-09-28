@@ -40,7 +40,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 3;
+pub const CONTRACT_VERSION: u32 = 4;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -114,6 +114,12 @@ pub enum RegistryError {
     RegistrationActive  = 19,
     /// A registration must declare at least one category.
     NoCategories        = 20,
+    /// The owner is not permitted by the active registration allowlist.
+    NotAllowlisted      = 21,
+    /// The owner has reached the registration limit for this window.
+    RegistrationRateLimited = 22,
+    /// A nonzero registration limit requires a nonzero ledger window.
+    InvalidRateLimit    = 23,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -262,6 +268,20 @@ pub enum ProposalAction {
     SetVerified(Address, bool),
     /// Take `(contract_id, amount, reason)` of a registration's stake.
     Slash(Address, i128, String),
+    /// Enable or disable permissioned registration.
+    SetAllowlistEnabled(bool),
+    /// Add or remove an owner from the registration allowlist.
+    SetAllowlisted(Address, bool),
+    /// Set the per-owner limit and ledger window; a zero limit disables it.
+    ConfigureRegistrationRateLimit(u32, u32),
+}
+
+/// Fixed-window registration counter for one owner.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegistrationWindow {
+    pub started_at: u32,
+    pub count: u32,
 }
 
 /// State stored for every open (or executed) proposal.
@@ -325,6 +345,18 @@ pub enum DataKey {
     /// bounded entry shared by everything in it.
     ByCategory(Category),
 
+    // ── Registration policy ─────────────────────────────────────────────────
+    /// bool — whether only allowlisted owners may register.
+    AllowlistEnabled,
+    /// bool — whether an owner is allowlisted.
+    Allowlisted(Address),
+    /// u32 — per-owner registrations per fixed window; zero disables limiting.
+    RegistrationRateLimit,
+    /// u32 — fixed registration window size in ledgers.
+    RegistrationRateWindow,
+    /// RegistrationWindow — the current fixed-window counter for one owner.
+    RegistrationWindow(Address),
+
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 initialize.  Retained so
     /// that the registry-v2 upgrade tests, which read `DataKey::Admin` from
@@ -339,6 +371,19 @@ pub struct LuminaRegistry;
 
 #[contractimpl]
 impl LuminaRegistry {
+    /// Atomically initialize a new deployment with one bootstrap admin.
+    /// The deployment transaction must include that admin's authorization.
+    pub fn __constructor(env: Env, bootstrap_admin: Address) {
+        bootstrap_admin.require_auth();
+        let mut admins = Vec::new(&env);
+        admins.push_back(bootstrap_admin.clone());
+        env.storage().instance().set(&DataKey::Admins, &admins);
+        env.storage().instance().set(&DataKey::Threshold, &1u32);
+        env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        env.storage().instance().set(&DataKey::ContractCount, &0u32);
+        env.storage().instance().set(&DataKey::Admin, &bootstrap_admin);
+    }
+
     // ── Initialization ──────────────────────────────────────────────────────
 
     /// One-time setup.  `admins` must be non-empty and `threshold` must be
@@ -599,6 +644,72 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// Govern whether new registrations require an allowlisted owner.
+    /// Permissionless registration remains the default until this proposal executes.
+    pub fn propose_set_allowlist_enabled(
+        env: Env,
+        proposer: Address,
+        enabled: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetAllowlistEnabled(enabled),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_allowlist"), enabled),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Govern an owner's membership in the registration allowlist.
+    pub fn propose_set_allowlisted(
+        env: Env,
+        proposer: Address,
+        owner: Address,
+        allowed: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetAllowlisted(owner.clone(), allowed),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_allowlisted"), (owner, allowed)),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Govern a fixed-window per-owner registration limit. Zero disables it.
+    pub fn propose_configure_registration_rate_limit(
+        env: Env,
+        proposer: Address,
+        limit: u32,
+        window_ledgers: u32,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
+            return Err(RegistryError::InvalidRateLimit);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::ConfigureRegistrationRateLimit(limit, window_ledgers),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "configure_rate_limit"), (limit, window_ledgers)),
+        );
+        Ok(proposal_id)
+    }
+
     // ── Governance: approval ────────────────────────────────────────────────
 
     /// Record an admin's approval of a proposal.  When the number of unique
@@ -764,11 +875,19 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
+        if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
+            && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
+        {
+            return Err(RegistryError::NotAllowlisted);
+        }
+
         if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::AlreadyRegistered);
         }
 
         let categories = Self::dedup_categories(&env, &categories)?;
+
+        Self::consume_registration_rate(&env, &owner)?;
 
         let entry = ContractEntry {
             contract_id: contract_id.clone(),
@@ -1267,6 +1386,32 @@ impl LuminaRegistry {
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 impl LuminaRegistry {
+    fn consume_registration_rate(env: &Env, owner: &Address) -> Result<(), RegistryError> {
+        let limit: u32 = env.storage().instance().get(&DataKey::RegistrationRateLimit).unwrap_or(0);
+        if limit == 0 {
+            return Ok(());
+        }
+        let window: u32 = env.storage().instance().get(&DataKey::RegistrationRateWindow).unwrap_or(0);
+        if window == 0 {
+            return Err(RegistryError::InvalidRateLimit);
+        }
+        let now = env.ledger().sequence();
+        let key = DataKey::RegistrationWindow(owner.clone());
+        let mut state: RegistrationWindow = env.storage().persistent()
+            .get(&key)
+            .unwrap_or(RegistrationWindow { started_at: now, count: 0 });
+        if now.saturating_sub(state.started_at) >= window {
+            state = RegistrationWindow { started_at: now, count: 0 };
+        }
+        if state.count >= limit {
+            return Err(RegistryError::RegistrationRateLimited);
+        }
+        state.count += 1;
+        env.storage().persistent().set(&key, &state);
+        env.storage().persistent().extend_ttl(&key, window, window);
+        Ok(())
+    }
+
     /// Return the current admin set (may be empty before initialization).
     fn admin_index(env: &Env) -> Vec<Address> {
         env.storage()
@@ -1448,6 +1593,31 @@ impl LuminaRegistry {
                     (contract_id.clone(), *amount, reason.clone(), treasury),
                 );
             }
+            ProposalAction::SetAllowlistEnabled(enabled) => {
+                env.storage().instance().set(&DataKey::AllowlistEnabled, enabled);
+                env.events().publish(
+                    (Symbol::new(env, "allowlist_mode_changed"),),
+                    (*enabled,),
+                );
+            }
+            ProposalAction::SetAllowlisted(owner, allowed) => {
+                env.storage().persistent().set(&DataKey::Allowlisted(owner.clone()), allowed);
+                env.events().publish(
+                    (Symbol::new(env, "owner_allowlisted"),),
+                    (owner.clone(), *allowed),
+                );
+            }
+            ProposalAction::ConfigureRegistrationRateLimit(limit, window) => {
+                if *limit > 0 && (*window == 0 || *window > env.storage().max_ttl()) {
+                    return Err(RegistryError::InvalidRateLimit);
+                }
+                env.storage().instance().set(&DataKey::RegistrationRateLimit, limit);
+                env.storage().instance().set(&DataKey::RegistrationRateWindow, window);
+                env.events().publish(
+                    (Symbol::new(env, "registration_rate_limit_changed"),),
+                    (*limit, *window),
+                );
+            }
         }
         Ok(())
     }
@@ -1587,17 +1757,21 @@ mod test {
     fn setup_multisig() -> (Env, LuminaRegistryClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
-        let client = LuminaRegistryClient::new(&env, &contract_id);
-
         let a1 = Address::generate(&env);
         let a2 = Address::generate(&env);
         let a3 = Address::generate(&env);
-        let mut admins = Vec::new(&env);
-        admins.push_back(a1.clone());
-        admins.push_back(a2.clone());
-        admins.push_back(a3.clone());
-        client.initialize(&admins, &2);
+        let contract_id = env.register(LuminaRegistry, (&a1,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+
+        let add_a2 = client.propose_add_admin(&a1, &a2);
+        pass_proposal(&env, &client, &a1, add_a2);
+        let add_a3 = client.propose_add_admin(&a1, &a3);
+        pass_proposal(&env, &client, &a1, add_a3);
+        let change_threshold = client.propose_change_threshold(&a1, &2);
+        client.approve_proposal(&a1, &change_threshold);
+        client.approve_proposal(&a2, &change_threshold);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&change_threshold);
         (env, client, a1, a2, a3)
     }
 
@@ -1605,13 +1779,9 @@ mod test {
     fn setup() -> (Env, LuminaRegistryClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
-        let client = LuminaRegistryClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
-        let mut admins = Vec::new(&env);
-        admins.push_back(admin.clone());
-        client.initialize(&admins, &1);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
         (env, client, admin)
     }
 
@@ -1701,33 +1871,18 @@ mod test {
     }
 
     #[test]
-    fn initialize_with_zero_threshold_fails() {
+    fn second_party_cannot_claim_a_new_deployment() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
-        let client = LuminaRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        let mut admins = Vec::new(&env);
-        admins.push_back(admin.clone());
-        assert_eq!(
-            client.try_initialize(&admins, &0),
-            Err(Ok(RegistryError::InvalidThreshold))
-        );
-    }
-
-    #[test]
-    fn initialize_with_threshold_exceeding_set_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
+        let contract_id = env.register(LuminaRegistry, (&admin,));
         let client = LuminaRegistryClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
         let mut admins = Vec::new(&env);
-        admins.push_back(admin.clone());
-        // threshold=2 but only 1 admin
+        admins.push_back(attacker);
         assert_eq!(
-            client.try_initialize(&admins, &2),
-            Err(Ok(RegistryError::InvalidThreshold))
+            client.try_initialize(&admins, &1),
+            Err(Ok(RegistryError::AlreadyInitialized))
         );
     }
 
@@ -2041,6 +2196,82 @@ mod test {
     }
 
     #[test]
+    fn allowlist_mode_is_off_by_default_and_governed() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let first_target = Address::generate(&env);
+        client.register_contract(
+            &owner, &first_target, &String::from_str(&env, "First"),
+            &String::from_str(&env, "First"), &default_cats(&env),
+        );
+        let enable = client.propose_set_allowlist_enabled(&admin, &true);
+        pass_proposal(&env, &client, &admin, enable);
+        let target = Address::generate(&env);
+        assert_eq!(
+            client.try_register_contract(
+                &owner, &target, &String::from_str(&env, "Blocked"),
+                &String::from_str(&env, "Blocked"), &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::NotAllowlisted)),
+        );
+        let allow = client.propose_set_allowlisted(&admin, &owner, &true);
+        pass_proposal(&env, &client, &admin, allow);
+        client.register_contract(
+            &owner, &target, &String::from_str(&env, "Allowed"),
+            &String::from_str(&env, "Allowed"), &default_cats(&env),
+        );
+        assert!(client.is_registered(&target));
+    }
+
+    #[test]
+    fn registration_rate_limit_resets_after_governed_window() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let configure = client.propose_configure_registration_rate_limit(&admin, &1, &3);
+        pass_proposal(&env, &client, &admin, configure);
+        let first = Address::generate(&env);
+        client.register_contract(
+            &owner, &first, &String::from_str(&env, "First"),
+            &String::from_str(&env, "First"), &default_cats(&env),
+        );
+        let second = Address::generate(&env);
+        assert_eq!(
+            client.try_register_contract(
+                &owner, &second, &String::from_str(&env, "Second"),
+                &String::from_str(&env, "Second"), &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::RegistrationRateLimited)),
+        );
+        advance_ledger(&env, 3);
+        client.register_contract(
+            &owner, &second, &String::from_str(&env, "Second"),
+            &String::from_str(&env, "Second"), &default_cats(&env),
+        );
+        assert!(client.is_registered(&second));
+    }
+
+    #[test]
+    fn bootstrap_admin_can_add_admin_and_raise_threshold_through_governance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        let second_admin = Address::generate(&env);
+        assert_eq!(client.get_admins().len(), 1);
+        assert_eq!(client.get_threshold(), 1);
+        let add = client.propose_add_admin(&admin, &second_admin);
+        pass_proposal(&env, &client, &admin, add);
+        let change = client.propose_change_threshold(&admin, &2);
+        client.approve_proposal(&admin, &change);
+        client.approve_proposal(&second_admin, &change);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&change);
+        assert_eq!(client.get_admins().len(), 2);
+        assert_eq!(client.get_threshold(), 2);
+    }
+
+    #[test]
     fn deactivate_by_owner_succeeds() {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
@@ -2199,10 +2430,11 @@ mod test {
     }
 
     #[test]
-    fn admin_gated_calls_on_uninitialized_registry_error() {
+    fn unauthorized_owner_management_call_is_rejected() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(LuminaRegistry, ());
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
         let client = LuminaRegistryClient::new(&env, &contract_id);
         let (_owner, target) = register_sample(&env, &client);
         let stranger = Address::generate(&env);
@@ -2210,19 +2442,16 @@ mod test {
 
         assert_eq!(
             client.try_transfer_ownership(&stranger, &target, &new_owner),
-            Err(Ok(RegistryError::NotInitialized)),
+            Err(Ok(RegistryError::Unauthorized)),
         );
     }
 
     // ── Upgrade-path tests ──────────────────────────────────────────────────
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
-        let contract_id = env.register(registry_v1_wasm::WASM, ());
-        let client = registry_v1_wasm::Client::new(env, &contract_id);
         let admin = Address::generate(env);
-        let mut admins = Vec::new(env);
-        admins.push_back(admin.clone());
-        client.initialize(&admins, &1);
+        let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
+        let client = registry_v1_wasm::Client::new(env, &contract_id);
         (client, admin, contract_id)
     }
 
@@ -2449,14 +2678,13 @@ mod test {
     }
 
     #[test]
-    fn get_admin_before_initialize_reports_not_initialized() {
+    fn constructor_sets_bootstrap_admin() {
         let env = Env::default();
-        let contract_id = env.register(LuminaRegistry, ());
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
         let client = LuminaRegistryClient::new(&env, &contract_id);
-        assert_eq!(
-            client.try_get_admin(),
-            Err(Ok(RegistryError::NotInitialized))
-        );
+        assert_eq!(client.get_admin(), admin);
     }
 
     #[test]

@@ -71,10 +71,12 @@ version must stay compatible with the storage shapes documented on `DataKey` and
 
 ### Staking & reputation
 
-Registration itself stays free and permissionless — anyone can list a contract
-for indexing. On top of that, a registrant can post collateral, and governance
-can attest or penalise, so consumers of the Registry can tell a well-run project
-apart from a name that was typed into a form:
+Registration stays free and permissionless by default — anyone can list a
+contract for indexing. Governance can optionally enable an allowlist or a
+per-owner registration limit for curated deployments. On top of that, a
+registrant can post collateral, and governance can attest or penalise, so
+consumers of the Registry can tell a well-run project apart from a name that
+was typed into a form:
 
 | Method | Who can call it |
 | --- | --- |
@@ -83,6 +85,9 @@ apart from a name that was typed into a form:
 | `propose_set_verified(proposer, contract_id, verified)` | an admin — takes effect only after approval + timelock |
 | `propose_slash(proposer, contract_id, amount, reason)` | an admin — same |
 | `propose_configure_staking(proposer, token, treasury)` | an admin — same |
+| `propose_set_allowlist_enabled(proposer, enabled)` | an admin — same |
+| `propose_set_allowlisted(proposer, owner, allowed)` | an admin — same |
+| `propose_configure_registration_rate_limit(proposer, limit, window_ledgers)` | an admin — same; zero limit disables it |
 | `get_reputation(contract_id)` | anyone — stake, verified, lifetime slashed, lock expiry |
 | `get_contract_profile(contract_id)` | anyone — the entry and its reputation in one call |
 | `get_active_profiles(offset, limit)` | anyone — `get_active_contracts` with reputation attached |
