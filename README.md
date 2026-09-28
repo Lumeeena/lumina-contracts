@@ -8,6 +8,96 @@ Part of the Lumina project, split across three repos:
 - [lumina-backend](https://github.com/Lumeeena/lumina-backend) — indexer + GraphQL API + PostgreSQL schema
 - [lumina-contracts](https://github.com/Lumeeena/lumina-contracts) — this repo
 
+## Where the registry fits
+
+Lumina indexes Soroban contract events, but an indexer has to know *which*
+contracts to watch. Without this contract, that list is a static
+`INDEXED_CONTRACT_IDS` env var that an operator edits by hand. The registry
+replaces the hand-edited list with an on-chain one. A project lists itself by
+calling `register_contract`, and every Lumina indexer pointed at the registry
+starts indexing that project's events on its next poll. No operator needs to
+act and no one needs to redeploy. Discovery is the reason the contract exists.
+Categories, staking and governance all exist to make that list worth trusting.
+
+```
+ project ──register_contract──▶ ┌──────────┐ ◀──get_active_contracts── indexer ──getEvents──▶ project's events
+                                │ registry │                              │
+ frontend ──read views─────────▶└──────────┘                              ▼
+    │                                │ emits contract_registered, …    PostgreSQL / GraphQL
+    └───────────── history view ◀────┴──────── indexed like any other contract's events
+```
+
+### How the indexer discovers contracts
+
+[lumina-backend](https://github.com/Lumeeena/lumina-backend)'s indexer
+(`indexer/src/registry.ts`) turns discovery on when `REGISTRY_CONTRACT_ID` and
+`REGISTRY_READ_ACCOUNT` are set. On a timer it then:
+
+1. Calls `get_active_contracts(offset, 50)` through `simulateTransaction`. This
+   is a read-only call, so the read account needs no key and pays no fee. It
+   keeps paging until a page comes back with fewer than 50 entries, with a
+   cap of 20 pages.
+2. Takes `contract_id` from each `ContractEntry`. It drops any address that is
+   not a `C…` contract address, because the registry accepts any `Address` and
+   one account address in the list would make the whole `getEvents` filter fail.
+3. Merges those IDs with the static list and indexes their events.
+
+Deactivating a registration therefore stops the indexer from polling that
+contract. Already-indexed events stay in the database.
+
+A note on paging semantics: `offset` is a position in *registration order*,
+counting deactivated entries, not a count of active ones. A page can come back
+with fewer than `limit` entries even when more active registrations follow,
+because the page skipped over deactivated entries. The same holds for
+`get_active_profiles` and `get_active_contracts_by_category`.
+
+### What the frontend reads
+
+[lumina-frontend](https://github.com/Lumeeena/lumina-frontend)'s `/registry`
+page (`lib/registry.ts`) reads the contract directly over Soroban RPC with the
+same simulate-only pattern. It uses `get_active_contracts`,
+`get_active_profiles`, `get_active_contracts_by_category`, `get_categories`,
+`get_contracts_by_owner`, `get_reputation` and `get_slashes`.
+
+The contract stores only current state. `ContractEntry.active` is a boolean,
+not a log, so "when was this deactivated, and by whom?" cannot be read from
+storage. The registration history view (`lib/registryHistory.ts`) rebuilds
+that history from the registry's **own events**. The indexer stores them
+because the registry is itself a registered contract, and the frontend queries
+them from the GraphQL API filtered to `contractId = <registry>`:
+
+| Event topic | Data tuple | History row |
+| --- | --- | --- |
+| `contract_registered` | `(contract_id, owner, name, categories)` | Registered |
+| `contract_deactivated` | `(contract_id, caller)`, or `(contract_id, "governance")` when deactivated by proposal | Deactivated |
+| `metadata_updated` | `(contract_id, owner, name)` | Metadata updated |
+| `ownership_transferred` | `(contract_id, previous_owner, new_owner)` | Ownership transferred |
+
+The history view matches on the **first topic** and treats the **first
+element of the data tuple** as the registration the event concerns. Other
+events (`categories_updated`, `stake_*`, `proposal_*`, `registry_upgraded`, …)
+still appear in the history, shown as a generic "Registry event" row.
+
+### What breaks downstream when the interface changes
+
+Neither sibling repo generates bindings from this contract. Both call methods by
+name, with arguments built by hand, and decode results as plain JS objects. A
+change here does not fail their builds. It fails at runtime, often quietly:
+
+| Change here | Effect downstream |
+| --- | --- |
+| Rename or remove `get_active_contracts`, or change its arguments | Indexer discovery fails every poll. Registered contracts stop being indexed, and the static list keeps working, which hides the failure. |
+| Rename a `ContractEntry` field (e.g. `contract_id`) | The indexer reads `undefined` IDs, filters them all out, and discovers nothing. The frontend renders blank rows. |
+| Change `offset`/`limit` semantics or the page cap | The indexer and the frontend stop paging too early or too late, so contracts are silently missed or duplicated. |
+| Change the arguments of `register_contract` | Every registrant's scripts and bindings break. This happened when `categories` was added. |
+| Rename an event topic, or move `contract_id` out of the first data slot | History rows turn into "Registry event" rows or lose their subject, so the per-contract history is empty. |
+| Add or reorder `Category` variants | The frontend's `CATEGORIES` list no longer matches, and category filters drop unknown values. |
+
+`registry/tests/interface.rs` guards the function and type half of this list.
+See [Interface snapshot](#interface-snapshot). Event topics and payloads are
+not part of the contract spec, so review changes to `env.events().publish`
+calls against the table above.
+
 ## Lumina Registry
 
 `registry/` — an on-chain manifest of Soroban contracts registered for Lumina indexing. Any project can call `register_contract()` to add their contract; [lumina-backend](https://github.com/Lumeeena/lumina-backend)'s indexer can then discover and index their events.
