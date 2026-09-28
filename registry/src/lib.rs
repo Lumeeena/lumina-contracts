@@ -1,3 +1,5 @@
+// Copyright (c) Lumina contributors
+// SPDX-License-Identifier: MIT
 #![no_std]
 //! Lumina Registry — on-chain contract registry for the Lumina indexer.
 //!
@@ -40,7 +42,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 3;
+pub const CONTRACT_VERSION: u32 = 4;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -114,6 +116,8 @@ pub enum RegistryError {
     RegistrationActive  = 19,
     /// A registration must declare at least one category.
     NoCategories        = 20,
+    /// The registration still holds stake — withdraw it before deregistering.
+    StakeNotEmpty       = 21,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -296,7 +300,17 @@ pub enum DataKey {
     ProposalData(u32),
 
     // ── Registry ────────────────────────────────────────────────────────────
+    /// u32 — live registrations (deactivated included, deregistered excluded).
+    /// Incremented on `register_contract`, decremented on `deregister`.
+    /// See `get_contract_count` / `get_total_registered` for which figure to read.
     ContractCount,
+    /// u32 — lifetime registrations ever made. Incremented on
+    /// `register_contract` and never decremented, so it survives `deregister`.
+    /// Added alongside deregistration to keep the old "registrations ever made"
+    /// figure available after `ContractCount` became the live total. Missing on
+    /// deployments that predate it — `get_total_registered` falls back to
+    /// `ContractCount` in that case.
+    TotalRegistered,
     Contract(Address),
     OwnerContracts(Address), // owner → Vec<Address>
     AllContracts,            // insertion-ordered Vec<Address> of every registered contract
@@ -368,6 +382,7 @@ impl LuminaRegistry {
         env.storage().instance().set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
         env.storage().instance().set(&DataKey::ContractCount, &0u32);
+        env.storage().instance().set(&DataKey::TotalRegistered, &0u32);
 
         // Write the legacy Admin key with the first admin so the v2 upgrade
         // tests (which read DataKey::Admin) continue to pass unchanged.
@@ -713,6 +728,164 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    /// Permanently remove a deactivated, unstaked registration.
+    ///
+    /// This is the deregistration path, as opposed to `deactivate` (a soft
+    /// flag that keeps the entry so the owner stays listed under
+    /// `get_contracts_by_owner` and the address cannot be re-registered).
+    /// `deregister` deletes the `Contract` entry itself, so the same address
+    /// may be registered again later as a fresh entry.
+    ///
+    /// Requirements, checked in order:
+    ///
+    /// 1. the caller is the registered owner;
+    /// 2. the registration is already deactivated (`deactivate` first);
+    /// 3. no stake remains (`withdraw_stake` first — otherwise funds would be
+    ///    stranded under an address the registry no longer tracks).
+    ///
+    /// Cleanup is **eager**: the entry is removed from the global
+    /// `AllContracts` index, the owner's index, and every category index it
+    /// claimed, and `ContractCount` (the live total) is decremented.
+    /// `TotalRegistered` (the lifetime total) is deliberately left untouched.
+    /// Slash records are intentionally kept so penalties stay auditable after
+    /// the registration they were levied against is gone.
+    ///
+    /// Storage archival (TTL expiry making a `Contract` entry unloadable
+    /// without any explicit call) is handled separately by the permissionless,
+    /// idempotent `prune_category` / `prune_all_contracts` entrypoints: eager
+    /// removal covers every path the contract itself controls, while pruning
+    /// covers the one path it does not — the ledger garbage-collecting an
+    /// entry out from under an index that still names it.
+    pub fn deregister(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+        if entry.active {
+            return Err(RegistryError::RegistrationActive);
+        }
+        if Self::stake_of(&env, &contract_id) != 0 {
+            return Err(RegistryError::StakeNotEmpty);
+        }
+
+        // Drop every category index reference first, so a deregistered
+        // contract leaves no index reference behind (see #140).
+        for category in Self::categories_of(&env, &contract_id).iter() {
+            let mut index = Self::category_index(&env, &category);
+            if let Some(i) = index.first_index_of(&contract_id) {
+                index.remove(i);
+                env.storage().persistent()
+                    .set(&DataKey::ByCategory(category), &index);
+            }
+        }
+        env.storage().persistent().remove(&DataKey::Categories(contract_id.clone()));
+
+        // Drop the global and owner indexes.
+        let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        if let Some(i) = all.first_index_of(&contract_id) {
+            all.remove(i);
+            env.storage().instance().set(&DataKey::AllContracts, &all);
+        }
+        let mut owned = Self::owner_index(&env, &entry.owner);
+        if let Some(i) = owned.first_index_of(&contract_id) {
+            owned.remove(i);
+            Self::set_owner_index(&env, &entry.owner, &owned);
+        }
+
+        // Delete the entry and its live reputation state. Slashes are kept
+        // for auditability (see docstring above).
+        env.storage().persistent().remove(&DataKey::Contract(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Stake(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
+
+        // Live total goes down; lifetime total does not (see #141).
+        let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(1);
+        env.storage().instance().set(&DataKey::ContractCount, &count.saturating_sub(1));
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_deregistered"),),
+            (contract_id, owner),
+        );
+
+        Ok(())
+    }
+
+    /// Remove dead references from one category index.
+    ///
+    /// A reference is dead when its `Contract` entry no longer loads — either
+    /// because the registration was removed outside the indexed paths (e.g.
+    /// storage archival/TTL expiry) or because it predates eager cleanup.
+    /// `deregister` and `set_categories` already remove their own references
+    /// eagerly; this covers the paths they cannot, which is why it exists
+    /// alongside eager removal rather than instead of it.
+    ///
+    /// Permissionless (no auth) so anyone — indexer, frontend, or a cron-like
+    /// caller — can pay for the cleanup. Idempotent and safe to call
+    /// repeatedly: a second call with nothing dead removes nothing and
+    /// returns 0. Returns the number of references removed.
+    pub fn prune_category(env: Env, category: Category) -> u32 {
+        let index = Self::category_index(&env, &category);
+        let mut live = Vec::new(&env);
+        let mut removed: u32 = 0;
+
+        for contract_id in index.iter() {
+            if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+                live.push_back(contract_id);
+            } else {
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            env.storage().persistent().set(&DataKey::ByCategory(category), &live);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "category_pruned"),),
+            (category, removed),
+        );
+
+        removed
+    }
+
+    /// Remove dead references from the global `AllContracts` index.
+    ///
+    /// Same dead-definition, permissionless idempotent semantics, and return
+    /// value as `prune_category`, but for the paginated
+    /// `get_active_contracts` / `get_active_profiles` listing instead of one
+    /// category. Callers that prune categories on a schedule should prune the
+    /// global index on the same schedule.
+    pub fn prune_all_contracts(env: Env) -> u32 {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut live = Vec::new(&env);
+        let mut removed: u32 = 0;
+
+        for contract_id in all.iter() {
+            if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+                live.push_back(contract_id);
+            } else {
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            env.storage().instance().set(&DataKey::AllContracts, &live);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "all_contracts_pruned"),),
+            (removed,),
+        );
+
+        removed
+    }
+
     // ── Legacy upgrade kept for backward-compatibility with existing tests ───
 
     /// Direct upgrade, kept for the upgrade-path tests in this crate (which
@@ -791,6 +964,10 @@ impl LuminaRegistry {
 
         let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
         env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
+        // Lifetime total: never decremented, so it keeps counting across
+        // `deregister`. `ContractCount` above is the live total.
+        let total: u32 = env.storage().instance().get(&DataKey::TotalRegistered).unwrap_or(count);
+        env.storage().instance().set(&DataKey::TotalRegistered, &(total + 1));
 
         Self::index_categories(&env, &contract_id, &categories);
 
@@ -1123,8 +1300,41 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ContractNotFound)
     }
 
+    /// Live registrations: deactivated entries included, deregistered ones
+    /// not. Incremented on `register_contract`, decremented on `deregister`.
+    /// This is the figure a "how many entries exist right now" consumer wants.
+    /// For lifetime registrations ever made see `get_total_registered`; for
+    /// currently listed (active) entries see `get_active_contract_count` (the
+    /// frontend stats page should read that one).
     pub fn get_contract_count(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
+    }
+
+    /// Lifetime registrations ever made. Incremented on `register_contract`
+    /// and never decremented, so it keeps counting across `deregister`.
+    /// Falls back to `ContractCount` on deployments that predate the split
+    /// (where the single counter was the lifetime figure).
+    pub fn get_total_registered(env: Env) -> u32 {
+        if let Some(total) = env.storage().instance().get::<DataKey, u32>(&DataKey::TotalRegistered) {
+            return total;
+        }
+        env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
+    }
+
+    /// Currently listed (active) registrations. Walks `AllContracts` and
+    /// counts entries that still load and are flagged active, skipping dead
+    /// references exactly as `get_active_contracts` does.
+    pub fn get_active_contract_count(env: Env) -> u32 {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut active: u32 = 0;
+        for contract_id in all.iter() {
+            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                if entry.active {
+                    active += 1;
+                }
+            }
+        }
+        active
     }
 
     pub fn is_registered(env: Env, contract_id: Address) -> bool {
@@ -1689,6 +1899,8 @@ mod test {
     fn initialize_sets_zero_count() {
         let (_, client, _) = setup();
         assert_eq!(client.get_contract_count(), 0);
+        assert_eq!(client.get_total_registered(), 0);
+        assert_eq!(client.get_active_contract_count(), 0);
     }
 
     #[test]
@@ -2548,6 +2760,44 @@ mod test {
         (owner, target)
     }
 
+    /// Sum of every registration's tracked stake (`DataKey::Stake`).
+    ///
+    /// Reads `AllContracts` from the registry's own storage, so it covers
+    /// deactivated entries (which keep their stake until withdrawal) rather
+    /// than only the active listing.
+    fn tracked_stake_total(env: &Env, client: &LuminaRegistryClient) -> i128 {
+        env.as_contract(&client.address, || {
+            let all: Vec<Address> = env.storage().instance()
+                .get(&DataKey::AllContracts)
+                .unwrap_or(Vec::new(env));
+            let mut total: i128 = 0;
+            for contract_id in all.iter() {
+                total += env.storage().persistent()
+                    .get::<DataKey, i128>(&DataKey::Stake(contract_id))
+                    .unwrap_or(0);
+            }
+            total
+        })
+    }
+
+    /// Solvency invariant: the registry's token balance must exactly match
+    /// what it believes it owes across all registrations.
+    ///
+    /// `stake` moves tokens in and tracks them, `withdraw_stake` moves them
+    /// out and untracks them, and slash execution moves them to the treasury
+    /// and untracks them — so after any sequence the two figures agree.
+    /// Deliberately an equality (not just `balance >= tracked`): both an
+    /// over-credited and an under-credited accounting bug break it.
+    fn assert_solvency(env: &Env, client: &LuminaRegistryClient, token_id: &Address) {
+        let tracked = tracked_stake_total(env, client);
+        let held = balance(env, token_id, &client.address);
+        assert_eq!(
+            held, tracked,
+            "solvency invariant violated: token balance {} != tracked stake {}",
+            held, tracked,
+        );
+    }
+
     // ── Configuration ───────────────────────────────────────────────────────
 
     #[test]
@@ -2596,6 +2846,7 @@ mod test {
         assert_eq!(client.get_stake(&target), 400);
         assert_eq!(balance(&env, &token_id, &owner), 600);
         assert_eq!(balance(&env, &token_id, &client.address), 400);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2608,6 +2859,7 @@ mod test {
 
         assert_eq!(client.get_stake(&target), 500);
         assert_eq!(balance(&env, &token_id, &client.address), 500);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2622,6 +2874,7 @@ mod test {
             Err(Ok(RegistryError::NotOwner)),
         );
         assert_eq!(client.get_stake(&target), 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2638,6 +2891,7 @@ mod test {
             client.try_stake(&owner, &target, &-100),
             Err(Ok(RegistryError::InvalidAmount)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2651,20 +2905,22 @@ mod test {
             client.try_stake(&owner, &unregistered, &100),
             Err(Ok(RegistryError::ContractNotFound)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── Verification ────────────────────────────────────────────────────────
 
     #[test]
     fn verification_is_unset_by_default() {
-        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (_owner, target) = register_sample(&env, &client);
         assert!(!client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn governance_can_attest_and_later_revoke_verification() {
-        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (env, client, admin, token_id, _treasury) = setup_staking();
         let (_owner, target) = register_sample(&env, &client);
 
         let pid = client.propose_set_verified(&admin, &target, &true);
@@ -2674,11 +2930,12 @@ mod test {
         let pid = client.propose_set_verified(&admin, &target, &false);
         pass_proposal(&env, &client, &admin, pid);
         assert!(!client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn a_registrant_cannot_verify_their_own_contract() {
-        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_sample(&env, &client);
 
         // The owner is not an admin, and there is no non-governance path to
@@ -2688,22 +2945,24 @@ mod test {
             Err(Ok(RegistryError::NotAdmin)),
         );
         assert!(!client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn verification_cannot_be_proposed_for_an_unregistered_contract() {
-        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (env, client, admin, token_id, _treasury) = setup_staking();
         let unregistered = Address::generate(&env);
 
         assert_eq!(
             client.try_propose_set_verified(&admin, &unregistered, &true),
             Err(Ok(RegistryError::ContractNotFound)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn verification_survives_the_timelock_without_early_effect() {
-        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (env, client, admin, token_id, _treasury) = setup_staking();
         let (_owner, target) = register_sample(&env, &client);
 
         let pid = client.propose_set_verified(&admin, &target, &true);
@@ -2715,6 +2974,7 @@ mod test {
         advance_ledger(&env, TIMELOCK_LEDGERS);
         client.execute_proposal(&pid);
         assert!(client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── Slashing ────────────────────────────────────────────────────────────
@@ -2737,6 +2997,7 @@ mod test {
         let record = slashes.get(0).unwrap();
         assert_eq!(record.amount, 400);
         assert_eq!(record.reason, reason);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2760,6 +3021,7 @@ mod test {
         assert_eq!(slashes.get(0).unwrap().reason, first);
         assert_eq!(slashes.get(1).unwrap().reason, second);
         assert_eq!(client.get_reputation(&target).slashed_total, 500);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2780,11 +3042,12 @@ mod test {
         );
         assert_eq!(client.get_stake(&target), 100);
         assert_eq!(balance(&env, &token_id, &treasury), 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn slashing_a_registration_with_no_stake_is_rejected() {
-        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (env, client, admin, token_id, _treasury) = setup_staking();
         let (_owner, target) = register_sample(&env, &client);
 
         let reason = String::from_str(&env, "nothing at stake");
@@ -2796,11 +3059,12 @@ mod test {
             client.try_execute_proposal(&pid),
             Err(Ok(RegistryError::InsufficientStake)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn slash_cannot_be_proposed_for_an_unregistered_contract() {
-        let (env, client, admin, _token_id, _treasury) = setup_staking();
+        let (env, client, admin, token_id, _treasury) = setup_staking();
         let unregistered = Address::generate(&env);
         let reason = String::from_str(&env, "unknown");
 
@@ -2808,6 +3072,7 @@ mod test {
             client.try_propose_slash(&admin, &unregistered, &100, &reason),
             Err(Ok(RegistryError::ContractNotFound)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2820,6 +3085,7 @@ mod test {
             client.try_propose_slash(&admin, &target, &0, &reason),
             Err(Ok(RegistryError::InvalidAmount)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2832,6 +3098,7 @@ mod test {
             client.try_propose_slash(&owner, &target, &50, &reason),
             Err(Ok(RegistryError::NotAdmin)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── Withdrawal ──────────────────────────────────────────────────────────
@@ -2847,6 +3114,7 @@ mod test {
         assert_eq!(client.get_stake(&target), 0);
         assert_eq!(balance(&env, &token_id, &owner), 750);
         assert_eq!(balance(&env, &token_id, &client.address), 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2860,6 +3128,7 @@ mod test {
             Err(Ok(RegistryError::RegistrationActive)),
         );
         assert_eq!(client.get_stake(&target), 500);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2874,11 +3143,12 @@ mod test {
             Err(Ok(RegistryError::NotOwner)),
         );
         assert_eq!(client.get_stake(&target), 500);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn withdraw_is_refused_when_there_is_nothing_staked() {
-        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_sample(&env, &client);
         client.deactivate(&owner, &target);
 
@@ -2886,6 +3156,7 @@ mod test {
             client.try_withdraw_stake(&owner, &target),
             Err(Ok(RegistryError::InsufficientStake)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2907,6 +3178,7 @@ mod test {
             Err(Ok(RegistryError::StakeLocked)),
         );
         assert_eq!(client.get_stake(&target), 800);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2925,13 +3197,14 @@ mod test {
         assert_eq!(client.withdraw_stake(&owner, &target), 800);
         assert_eq!(balance(&env, &token_id, &owner), 800);
         assert_eq!(client.get_stake(&target), 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── Reputation views ────────────────────────────────────────────────────
 
     #[test]
     fn reputation_of_an_untouched_registration_is_all_zeroes() {
-        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (_owner, target) = register_sample(&env, &client);
 
         let reputation = client.get_reputation(&target);
@@ -2939,6 +3212,7 @@ mod test {
         assert!(!reputation.verified);
         assert_eq!(reputation.slashed_total, 0);
         assert_eq!(reputation.withdraw_locked_until, 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2955,17 +3229,19 @@ mod test {
         assert!(profile.entry.active);
         assert_eq!(profile.reputation.stake, 600);
         assert!(profile.reputation.verified);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn contract_profile_rejects_an_unregistered_contract() {
-        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let unregistered = Address::generate(&env);
 
         assert_eq!(
             client.try_get_contract_profile(&unregistered),
             Err(Ok(RegistryError::ContractNotFound)),
         );
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
@@ -2987,11 +3263,12 @@ mod test {
         // from the plain listing.
         client.deactivate(&owner2, &plain);
         assert_eq!(client.get_active_profiles(&0, &10).len(), 1);
+        assert_solvency(&env, &client, &token_id);
     }
 
     #[test]
     fn active_profiles_paginate_like_active_contracts() {
-        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         for _ in 0..5 {
             register_sample(&env, &client);
         }
@@ -3001,6 +3278,7 @@ mod test {
         assert_eq!(client.get_active_profiles(&4, &2).len(), 1);
         assert_eq!(client.get_active_profiles(&5, &2).len(), 0);
         assert_eq!(client.get_active_profiles(&99, &2).len(), 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── End-to-end lifecycle ────────────────────────────────────────────────
@@ -3054,6 +3332,7 @@ mod test {
         assert_eq!(client.get_slashes(&target).len(), 1);
         assert_eq!(client.get_reputation(&target).slashed_total, 250);
         assert_eq!(client.get_reputation(&target).stake, 0);
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── Category taxonomy ───────────────────────────────────────────────────
@@ -3366,5 +3645,133 @@ mod test {
             client.get_active_contracts_by_category(&Category::Payments, &0, &10).len(),
             1,
         );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Deregistration, pruning & counters ──────────────────────────────────
+
+    #[test]
+    fn deregister_removes_every_index_reference_and_decrements_the_live_count() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Oracle]);
+
+        assert_eq!(client.get_contract_count(), 1);
+        assert_eq!(client.get_total_registered(), 1);
+
+        client.deactivate(&owner, &target);
+        client.deregister(&owner, &target);
+
+        // The entry is gone and the address may be re-registered.
+        assert!(!client.is_registered(&target));
+        assert_eq!(client.get_contract_count(), 0);
+        // Lifetime total is untouched.
+        assert_eq!(client.get_total_registered(), 1);
+        assert_eq!(client.get_active_contract_count(), 0);
+
+        // No index reference remains: global, owner, and both categories.
+        assert_eq!(client.get_active_contracts(&0, &10).len(), 0);
+        assert_eq!(client.get_contracts_by_owner(&owner, &0, &10).len(), 0);
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 0);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Oracle, &0, &10).len(), 0);
+        assert_eq!(client.get_categories(&target).len(), 0);
+    }
+
+    #[test]
+    fn deregister_requires_deactivated_and_unstaked() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        // Still active.
+        assert_eq!(
+            client.try_deregister(&owner, &target),
+            Err(Ok(RegistryError::RegistrationActive)),
+        );
+
+        client.deactivate(&owner, &target);
+
+        // Still staked.
+        assert_eq!(
+            client.try_deregister(&owner, &target),
+            Err(Ok(RegistryError::StakeNotEmpty)),
+        );
+        assert_solvency(&env, &client, &token_id);
+
+        // Non-owner cannot deregister even once eligible.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_deregister(&stranger, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+    }
+
+    #[test]
+    fn deregister_keeps_slash_history_for_audit() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        let reason = String::from_str(&env, "kept for audit");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+        client.deactivate(&owner, &target);
+
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        client.withdraw_stake(&owner, &target);
+        client.deregister(&owner, &target);
+
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn prune_category_drops_dead_references_and_is_safe_to_repeat() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let live = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let gone = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        // Simulate a dead reference the eager paths did not clean (e.g.
+        // archival): remove the Contract entry behind the index's back.
+        env.as_contract(&client.address, || {
+            env.storage().persistent().remove(&DataKey::Contract(gone.clone()));
+        });
+
+        // The listing tolerates it, so it stays correct but pays for the walk.
+        let page = client.get_active_contracts_by_category(&Category::DeFi, &0, &10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().contract_id, live);
+
+        // Permissionless prune removes exactly the dead reference...
+        assert_eq!(client.prune_category(&Category::DeFi), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 1);
+
+        // ...and repeating it removes nothing.
+        assert_eq!(client.prune_category(&Category::DeFi), 0);
+        assert_eq!(client.prune_all_contracts(), 1);
+        assert_eq!(client.prune_all_contracts(), 0);
+    }
+
+    #[test]
+    fn contract_count_is_live_and_total_registered_is_lifetime() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let first = register_in(&env, &client, &owner, &[Category::Dao]);
+        let _second = register_in(&env, &client, &owner, &[Category::Dao]);
+
+        assert_eq!(client.get_contract_count(), 2);
+        assert_eq!(client.get_total_registered(), 2);
+        assert_eq!(client.get_active_contract_count(), 2);
+
+        client.deactivate(&owner, &first);
+        // Deactivation is not deregistration: the live total still counts it,
+        // only the active figure drops.
+        assert_eq!(client.get_contract_count(), 2);
+        assert_eq!(client.get_total_registered(), 2);
+        assert_eq!(client.get_active_contract_count(), 1);
+
+        client.deregister(&owner, &first);
+        assert_eq!(client.get_contract_count(), 1);
+        assert_eq!(client.get_total_registered(), 2);
+        assert_eq!(client.get_active_contract_count(), 1);
     }
 }

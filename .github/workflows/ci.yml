@@ -7,6 +7,24 @@ on:
     branches: [main]
 
 jobs:
+  license-headers:
+    name: License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SPDX license headers
+        run: |
+          missing=0
+          for f in $(git ls-files '*.rs'); do
+            if ! head -n 5 "$f" | grep -q "SPDX-License-Identifier: MIT"; then
+              echo "::error file=$f::missing SPDX license header (see LICENSE)"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "New source files must carry '// SPDX-License-Identifier: MIT' in the first 5 lines."
+            exit 1
+          fi
   contracts:
     name: Build Contracts
     runs-on: ubuntu-latest

@@ -1,3 +1,5 @@
+// Copyright (c) Lumina contributors
+// SPDX-License-Identifier: MIT
 #![no_std]
 //! Lumina Registry v2 — the upgrade target used by the registry's upgrade tests.
 //!
@@ -35,7 +37,7 @@ use soroban_sdk::{
 /// reads back to confirm the new code is the one now executing. The tests
 /// assert the relationship rather than the literal, so bumping the registry's
 /// version means bumping this one too, and nothing else.
-pub const CONTRACT_VERSION: u32 = 4;
+pub const CONTRACT_VERSION: u32 = 5;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]

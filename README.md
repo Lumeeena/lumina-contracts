@@ -31,6 +31,8 @@ browsing rather than only a flat list:
 | `get_active_contracts_by_category(category, offset, limit)` | anyone — same paging semantics as `get_active_contracts` |
 | `get_categories(contract_id)` | anyone |
 | `set_categories(owner, contract_id, categories)` | the registered owner only |
+| `prune_category(category)` | anyone — removes dead index references, returns the count removed |
+| `prune_all_contracts()` | anyone — same, for the global `AllContracts` index |
 
 A contract can be filed under several categories and is discoverable under each.
 Duplicates are collapsed, so passing a category twice indexes it once.
@@ -44,6 +46,15 @@ contract upgrade; `Other` is the escape hatch until then.
 filters on `active`, exactly as the global listing does, which is what keeps a
 deactivated registration out of browsing.
 
+`deregister` is the opposite: it deletes the entry itself (owner only, must
+already be deactivated and fully unstaked) and eagerly removes it from the
+global, owner, and every category index, so a deregistered contract leaves no
+index reference. Slash records are kept for auditability. Storage archival can
+still strand a reference the eager paths never saw — `prune_category` /
+`prune_all_contracts` cover that case. They are permissionless and idempotent
+(safe to call repeatedly; a second call removes nothing and returns 0), so an
+indexer or a cron-like caller can pay for the cleanup on a schedule.
+
 Registrations are also manageable after the fact:
 
 | Method | Who can call it |
@@ -52,6 +63,12 @@ Registrations are also manageable after the fact:
 | `update_metadata(owner, contract_id, name, description)` | the registered owner only |
 | `transfer_ownership(caller, contract_id, new_owner)` | the current owner or the admin |
 | `deactivate(caller, contract_id)` | the current owner or the admin |
+| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and unstaked |
+
+Counters: `get_contract_count` is the live total (deactivated included,
+deregistered excluded), `get_total_registered` is the lifetime total
+(never decremented), and `get_active_contract_count` is the currently listed
+figure. The frontend stats page should read `get_active_contract_count`.
 
 ### Upgrades
 

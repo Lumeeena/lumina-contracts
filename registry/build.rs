@@ -1,3 +1,5 @@
+// Copyright (c) Lumina contributors
+// SPDX-License-Identifier: MIT
 //! Turns a missing upgrade-test fixture into a message that says what to run.
 //!
 //! The upgrade tests in `src/lib.rs` deploy the registry from its compiled
