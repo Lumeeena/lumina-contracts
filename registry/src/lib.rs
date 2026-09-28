@@ -127,6 +127,12 @@ pub enum RegistryError {
     NoCategories        = 20,
     /// The registration still holds stake — withdraw it before deregistering.
     StakeNotEmpty       = 21,
+    /// The registration rate limit configuration is invalid.
+    InvalidRateLimit    = 22,
+    /// The owner is not allowlisted for registration.
+    NotAllowlisted      = 23,
+    /// The registration rate limit has been exceeded.
+    RegistrationRateLimited = 24,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -261,6 +267,26 @@ pub struct ContractProfile {
     pub entry: ContractEntry,
     /// The reputation and staking signal.
     pub reputation: Reputation,
+}
+
+/// Paginated result of contract entries with pagination info.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractPage {
+    /// The contracts in this page.
+    pub entries: Vec<ContractEntry>,
+    /// True if more results are available after this page.
+    pub has_more: bool,
+}
+
+/// Paginated result of contract profiles with pagination info.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractProfilePage {
+    /// The profiles in this page.
+    pub entries: Vec<ContractProfile>,
+    /// True if more results are available after this page.
+    pub has_more: bool,
 }
 
 // ─── Proposal types ────────────────────────────────────────────────────────
@@ -1365,6 +1391,55 @@ impl LuminaRegistry {
         result
     }
 
+    /// Paginated list of active registrations in multiple categories.
+    ///
+    /// Returns contracts appearing in ANY of the selected categories (union),
+    /// deduplicated so a contract appearing in several categories appears once.
+    /// Results are in registration order (the order they first appear when
+    /// iterating the combined indices).
+    ///
+    /// `categories` may not be empty; an empty selection returns a validation error.
+    pub fn get_active_contracts_by_categories(
+        env: Env,
+        categories: Vec<Category>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<ContractEntry>, RegistryError> {
+        if categories.is_empty() {
+            return Err(RegistryError::NoCategories);
+        }
+
+        let mut seen = Vec::new(&env);
+        let mut result = Vec::new(&env);
+
+        for category in categories.iter() {
+            let index = Self::category_index(&env, &category);
+            for contract_id in index.iter() {
+                if !seen.contains(&contract_id) {
+                    seen.push_back(contract_id.clone());
+
+                    if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                        if entry.active {
+                            result.push_back(entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        let total = result.len();
+        let mut page = Vec::new(&env);
+        let mut i = offset;
+        while i < total && page.len() < limit {
+            if let Some(entry) = result.get(i) {
+                page.push_back(entry);
+            }
+            i += 1;
+        }
+
+        Ok(page)
+    }
+
     /// `(stake_token, treasury)`, or `StakingNotConfigured` if governance has
     /// not opened staking yet.
     pub fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError> {
@@ -1405,8 +1480,29 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
+        let mut slashed_total: i128 = 0;
+        let slashes: Vec<SlashRecord> = env.storage().persistent()
+            .get(&DataKey::Slashes(contract_id.clone()))
+            .unwrap_or(Vec::new(&env));
+        for record in slashes.iter() {
+            slashed_total += record.amount;
+        }
+
+        let reputation = Reputation {
+            stake: env.storage().persistent()
+                .get(&DataKey::Stake(contract_id.clone()))
+                .unwrap_or(0),
+            verified: env.storage().persistent()
+                .get(&DataKey::Verified(contract_id.clone()))
+                .unwrap_or(false),
+            slashed_total,
+            withdraw_locked_until: env.storage().persistent()
+                .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
+                .unwrap_or(0),
+        };
+
         Ok(ContractProfile {
-            reputation: Self::reputation_of(&env, &contract_id),
+            reputation,
             entry,
         })
     }
@@ -1501,6 +1597,74 @@ impl LuminaRegistry {
         }
 
         result
+    }
+
+    /// Paginated list of active contract addresses only, intended for indexers
+    /// that need only the addresses without the full entries.
+    pub fn get_active_contract_ids(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut result = Vec::new(&env);
+
+        let mut i = offset;
+        while i < all.len() && result.len() < limit {
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                    if entry.active {
+                        result.push_back(contract_id);
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        result
+    }
+
+    /// Paginated list of active registered contracts with indication of whether more results exist.
+    pub fn get_active_contracts_page(env: Env, offset: u32, limit: u32) -> ContractPage {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut entries = Vec::new(&env);
+
+        let mut i = offset;
+        while i < all.len() && entries.len() < limit {
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                    if entry.active {
+                        entries.push_back(entry);
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        let has_more = i < all.len();
+
+        ContractPage { entries, has_more }
+    }
+
+    /// Paginated list of contract profiles with indication of whether more results exist.
+    pub fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut entries = Vec::new(&env);
+
+        let mut i = offset;
+        while i < all.len() && entries.len() < limit {
+            if let Some(contract_id) = all.get(i) {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                    if entry.active {
+                        entries.push_back(ContractProfile {
+                            reputation: Self::reputation_of(&env, &contract_id),
+                            entry,
+                        });
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        let has_more = i < all.len();
+
+        ContractProfilePage { entries, has_more }
     }
 
     /// Paginated list of every contract registered by `owner`, including
