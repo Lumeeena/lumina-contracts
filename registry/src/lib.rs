@@ -455,7 +455,7 @@ pub enum DataKey {
     RegistrationFee,
 
     // ── Tags ────────────────────────────────────────────────────────────────
-    /// Vec<Symbol> — owner-set normalized tags for a registration.
+    /// Vec<String> — owner-set normalized tags for a registration.
     Tags(Address),
 
     // ── Registry statistics ────────────────────────────────────────────────
@@ -796,7 +796,12 @@ impl LuminaRegistry {
     }
 
     /// Govern a fixed-window per-owner registration limit. Zero disables it.
-    pub fn propose_configure_registration_rate_limit(
+    ///
+    /// Named `propose_set_rate_limit` rather than the more explicit
+    /// `propose_configure_registration_rate_limit` because a Soroban export name
+    /// is capped at 32 characters and the longer spelling is 41. Every other
+    /// `propose_*` here already fits, so the short form stays consistent.
+    pub fn propose_set_rate_limit(
         env: Env,
         proposer: Address,
         limit: u32,
@@ -1382,11 +1387,17 @@ impl LuminaRegistry {
     /// Set normalized, owner-defined tags for a registration.
     /// Tags complement categories (which are fixed and for browsing) and provide
     /// owner-set search metadata. Max 10 tags, each max 16 characters.
+    ///
+    /// Tags are [`String`] rather than `Symbol` because the per-tag length cap
+    /// is only measurable on-chain for a `String`: `soroban-sdk` 22 exposes no
+    /// wasm-side way to ask a `Symbol` how long it is (`ToString for Symbol` is
+    /// `#[cfg(not(target_family = "wasm"))]`), so a `Vec<Symbol>` signature
+    /// could not enforce the 16-character bound it documents.
     pub fn set_tags(
         env: Env,
         owner: Address,
         contract_id: Address,
-        tags: Vec<Symbol>,
+        tags: Vec<String>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
@@ -1406,8 +1417,7 @@ impl LuminaRegistry {
         }
 
         for tag in tags.iter() {
-            let s = tag.to_string(&env);
-            if s.len() > MAX_TAG_LEN {
+            if tag.len() > MAX_TAG_LEN {
                 return Err(RegistryError::InvalidTags);
             }
         }
@@ -1423,7 +1433,7 @@ impl LuminaRegistry {
     }
 
     /// Get tags for a registration.
-    pub fn get_tags(env: Env, contract_id: Address) -> Vec<Symbol> {
+    pub fn get_tags(env: Env, contract_id: Address) -> Vec<String> {
         env.storage().persistent()
             .get(&DataKey::Tags(contract_id))
             .unwrap_or(Vec::new(&env))
@@ -1637,7 +1647,13 @@ impl LuminaRegistry {
     /// iterating the combined indices).
     ///
     /// `categories` may not be empty; an empty selection returns a validation error.
-    pub fn get_active_contracts_by_categories(
+    ///
+    /// Named `get_active_by_categories` rather than
+    /// `get_active_contracts_by_categories` because a Soroban export name is
+    /// capped at 32 characters and the longer spelling is 34. It is the
+    /// multi-category sibling of `get_active_contracts_by_category` and shares
+    /// its paging and active-filtering behaviour.
+    pub fn get_active_by_categories(
         env: Env,
         categories: Vec<Category>,
         offset: u32,
@@ -1707,7 +1723,7 @@ impl LuminaRegistry {
         let total_registered = env.storage().instance()
             .get::<DataKey, u32>(&DataKey::TotalRegistered)
             .unwrap_or(0);
-        let active_count = Self::get_active_contract_count(&env);
+        let active_count = Self::get_active_contract_count(env.clone());
         let verified_count = env.storage().instance()
             .get::<DataKey, u32>(&DataKey::VerifiedCount)
             .unwrap_or(0);
@@ -2928,7 +2944,7 @@ mod test {
     fn registration_rate_limit_resets_after_governed_window() {
         let (env, client, admin) = setup();
         let owner = Address::generate(&env);
-        let configure = client.propose_configure_registration_rate_limit(&admin, &1, &3);
+        let configure = client.propose_set_rate_limit(&admin, &1, &3);
         pass_proposal(&env, &client, &admin, configure);
         let first = Address::generate(&env);
         client.register_contract(
@@ -3151,6 +3167,11 @@ mod test {
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
         let admin = Address::generate(env);
+        // `__constructor` calls `bootstrap_admin.require_auth()`, and a
+        // constructor is not the root invocation, so plain `mock_all_auths`
+        // rejects it as an untied authorization. The non-root variant is the
+        // SDK's documented answer for exactly this shape.
+        env.mock_all_auths_allowing_non_root_auth();
         let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
         let client = registry_v1_wasm::Client::new(env, &contract_id);
         (client, admin, contract_id)
