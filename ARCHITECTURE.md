@@ -83,12 +83,13 @@ name, description, registration ledger, and active flag. Reputation is joined
 at read time by `get_contract_profile` and `get_active_profiles`. This avoids a
 storage migration whenever reputation gains a new field.
 
-The three indexes contain addresses rather than copies of `ContractEntry`.
-Reads resolve each address through `Contract(contract_id)` and filter on the
-entry's `active` flag. Consequently, pagination offsets address positions in
-the underlying ordered index, not positions in the filtered active result. A
-page may contain fewer than `limit` active entries when deactivated entries
-occupy positions in that range.
+The indexes contain addresses rather than copies of `ContractEntry`. Global,
+category, and profile listing reads resolve each address and return only active
+entries. Their `offset` is a position in the underlying ordered index; inactive
+or missing entries are skipped without consuming the result `limit`, so the
+scan continues until it fills the result or reaches the end of the raw index.
+`get_contracts_by_owner` is different: it resolves the owner's ordered index
+without filtering and therefore includes inactive registrations.
 
 ## Registration lifecycle
 
@@ -98,8 +99,10 @@ occupy positions in that range.
 2. It writes the `ContractEntry`, appends the address to `AllContracts`, the
    owner's index, and each category index, then advances the live and lifetime
    counters.
-3. The owner may update metadata, tags, categories, ownership, and an optional
-   successor address. These operations keep the secondary indexes consistent.
+3. The owner may update metadata, tags, and categories. Ownership transfer can
+   be authorized by the current owner, a current multisig admin, or the legacy
+   single admin retained for upgrade compatibility; it moves the address from
+   the previous owner's index to the new owner's index.
 4. `deactivate` is an immediate owner action. It clears only `active`; listing
    views filter the entry out while its metadata, reputation, and history
    remain available. Governance may deactivate somebody else's registration
@@ -109,9 +112,11 @@ occupy positions in that range.
    references but preserves slash history for auditability. The address may
    then be registered again as a fresh entry.
 
-`register_contracts` performs the same work for a bounded batch. Soroban
-invocations are atomic, so validation or token-transfer failure leaves no
-partial batch behind.
+`register_contracts` performs a bounded batch in one atomic Soroban invocation,
+so a validation or token-transfer failure leaves no partial batch behind. Its
+preflight rejects addresses that are already stored and validates every
+category list, but it does not deduplicate contract IDs repeated within the
+same input batch. Callers must therefore supply unique contract IDs.
 
 `prune_all_contracts` and `prune_category` cover a different failure mode:
 storage archival may make a persistent `Contract` entry unavailable without
@@ -192,13 +197,17 @@ inactive + unlocked + owner -- withdraw --> owner
 - `withdraw_stake` returns the entire remainder only to the owner, only after
   deactivation, and only after the post-slash lock expires.
 
-The central accounting invariant is:
+The internal bookkeeping invariant across staking transitions is:
 
 ```text
-stake-token balance held by the registry
-    == sum(Stake(contract_id)) across tracked registrations
-    == TotalStaked
+TotalStaked == sum(Stake(contract_id)) across tracked registrations
 ```
+
+In the isolated staking flows exercised by the tests, the registry's token
+balance also equals that tracked stake. That balance equality is conditional,
+not a general ledger invariant: unsolicited token transfers and the governed
+treasury-withdrawal action can place tokens in the registry without crediting
+any registration or `TotalStaked`.
 
 Token transfers occur before the corresponding bookkeeping changes. If a
 token refuses a deposit, withdrawal, or slash transfer, Soroban rolls back the
@@ -215,10 +224,10 @@ properties it checks, with representative test names for quick navigation:
 | --- | --- |
 | A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
 | Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
-| Only owners can mutate or immediately deactivate their registrations; ownership transfer moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices` |
+| Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
 | Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |
 | Category membership is non-empty and deduplicated, and category changes do not affect reputation. | `registration_requires_at_least_one_category`, `duplicate_categories_are_collapsed`, `categories_and_reputation_are_independent` |
-| Stake accounting equals the token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
+| In isolated staking flows, tracked stake equals the registry token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
 | Verification is governance-only and independent from self-service attestations. | `a_registrant_cannot_verify_their_own_contract`, `attesting_does_not_affect_governance_only_verification`, `attesting_does_not_grant_verification_or_privilege_to_the_attester` |
 | Deregistration removes live indexes and state only after safe exit, while retaining slash history and lifetime totals. | `deregister_requires_deactivated_and_unstaked`, `deregister_removes_every_index_reference_and_decrements_the_live_count`, `deregister_keeps_slash_history_for_audit`, `contract_count_is_live_and_total_registered_is_lifetime` |
 | Code upgrades preserve compatible storage and authentication. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_carries_admin_across_swap`, `upgraded_registry_can_be_rolled_back` |
