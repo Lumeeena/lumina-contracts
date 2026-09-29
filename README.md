@@ -194,14 +194,16 @@ was typed into a form:
 | `propose_configure_staking(proposer, token, treasury)` | an admin — same |
 | `propose_set_allowlist_enabled(proposer, enabled)` | an admin — same |
 | `propose_set_allowlisted(proposer, owner, allowed)` | an admin — same |
-| `propose_configure_registration_rate_limit(proposer, limit, window_ledgers)` | an admin — same; zero limit disables it |
+| `propose_set_rate_limit(proposer, limit, window_ledgers)` | an admin — same; zero limit disables it |
 | `get_reputation(contract_id)` | anyone — stake, verified, lifetime slashed, lock expiry |
 | `get_contract_profile(contract_id)` | anyone — the entry and its reputation in one call |
 | `get_active_profiles(offset, limit)` | anyone — `get_active_contracts` with reputation attached |
 | `get_stake` / `is_verified` / `get_slashes` / `get_staking_config` | anyone |
 
-Verified status has no non-governance path: a registrant cannot attest their own
-contract, which is the entire value of the signal. Slashes move stake to the
+Verified status has no non-governance path: a registrant cannot verify their own
+contract, which is the entire value of the signal. (Permissionless third-party
+`attest` exists and is documented below, but it records a separate, weaker claim
+and cannot reach `Verified`.) Slashes move stake to the
 treasury and record their reason on-chain permanently, so a penalty stays
 auditable long after the stake it was taken from is gone.
 
@@ -215,6 +217,37 @@ Staking is closed until governance runs `propose_configure_staking` to name a
 SEP-41 token (native XLM via its Stellar Asset Contract works) and a treasury.
 Routing that through governance rather than `initialize` means the already-live
 registry can adopt staking after an upgrade instead of being redeployed.
+
+### Third-party attestations
+
+Any address can vouch for a registration with a short, bounded label. This is a
+transparency feature rather than a trust signal:
+
+| Method | Who can call it |
+| --- | --- |
+| `attest(attester, contract_id, label)` | anyone, including the registration's own owner |
+| `revoke_attestation(attester, contract_id)` | the attester, and only for their own attestation |
+| `get_attestations(contract_id)` | anyone — `(attester, label, created_at)`, oldest first |
+
+Two properties are deliberate. The attester's address is recorded on-chain, so a
+claim is attributable rather than anonymous, and the attester can withdraw it
+themselves without asking anyone. And `revoke_attestation` is scoped to the
+caller's own record: no admin, and not even the registration's owner, can remove
+another party's attestation, because a claim should last exactly as long as the
+party making it stands behind it.
+
+Attestations are **not** verification and never feed into it. `Verified` remains
+governance-only, set through a threshold-and-timelocked proposal, and there is no
+counter or path by which attaching many attestations could substitute for that —
+so nobody can inflate the verified signal by attaching cheap labels. Consumers
+that want to weight the two differently can, and can surface the attester either
+way.
+
+One attestation per attester per registration: re-attesting revises the existing
+label instead of appending, so a stale claim cannot be left behind. Labels are
+bounded to 64 bytes and non-empty, and a registration holds at most 20
+attestations, so the cost of reading a registration's attestations is a property
+of the contract rather than of how many parties choose to speak up.
 
 ## Build & Test
 

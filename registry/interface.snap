@@ -1,6 +1,7 @@
-error RegistryError { AlreadyInitialized = 1, Unauthorized = 2, AlreadyRegistered = 3, ContractNotFound = 4, InvalidMetadata = 5, NotOwner = 6, NotInitialized = 7, ProposalNotFound = 8, ThresholdNotMet = 9, TimelockNotElapsed = 10, AlreadyApproved = 11, NotAdmin = 12, InvalidThreshold = 13, AlreadyExecuted = 14, StakingNotConfigured = 15, InvalidAmount = 16, InsufficientStake = 17, StakeLocked = 18, RegistrationActive = 19, NoCategories = 20, StakeNotEmpty = 21, InvalidRateLimit = 22, NotAllowlisted = 23, RegistrationRateLimited = 24, InsufficientFee = 25, InvalidTags = 26 }
+error RegistryError { AlreadyInitialized = 1, Unauthorized = 2, AlreadyRegistered = 3, ContractNotFound = 4, InvalidMetadata = 5, NotOwner = 6, NotInitialized = 7, ProposalNotFound = 8, ThresholdNotMet = 9, TimelockNotElapsed = 10, AlreadyApproved = 11, NotAdmin = 12, InvalidThreshold = 13, AlreadyExecuted = 14, StakingNotConfigured = 15, InvalidAmount = 16, InsufficientStake = 17, StakeLocked = 18, RegistrationActive = 19, NoCategories = 20, StakeNotEmpty = 21, InvalidRateLimit = 22, NotAllowlisted = 23, RegistrationRateLimited = 24, InsufficientFee = 25, InvalidTags = 26, InvalidAttestation = 27, AttestationNotFound = 28 }
 fn __constructor(bootstrap_admin: Address)
 fn approve_proposal(admin: Address, proposal_id: U32) -> Result<(), RegistryError>
+fn attest(attester: Address, contract_id: Address, label: String) -> Result<(), RegistryError>
 fn deactivate(caller: Address, contract_id: Address) -> Result<(), RegistryError>
 fn deregister(owner: Address, contract_id: Address) -> Result<(), RegistryError>
 fn execute_proposal(proposal_id: U32) -> Result<(), RegistryError>
@@ -13,6 +14,7 @@ fn get_active_profiles(offset: U32, limit: U32) -> Vec<ContractProfile>
 fn get_active_profiles_page(offset: U32, limit: U32) -> ContractProfilePage
 fn get_admin() -> Result<Address, RegistryError>
 fn get_admins() -> Result<Vec<Address>, RegistryError>
+fn get_attestations(contract_id: Address) -> Vec<Attestation>
 fn get_categories(contract_id: Address) -> Vec<Category>
 fn get_contract(contract_id: Address) -> Result<ContractEntry, RegistryError>
 fn get_contract_count() -> U32
@@ -49,6 +51,7 @@ fn prune_all_contracts() -> U32
 fn prune_category(category: Category) -> U32
 fn register_contract(owner: Address, contract_id: Address, name: String, description: String, categories: Vec<Category>) -> Result<(), RegistryError>
 fn register_contracts(owner: Address, entries: Vec<RegistrationEntry>) -> Result<(), RegistryError>
+fn revoke_attestation(attester: Address, contract_id: Address) -> Result<U32, RegistryError>
 fn set_categories(owner: Address, contract_id: Address, categories: Vec<Category>) -> Result<(), RegistryError>
 fn set_tags(owner: Address, contract_id: Address, tags: Vec<Symbol>) -> Result<(), RegistryError>
 fn stake(owner: Address, contract_id: Address, amount: I128) -> Result<(), RegistryError>
@@ -56,6 +59,7 @@ fn transfer_ownership(caller: Address, contract_id: Address, new_owner: Address)
 fn update_metadata(owner: Address, contract_id: Address, name: String, description: String) -> Result<(), RegistryError>
 fn upgrade(admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError>
 fn withdraw_stake(owner: Address, contract_id: Address) -> Result<I128, RegistryError>
+struct Attestation { attester: Address, created_at: U32, label: String }
 struct ContractEntry { active: Bool, contract_id: Address, description: String, name: String, owner: Address, registered_at: U32 }
 struct ContractPage { entries: Vec<ContractEntry>, has_more: Bool }
 struct ContractProfile { entry: ContractEntry, reputation: Reputation }
@@ -67,5 +71,5 @@ struct RegistryStats { active_count: U32, staked_count: U32, total_registered: U
 struct Reputation { slashed_total: I128, stake: I128, verified: Bool, withdraw_locked_until: U32 }
 struct SlashRecord { amount: I128, reason: String, slashed_at: U32 }
 union Category { DeFi, Nft, Gaming, Identity, Infrastructure, Payments, Oracle, Dao, Other }
-union DataKey { Admins, Threshold, ProposalCount, ProposalData(U32), ContractCount, TotalRegistered, Contract(Address), OwnerContracts(Address), AllContracts, StakeToken, Treasury, Stake(Address), Verified(Address), Slashes(Address), WithdrawLockedUntil(Address), Categories(Address), ByCategory(Category), AllowlistEnabled, Allowlisted(Address), RegistrationRateLimit, RegistrationRateWindow, RegistrationWindow(Address), RegistrationFee, Tags(Address), TotalStaked, VerifiedCount, Admin }
+union DataKey { Admins, Threshold, ProposalCount, ProposalData(U32), ContractCount, TotalRegistered, Contract(Address), OwnerContracts(Address), AllContracts, StakeToken, Treasury, Stake(Address), Verified(Address), Slashes(Address), WithdrawLockedUntil(Address), Categories(Address), ByCategory(Category), AllowlistEnabled, Allowlisted(Address), RegistrationRateLimit, RegistrationRateWindow, RegistrationWindow(Address), RegistrationFee, Tags(Address), Attestations(Address), TotalStaked, VerifiedCount, Admin }
 union ProposalAction { Deactivate(Address), Upgrade(BytesN<32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I128, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(I128) }

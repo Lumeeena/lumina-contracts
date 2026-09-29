@@ -43,7 +43,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 5;
+pub const CONTRACT_VERSION: u32 = 6;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -137,6 +137,11 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -292,6 +297,59 @@ pub struct ContractProfilePage {
     /// True if more results are available after this page.
     pub has_more: bool,
 }
+
+// ─── Third-party attestations ──────────────────────────────────────────────
+//
+// ## Why this is not `Verified`
+//
+// `Verified` is the governance signal: only the admin set, through a
+// threshold-and-timelocked proposal, can set it, and a registrant cannot
+// vouch for themselves. That is exactly the property that makes it worth
+// anything, so this feature deliberately does not touch it — there is no
+// `attest`-driven path to `Verified` and no counter that aggregates
+// attestations into it.
+//
+// An attestation is a weaker, explicitly *named* claim. "Account X says this
+// contract is audited" is a different and more modest statement than
+// "the registry vouches for this contract", and conflating them would let
+// anyone inflate the verified signal by attaching cheap labels to a
+// registration. Keeping them separate means a consumer can weight them
+// differently, and can show the attester's address either way.
+//
+// What an attestation *is* good for is the transparency property: the
+// attester's address is recorded on-chain, so a claim cannot be anonymous,
+// and the attester can withdraw it themselves. A wrong attestation is
+// therefore contestable by the party it misleads, without needing governance
+// to act.
+//
+// Labels are bounded in both count and length (see
+// [`MAX_ATTESTATIONS_PER_CONTRACT`] and [`MAX_ATTESTATION_LABEL_LEN`]) so one
+// party cannot inflate a registration's state with unbounded storage at a
+// cost imposed on every future reader of that list.
+
+/// One third party's claim about a registration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attestation {
+    /// Who made the attestation. Recorded so the claim is attributable rather
+    /// than anonymous, and so the attester can revoke it.
+    pub attester: Address,
+    /// Short, bounded free-text label describing the basis of the claim
+    /// (e.g. "audited", "used in production"). Bounded by
+    /// [`MAX_ATTESTATION_LABEL_LEN`].
+    pub label: String,
+    /// Ledger at which the attestation was made.
+    pub created_at: u32,
+}
+
+/// Maximum attestations a single registration may accumulate.
+///
+/// Bounded so the cost of listing a registration's attestations is a property
+/// of the contract rather than of how many parties choose to speak up.
+pub const MAX_ATTESTATIONS_PER_CONTRACT: u32 = 20;
+
+/// Maximum length of an attestation label, in bytes.
+pub const MAX_ATTESTATION_LABEL_LEN: u32 = 64;
 
 /// Entry for batch registration.
 #[contracttype]
@@ -457,6 +515,14 @@ pub enum DataKey {
     // ── Tags ────────────────────────────────────────────────────────────────
     /// Vec<Symbol> — owner-set normalized tags for a registration.
     Tags(Address),
+
+    // ── Third-party attestations ────────────────────────────────────────────
+    /// Vec<Attestation> — third-party attestations on a registration, oldest
+    /// first. Kept beside `ContractEntry` rather than inside it, for the same
+    /// reason as `Reputation`: a new field on `ContractEntry` would break every
+    /// entry already written (see the upgrade-compatibility rules above),
+    /// whereas a new `DataKey` variant is safe.
+    Attestations(Address),
 
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
@@ -1042,6 +1108,10 @@ impl LuminaRegistry {
         env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Tags(contract_id.clone()));
+        // Attestations are opinions about a live registration; once the entry
+        // is gone they have nothing left to refer to. Slashes, by contrast,
+        // are kept above, because those stay auditable after the fact.
+        env.storage().persistent().remove(&DataKey::Attestations(contract_id.clone()));
 
         if was_verified {
             let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(1);
@@ -1433,6 +1503,141 @@ impl LuminaRegistry {
         env.storage().persistent()
             .get(&DataKey::Tags(contract_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // ── Third-party attestations ────────────────────────────────────────────
+
+    /// Vouch for a registration with a short, bounded label.
+    ///
+    /// Permissionless by design: any address may attest, including the
+    /// registration's own owner. This is a transparency feature, not a trust
+    /// signal — it grants nothing, changes no counter that feeds
+    /// [`LuminaRegistry::is_verified`], and confers no privilege. What it does
+    /// is record *who* is vouching, so the claim is attributable and the
+    /// attester can take it back via
+    /// [`LuminaRegistry::revoke_attestation`].
+    ///
+    /// Governance-only verification is deliberately untouched: there is no
+    /// path from an attestation to `Verified`, so attaching many of them can
+    /// never substitute for the multi-sig proposal.
+    ///
+    /// One attestation per attester per registration. Re-attesting updates the
+    /// existing record's label and timestamp rather than adding a second entry,
+    /// so a party cannot pad the list or leave a stale label behind that they
+    /// no longer stand behind.
+    ///
+    /// Rejects an empty or over-long label, and a registration that has
+    /// already reached [`MAX_ATTESTATIONS_PER_CONTRACT`].
+    pub fn attest(
+        env: Env,
+        attester: Address,
+        contract_id: Address,
+        label: String,
+    ) -> Result<(), RegistryError> {
+        attester.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        // Bounded in length, and non-empty: an empty label carries no claim
+        // but still costs a list entry and an address.
+        if label.is_empty() || label.len() > MAX_ATTESTATION_LABEL_LEN {
+            return Err(RegistryError::InvalidAttestation);
+        }
+
+        let mut attestations = Self::attestations_of(&env, &contract_id);
+        let created_at = env.ledger().sequence();
+
+        // Replace this attester's existing record rather than appending, so
+        // the list stays one-per-attester and the label is always current.
+        for i in 0..attestations.len() {
+            if let Some(existing) = attestations.get(i) {
+                if existing.attester == attester {
+                    let recorded = label.clone();
+                    attestations.set(i, Attestation {
+                        attester: attester.clone(),
+                        label,
+                        created_at,
+                    });
+                    env.storage().persistent()
+                        .set(&DataKey::Attestations(contract_id.clone()), &attestations);
+                    env.events().publish(
+                        (Symbol::new(&env, "attestation_updated"),),
+                        (contract_id, attester, recorded),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        if attestations.len() >= MAX_ATTESTATIONS_PER_CONTRACT {
+            return Err(RegistryError::InvalidAttestation);
+        }
+
+        attestations.push_back(Attestation {
+            attester: attester.clone(),
+            label,
+            created_at,
+        });
+        env.storage().persistent()
+            .set(&DataKey::Attestations(contract_id.clone()), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "attestation_added"),),
+            (contract_id, attester, attestations.len()),
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw your own attestation from a registration.
+    ///
+    /// Scoped to the caller's own record: it removes the single attestation
+    /// whose `attester` equals `attester`, and errors if the caller has none.
+    /// No caller can remove anyone else's attestation — not a registry admin,
+    /// not the registration's owner, not a third party. That is the point:
+    /// a claim stays exactly as long as the party making it stands behind it,
+    /// and nobody else gets to decide that for them.
+    ///
+    /// Returns the number of attestations remaining.
+    pub fn revoke_attestation(
+        env: Env,
+        attester: Address,
+        contract_id: Address,
+    ) -> Result<u32, RegistryError> {
+        attester.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        let mut attestations = Self::attestations_of(&env, &contract_id);
+
+        // Match on the recorded attester, not on any caller-supplied address,
+        // so there is no argument through which one party can target another's
+        // attestation.
+        let index = (0..attestations.len())
+            .find(|i| attestations.get(*i).map(|a| a.attester == attester).unwrap_or(false))
+            .ok_or(RegistryError::AttestationNotFound)?;
+
+        attestations.remove(index);
+        let remaining = attestations.len();
+        env.storage().persistent()
+            .set(&DataKey::Attestations(contract_id), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "attestation_revoked"),),
+            (attester, remaining),
+        );
+
+        Ok(remaining)
+    }
+
+    /// Every third-party attestation on a registration, oldest first.
+    /// Returns an empty list for a registration that has none.
+    pub fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation> {
+        Self::attestations_of(&env, &contract_id)
     }
 
     // ── Staking ─────────────────────────────────────────────────────────────
@@ -2360,6 +2565,12 @@ impl LuminaRegistry {
             Ok(s) => s.len() as u32,
             Err(_) => u32::MAX,
         }
+    }
+
+    fn attestations_of(env: &Env, contract_id: &Address) -> Vec<Attestation> {
+        env.storage().persistent()
+            .get(&DataKey::Attestations(contract_id.clone()))
+            .unwrap_or(Vec::new(env))
     }
 
     fn slash_history(env: &Env, contract_id: &Address) -> Vec<SlashRecord> {
@@ -4720,6 +4931,371 @@ mod test {
             1,
         );
         assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Third-party attestations ────────────────────────────────────────────
+
+    #[test]
+    fn multiple_parties_can_attest_to_the_same_registration() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "used in production"));
+        client.attest(&carol, &target, &String::from_str(&env, "independent review"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 3);
+
+        // Every attester's identity is recorded — the claim is attributable,
+        // not anonymous.
+        assert!(attestations.iter().any(|a| a.attester == alice));
+        assert!(attestations.iter().any(|a| a.attester == bob));
+        assert!(attestations.iter().any(|a| a.attester == carol));
+    }
+
+    #[test]
+    fn attestation_records_the_attester_label_and_ledger() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        let before = env.ledger().sequence();
+        client.attest(&alice, &target, &String::from_str(&env, "audited by acme"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        let attestation = attestations.get(0).unwrap();
+        assert_eq!(attestation.attester, alice);
+        assert_eq!(attestation.label, String::from_str(&env, "audited by acme"));
+        assert_eq!(attestation.created_at, before);
+    }
+
+    #[test]
+    fn attestations_are_kept_in_the_order_they_were_made() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "first"));
+        advance_ledger(&env, 5);
+        client.attest(&bob, &target, &String::from_str(&env, "second"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+        assert_eq!(attestations.get(1).unwrap().attester, bob);
+    }
+
+    #[test]
+    fn attesting_twice_updates_rather_than_duplicating() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "preliminary"));
+        advance_ledger(&env, 100);
+        client.attest(&alice, &target, &String::from_str(&env, "final audit"));
+
+        // One entry, not two, and the stale label is gone.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().label, String::from_str(&env, "final audit"));
+    }
+
+    #[test]
+    fn an_attester_can_revoke_their_own_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "audited too"));
+
+        // Returns the number remaining.
+        assert_eq!(client.revoke_attestation(&alice, &target), 1);
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        // Only Alice's is gone; Bob's is untouched.
+        assert_eq!(attestations.get(0).unwrap().attester, bob);
+    }
+
+    #[test]
+    fn revoking_removes_only_the_callers_own_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "a"));
+        client.attest(&bob, &target, &String::from_str(&env, "b"));
+        client.attest(&carol, &target, &String::from_str(&env, "c"));
+
+        // Bob revokes; Alice's and Carol's must both survive.
+        assert_eq!(client.revoke_attestation(&bob, &target), 2);
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 2);
+        assert!(attestations.iter().any(|a| a.attester == alice));
+        assert!(attestations.iter().any(|a| a.attester == carol));
+        assert!(!attestations.iter().any(|a| a.attester == bob));
+    }
+
+    #[test]
+    fn a_caller_cannot_revoke_someone_elses_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let mallory = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // Mallory has no attestation of her own to revoke.
+        assert_eq!(
+            client.try_revoke_attestation(&mallory, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+
+        // Alice's attestation is untouched by the attempt.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn neither_an_admin_nor_the_owner_can_revoke_another_partys_attestation() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // Privilege confers no standing here: the governance admin set and the
+        // registration's owner are both refused, because the record is keyed
+        // to the attester and only the attester can withdraw it.
+        assert_eq!(
+            client.try_revoke_attestation(&admin, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+        assert_eq!(
+            client.try_revoke_attestation(&owner, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+
+        assert_eq!(client.get_attestations(&target).len(), 1);
+        assert_eq!(client.get_attestations(&target).get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn revoking_twice_fails_on_the_second_call() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.revoke_attestation(&alice, &target), 0);
+
+        // Idempotence is not offered here: a second revoke is an error rather
+        // than a silent no-op, so a caller cannot mistake it for success.
+        assert_eq!(
+            client.try_revoke_attestation(&alice, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+    }
+
+    #[test]
+    fn attesting_is_rejected_for_an_unregistered_contract() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_attest(&alice, &unregistered, &String::from_str(&env, "audited")),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_eq!(
+            client.try_revoke_attestation(&alice, &unregistered),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn attestation_labels_are_length_bounded() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        // Empty labels carry no claim but still cost storage.
+        assert_eq!(
+            client.try_attest(&alice, &target, &String::from_str(&env, "")),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+
+        // At the limit: accepted.
+        let at_limit = "a".repeat(MAX_ATTESTATION_LABEL_LEN as usize);
+        client.attest(&alice, &target, &String::from_str(&env, &at_limit));
+        assert_eq!(client.get_attestations(&target).len(), 1);
+
+        // One byte over: rejected.
+        let over_limit = "a".repeat(MAX_ATTESTATION_LABEL_LEN as usize + 1);
+        let bob = Address::generate(&env);
+        assert_eq!(
+            client.try_attest(&bob, &target, &String::from_str(&env, &over_limit)),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+
+        // The rejected attestation left nothing behind.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn the_number_of_attestations_per_registration_is_bounded() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+
+        for i in 0..MAX_ATTESTATIONS_PER_CONTRACT {
+            client.attest(
+                &Address::generate(&env),
+                &target,
+                &String::from_str(&env, "audited"),
+            );
+            // Keep labels distinct from the counter for clarity if it ever fails.
+            let _ = i;
+        }
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // The next distinct attester is refused: the list cannot grow without
+        // bound, so a reader's cost stays fixed.
+        let overflow = Address::generate(&env);
+        assert_eq!(
+            client.try_attest(&overflow, &target, &String::from_str(&env, "audited")),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // An existing attester can still revise their own label at the cap,
+        // since that replaces rather than appends.
+        let first = client.get_attestations(&target).get(0).unwrap().attester;
+        client.attest(&first, &target, &String::from_str(&env, "revised"));
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // And revoking frees a slot again.
+        client.revoke_attestation(&first, &target);
+        client.attest(&overflow, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+    }
+
+    #[test]
+    fn attestations_are_scoped_to_one_registration() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let first = register_for(&env, &client, &alice);
+        let second = register_for(&env, &client, &alice);
+
+        client.attest(&alice, &first, &String::from_str(&env, "audited"));
+        client.attest(&alice, &second, &String::from_str(&env, "audited"));
+
+        // Same attester, two registrations, one entry each.
+        assert_eq!(client.get_attestations(&first).len(), 1);
+        assert_eq!(client.get_attestations(&second).len(), 1);
+
+        client.revoke_attestation(&alice, &first);
+        assert_eq!(client.get_attestations(&first).len(), 0);
+        // Revoking on one registration leaves the other alone.
+        assert_eq!(client.get_attestations(&second).len(), 1);
+    }
+
+    #[test]
+    fn a_registration_with_no_attestations_reports_an_empty_list() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_attestations(&target).len(), 0);
+
+        // Unregistered addresses read as empty too, mirroring `get_tags`.
+        assert_eq!(client.get_attestations(&Address::generate(&env)).len(), 0);
+    }
+
+    #[test]
+    fn attesting_does_not_affect_governance_only_verification() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Attestation is not verification, in either direction.
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "audited"));
+        assert!(!client.is_verified(&target));
+        assert_eq!(client.get_reputation(&target).verified, false);
+
+        // Verified statistics do not move either: attestations are not an
+        // input to the verified signal.
+        let stats = client.get_registry_stats();
+        assert_eq!(stats.verified_count, 0);
+
+        // Only governance can set it, and it still goes through the proposal
+        // flow rather than being implied by the attestations.
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.is_verified(&target));
+        assert_eq!(client.get_registry_stats().verified_count, 1);
+        assert_eq!(client.get_attestations(&target).len(), 2);
+    }
+
+    #[test]
+    fn attesting_does_not_grant_verification_or_privilege_to_the_attester() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // The attester gained nothing: still not verified, and still not an
+        // admin, so it cannot propose governance actions.
+        assert!(!client.is_verified(&target));
+        assert!(!client.get_admins().contains(&alice));
+        assert_eq!(
+            client.try_propose_set_verified(&alice, &target, &true),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+
+        // And it is not the registration's owner, so owner-gated actions
+        // remain closed to it.
+        assert_ne!(alice, owner);
+        assert_eq!(
+            client.try_update_metadata(&alice, &target, &String::from_str(&env, "x"), &String::from_str(&env, "y")),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+    }
+
+    #[test]
+    fn deregistering_removes_the_registrations_attestations() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.get_attestations(&target).len(), 1);
+
+        client.deactivate(&owner, &target);
+        client.deregister(&owner, &target);
+
+        // Opinions about a registration that no longer exists are cleared, so
+        // a later re-registration does not inherit them.
+        assert!(!client.is_registered(&target));
+        assert_eq!(client.get_attestations(&target).len(), 0);
+
+        let fresh = register_for(&env, &client, &owner);
+        assert_eq!(client.get_attestations(&fresh).len(), 0);
     }
 
     // ── Deregistration, pruning & counters ──────────────────────────────────

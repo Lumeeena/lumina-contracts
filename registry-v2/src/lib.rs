@@ -38,7 +38,7 @@ use soroban_sdk::{
 /// reads back to confirm the new code is the one now executing. The tests
 /// assert the relationship rather than the literal, so bumping the registry's
 /// version means bumping this one too, and nothing else.
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 7;
 
 /// Errors returned by the Lumina Registry v2 contract.
 #[contracterror]
