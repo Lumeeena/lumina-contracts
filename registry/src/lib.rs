@@ -137,6 +137,12 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// The proposed treasury or stake-token address is itself a registered
+    /// contract.  Allowing this would create a confusing state where a
+    /// registration's owner is the treasury that receives its own slashes.
+    /// The check is cheap and the configuration is rejected at proposal time
+    /// so the error surfaces immediately rather than after the timelock.
+    OverlappingAddress = 27,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -668,6 +674,14 @@ impl LuminaRegistry {
     /// registry was already initialized under the old signature — routing this
     /// through governance lets a deployed registry adopt staking after an
     /// upgrade instead of needing to be redeployed.
+    ///
+    /// Both `token` and `treasury` must not be addresses already registered in
+    /// the registry.  Permitting an overlap would create a confusing state: a
+    /// `ContractEntry` whose owner could receive its own slashes, making the
+    /// slash semantics circular.  The validation is intentionally placed here —
+    /// at proposal time — so an obviously-invalid configuration is rejected
+    /// immediately rather than sitting through the timelock only to revert on
+    /// execution.
     pub fn propose_configure_staking(
         env: Env,
         proposer: Address,
@@ -676,6 +690,15 @@ impl LuminaRegistry {
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
         Self::assert_is_admin(&env, &proposer)?;
+
+        // Reject if either address is already a registered contract.
+        // See `RegistryError::OverlappingAddress` for the full rationale.
+        if env.storage().persistent().has(&DataKey::Contract(token.clone())) {
+            return Err(RegistryError::OverlappingAddress);
+        }
+        if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+            return Err(RegistryError::OverlappingAddress);
+        }
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -2284,6 +2307,17 @@ impl LuminaRegistry {
                     return Err(RegistryError::InvalidMetadata);
                 }
                 let _ = token::Client::new(env, token_id).decimals();
+                // Guard at execution time as well as proposal time: the
+                // registration state may have changed between the two, and an
+                // overlap that slipped through (e.g. a pre-existing proposal
+                // created before the contract was registered) must still be
+                // caught before the config is written.
+                if env.storage().persistent().has(&DataKey::Contract(token_id.clone())) {
+                    return Err(RegistryError::OverlappingAddress);
+                }
+                if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+                    return Err(RegistryError::OverlappingAddress);
+                }
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
@@ -5105,5 +5139,90 @@ mod test {
         assert_eq!(client.get_stats().total_staked, 500);
         assert_eq!(client.get_stake(&target1), 400);
         assert_eq!(client.get_stake(&target2), 100);
+    // ── Overlapping-address guard (issue #109) ──────────────────────────────
+
+    /// Configuring the treasury as a registered contract address must be
+    /// rejected at proposal time.  See `RegistryError::OverlappingAddress`.
+    #[test]
+    fn configure_staking_rejects_treasury_that_is_a_registered_contract() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        // Register a contract; its address is now in the registry.
+        let registered_contract = register_for(&env, &client, &owner);
+
+        // A separate, valid stake token.
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+
+        // The treasury address happens to be one of the registered contracts.
+        assert_eq!(
+            client.try_propose_configure_staking(&admin, &token_id, &registered_contract),
+            Err(Ok(RegistryError::OverlappingAddress)),
+        );
+    }
+
+    /// Configuring the stake token as a registered contract address must also
+    /// be rejected at proposal time.
+    #[test]
+    fn configure_staking_rejects_stake_token_that_is_a_registered_contract() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        // Register a contract; its address is now in the registry.
+        let registered_contract = register_for(&env, &client, &owner);
+
+        // A valid treasury.
+        let treasury = Address::generate(&env);
+
+        // The stake-token address happens to be one of the registered contracts.
+        assert_eq!(
+            client.try_propose_configure_staking(&admin, &registered_contract, &treasury),
+            Err(Ok(RegistryError::OverlappingAddress)),
+        );
+    }
+
+    /// A normal configure-staking proposal with non-overlapping addresses must
+    /// still succeed so the existing behaviour is unaffected.
+    #[test]
+    fn configure_staking_with_non_overlapping_addresses_succeeds() {
+        let (env, client, admin) = setup();
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+        let treasury = Address::generate(&env);
+
+        // Neither address is a registered contract — this must go through.
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+        assert_eq!(client.get_staking_config(), (token_id, treasury));
+    }
+
+    /// A proposal created before a contract was registered must be rejected at
+    /// execution time even if it passed proposal-time validation.
+    #[test]
+    fn configure_staking_execution_rejects_if_address_registered_after_proposal() {
+        let (env, client, admin) = setup();
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+        let future_treasury = Address::generate(&env);
+
+        // Proposal created when future_treasury is not yet registered — passes.
+        let pid = client.propose_configure_staking(&admin, &token_id, &future_treasury);
+        client.approve_proposal(&admin, &pid);
+
+        // Before the timelock elapses, someone registers future_treasury.
+        let owner = Address::generate(&env);
+        client.register_contract(
+            &owner,
+            &future_treasury,
+            &String::from_str(&env, "Late contract"),
+            &String::from_str(&env, "registered after proposal"),
+            &default_cats(&env),
+        );
+
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        // Execution must now be rejected because the overlap exists.
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::OverlappingAddress)),
+        );
     }
 }
