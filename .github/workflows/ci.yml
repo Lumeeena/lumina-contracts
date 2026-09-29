@@ -30,9 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32v1-none
+      - name: Setup Rust toolchain
+        run: rustup show
       # `wasm32v1-none` is the Soroban target. `wasm32-unknown-unknown` builds,
       # but on current Rust it emits the reference-types proposal, which the
       # Soroban host refuses to load.

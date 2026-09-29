@@ -231,6 +231,16 @@ that test's upgrade target and is never deployed.
 Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
 
+### Upgrading the Rust Toolchain
+
+The project pins its Rust compiler version using a `rust-toolchain.toml` file to ensure that CI and local builds compile with the exact same compiler. A floating toolchain can cause unexpected breakages (such as the reference-types proposal being emitted by newer Rust versions on `wasm32-unknown-unknown`).
+
+To upgrade the compiler version:
+1. Update the `channel` value in `rust-toolchain.toml` to the new stable version.
+2. Ensure `targets = ["wasm32v1-none"]` remains present in the file.
+3. Re-run `cargo build --target wasm32v1-none --release` and `cargo test` locally to verify the new compiler version doesn't introduce any new build errors or warnings.
+4. Commit the updated `rust-toolchain.toml` file and open a PR. CI will automatically honor the newly pinned version instead of defaulting to `stable`.
+
 ### Interface snapshot
 
 [registry/interface.snap](./registry/interface.snap) is the registry's exported
