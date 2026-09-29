@@ -1,0 +1,3 @@
+# WASM size budget for target/wasm32v1-none/release/lumina_registry.wasm
+# Units: bytes. Update this value deliberately when the contract size changes.
+500000
