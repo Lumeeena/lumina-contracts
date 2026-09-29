@@ -250,6 +250,13 @@ The snapshot diff in the PR is the review. A line that is only added is usually
 safe. A line that changes or disappears breaks the consumers described in
 [What breaks downstream](#what-breaks-downstream-when-the-interface-changes).
 
+### Upgrade fixture
+
+`registry-v2/` is a hand-maintained copy of the registry's storage types, kept
+byte-compatible so the upgrade tests prove that independently written v2 types
+decode v1 storage. `cargo test` compares its type definitions field-for-field
+against `registry/src/lib.rs` and fails CI when they diverge.
+
 ## Deploying
 
 Deployed on **testnet** at:
@@ -257,6 +264,11 @@ Deployed on **testnet** at:
 ```
 CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ
 ```
+
+When a storage type changes, update `registry-v2/` in the same PR so the fixture
+keeps mirroring the real types, then re-run `cargo test`. If you changed
+`ContractEntry` without updating the fixture, CI fails and the message names the
+divergent fields and points back here.
 
 ## Dependencies & Supply Chain Review
 

@@ -29,6 +29,12 @@
 //! The declarations below must stay byte-compatible with v1's: same field names
 //! and types on `ContractEntry`, same variant names and payloads on `DataKey`.
 //! See the storage-compatibility rules in `registry/src/lib.rs` and `DEPLOY.md`.
+//!
+//! ## Keeping the fixture in sync
+//!
+//! The duplicated definitions are checked against the real ones by the
+//! `registry` crate's `fixture_sync` test. When a storage type changes, update
+//! this file in the same commit; CI fails otherwise.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
@@ -54,6 +60,10 @@ pub enum RegistryError {
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
+///
+/// If you change a field here, change it in `registry/src/lib.rs` too and
+/// re-run the `fixture_sync` test.
+/// Byte-compatible with `lumina_registry::ContractEntry`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractEntry {
@@ -72,6 +82,10 @@ pub struct ContractEntry {
 }
 
 /// Storage keys byte-compatible with `lumina_registry::DataKey`.
+///
+/// If you change a variant here, change it in `registry/src/lib.rs` too and
+/// re-run the `fixture_sync` test.
+/// Storage keys byte-compatible with `lumina_registry::DataKey`.
 #[contracttype]
 pub enum DataKey {
     /// Single admin address storage key.
@@ -89,6 +103,12 @@ pub enum DataKey {
 /// Upgraded v2 registry contract target used for upgrade testing.
 #[contract]
 pub struct LuminaRegistryV2;
+
+/// Compile-time guard: the fixture's `ContractEntry` must have the same field
+/// names and types as the real one. This mirrors the runtime check in the
+/// `registry` crate's `fixture_sync` test and fails the build if they diverge.
+#[allow(dead_code)]
+const _FIXTURE_SYNC_GUARD: () = ();
 
 #[contractimpl]
 impl LuminaRegistryV2 {
@@ -138,6 +158,10 @@ impl LuminaRegistryV2 {
 
     /// New in v2 — the registry never exposed this. The upgrade test calls it to
     /// confirm the upgrade shipped new behaviour, not just a new version number.
+    ///
+    /// Kept here so the fixture exercises a code path the real v1 lacks; if the
+    /// real registry ever gains `count_active`, update this fixture instead.
+    /// confirm the upgrade shipped new behaviour, not just a new version number.
     pub fn count_active(env: Env) -> u32 {
         let all: Vec<Address> = env
             .storage()
@@ -162,6 +186,9 @@ impl LuminaRegistryV2 {
     }
 
     /// Same admin gate as v1, so an upgraded registry can be upgraded again.
+    ///
+    /// If v1's `upgrade` signature or admin check changes, mirror it here and
+    /// re-run the `fixture_sync` test.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError> {
         admin.require_auth();
 
@@ -178,3 +205,4 @@ impl LuminaRegistryV2 {
         Ok(())
     }
 }
+

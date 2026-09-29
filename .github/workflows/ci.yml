@@ -45,6 +45,29 @@ jobs:
       # for. See "Interface snapshot" in the README for how to accept one.
       - run: cargo test
 
+  registry-v2-fixture:
+    name: Registry v2 Fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `registry-v2` is a hand-maintained copy of the storage types that must
+      # stay byte-compatible with the real ones. This check fails when the
+      # duplicated definitions drift out of sync with the types they mirror.
+      #
+      # If this fails, a storage type changed without updating the fixture.
+      # Regenerate it deliberately (see "Registry v2 upgrade fixture" in the
+      # README) and commit the updated fixture alongside the type change.
+      - name: Check registry-v2 fixture matches storage types
+        run: |
+          if ! cargo test -p registry --test registry_v2_fixture -- --nocapture; then
+            echo "::error::registry-v2 fixture is out of sync with the storage types."
+            echo "A storage type (e.g. ContractEntry) changed without updating the"
+            echo "registry-v2 upgrade fixture. Regenerate the fixture deliberately"
+            echo "(see \"Registry v2 upgrade fixture\" in the README) and commit it"
+            echo "together with the type change."
+            exit 1
+          fi
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

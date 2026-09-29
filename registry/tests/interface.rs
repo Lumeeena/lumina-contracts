@@ -1,4 +1,4 @@
-//! Guards the registry's exported interface against unreviewed changes.
+//! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
 //!
 //! The interface — every exported function signature and every type and error
 //! code those functions expose — is what the indexer, the frontend and every
@@ -20,6 +20,15 @@
 //!
 //! then commit `registry/interface.snap` alongside the change so the diff is
 //! reviewed with it.
+//!
+//! This file also guards the `registry-v2` upgrade fixture, a hand-maintained
+//! copy of the storage types that must stay byte-compatible with the real ones.
+//! The fixture's whole value is proving that independently written v2 types
+//! decode v1 storage, so if it drifts out of sync with the types it mirrors it
+//! quietly stops testing anything. When a storage type changes, update the
+//! fixture deliberately and regenerate its snapshot:
+//!
+//! 
 
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
 use std::path::PathBuf;
