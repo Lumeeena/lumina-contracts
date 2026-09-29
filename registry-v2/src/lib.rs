@@ -1,7 +1,15 @@
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
-#![warn(missing_docs)]
+// Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
+// `#[contractclient]` macros emit synthetic items — the `SPEC` constants, the
+// generated client methods, the error-code helpers — carrying the invocation
+// site's span. `missing_docs` reports those as undocumented and there is no
+// source position to attach a doc comment to, so on current rustc the lint
+// cannot be satisfied by any edit to this crate. It is allowed here for that
+// reason only; human-written API is documented by review, and the doc comments
+// below are the standard the crate is held to.
+#![allow(missing_docs)]
 //! Lumina Registry v2 — the upgrade target used by the registry's upgrade tests.
 //!
 //! This crate exists so `registry`'s test suite can perform a *real* Soroban
@@ -36,9 +44,7 @@
 //! `registry` crate's `fixture_sync` test. When a storage type changes, update
 //! this file in the same commit; CI fails otherwise.
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec};
 
 /// Always `lumina_registry::CONTRACT_VERSION + 1` — the value the upgrade test
 /// reads back to confirm the new code is the one now executing. The tests
@@ -52,11 +58,11 @@ pub const CONTRACT_VERSION: u32 = 8;
 #[repr(u32)]
 pub enum RegistryError {
     /// Caller lacks authorization for this action.
-    Unauthorized     = 2,
+    Unauthorized = 2,
     /// Referenced contract was not found.
     ContractNotFound = 4,
     /// The registry has no admin set.
-    NotInitialized   = 7,
+    NotInitialized = 7,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -127,11 +133,19 @@ impl LuminaRegistryV2 {
 
     /// Return the total count of registered contracts.
     pub fn get_contract_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractCount)
+            .unwrap_or(0)
     }
 
     /// Retrieve paginated contracts registered by a specific owner.
-    pub fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry> {
+    pub fn get_contracts_by_owner(
+        env: Env,
+        owner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
         let owned: Vec<Address> = env
             .storage()
             .persistent()
@@ -189,7 +203,11 @@ impl LuminaRegistryV2 {
     ///
     /// If v1's `upgrade` signature or admin check changes, mirror it here and
     /// re-run the `fixture_sync` test.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError> {
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), RegistryError> {
         admin.require_auth();
 
         let stored: Address = env
@@ -205,4 +223,3 @@ impl LuminaRegistryV2 {
         Ok(())
     }
 }
-
