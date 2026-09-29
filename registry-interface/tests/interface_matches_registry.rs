@@ -170,7 +170,7 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 29] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
@@ -178,7 +178,6 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 29] = [
     ("get_proposal", "proposal_id: U32", "Result<Proposal, RegistryError>"),
     ("get_categories", "contract_id: Address", "Vec<Category>"),
     ("get_tags", "contract_id: Address", "Vec<String>"),
-    ("get_staking_decimals", "", "Result<U32, RegistryError>"),
     (
         "get_active_contracts_by_category",
         "category: Category, offset: U32, limit: U32",
@@ -501,7 +500,7 @@ fn interface_types_match_the_registry() {
         "Deactivate(Address),Upgrade(BytesN<32>),AddAdmin(Address),RemoveAdmin(Address),\
          ChangeThreshold(U32),ConfigureStaking(Address,Address),SetVerified(Address,Bool),\
          Slash(Address,I128,String),SetAllowlistEnabled(Bool),SetAllowlisted(Address,Bool),\
-         ConfigureRegistrationRateLimit(U32,U32),SetRegistrationFee(I128),SetStakingDecimals(U32)",
+         ConfigureRegistrationRateLimit(U32,U32),SetRegistrationFee(I128)",
     );
 }
 

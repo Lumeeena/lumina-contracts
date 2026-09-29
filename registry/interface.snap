@@ -69,9 +69,9 @@ struct ContractProfilePage { entries: Vec<ContractProfile>, has_more: Bool }
 struct Proposal { action: ProposalAction, approvals: Vec<Address>, executed: Bool, id: U32, proposer: Address, ready_at: U32 }
 struct RegistrationEntry { categories: Vec<Category>, contract_id: Address, description: String, name: String }
 struct RegistrationWindow { count: U32, started_at: U32 }
-struct RegistryStats { active_count: U32, staked_count: U32, total_registered: U32, total_staked: I128, verified_count: U32 }
-struct Reputation { slashed_total: I128, stake: I128, verified: Bool, withdraw_locked_until: U32 }
-struct SlashRecord { amount: I128, reason: String, slashed_at: U32 }
+struct RegistryStats { active_count: U32, staked_count: U32, total_registered: U32, total_staked: H128, verified_count: U32 }
+struct Reputation { slashed_total: H128, stake: I128, verified: Bool, withdraw_locked_until: U32 }
+struct SlashRecord { amount: H128, reason: String, slashed_at: U32 }
 union Category { DeFi, Nft, Gaming, Identity, Infrastructure, Payments, Oracle, Dao, Other }
 union DataKey { Admins, Threshold, ProposalCount, ProposalData(U32), ContractCount, TotalRegistered, Contract(Address), OwnerContracts(Address), AllContracts, StakeToken, Treasury, Stake(Address), Verified(Address), Slashes(Address), WithdrawLockedUntil(Address), Categories(Address), ByCategory(Category), AllowlistEnabled, Allowlisted(Address), RegistrationRateLimit, RegistrationRateWindow, RegistrationWindow(Address), RegistrationFee, Tags(Address), Attestations(Address), TotalStaked, VerifiedCount, Admin }
-union ProposalAction { Deactivate(Address), Upgrade(BytesN <32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I128, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(I128) }
+union ProposalAction { Deactivate(Address), Upgrade(BytesN32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I128, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(H128) }

@@ -1,40 +1,38 @@
-//! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
-//!
-//! The interface — every exported function signature and every type and error
-//! code those functions expose — is what the indexer, the frontend and every
-//! registrant bind to. A renamed parameter or a new argument is a breaking
-//! change for all of them, and without this test it only surfaces when
-//! something downstream fails.
-//!
-//! The test reads the contract spec out of the *built* wasm (the same
-//! `contractspecv0` section `stellar contract bindings` and `contractimport!`
-//! consume), renders it as plain text, and compares it with the checked-in
-//! `registry/interface.snap`. Doc comments are left out: rewording one is not
-//! an interface change.
-//!
-//! To accept an intended change, rebuild the wasm and regenerate the snapshot:
-//!
-//! ```bash
-//! cargo build --target wasm32v1-none --release && UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
-//! ```
-//!
-//! then commit `registry/interface.snap` alongside the change so the diff is
-//! reviewed with it.
-//!
-//! This file also guards the `registry-v2` upgrade fixture, a hand-maintained
-//! copy of the storage types that must stay byte-compatible with the real ones.
-//! The fixture's whole value is proving that independently written v2 types
-//! decode v1 storage, so if it drifts out of sync with the types it mirrors it
-//! quietly stops testing anything. When a storage type changes, update the
-//! fixture deliberately and regenerate its snapshot:
-//!
-//! 
-
-// The staking config now reports the stake token's `decimals()`, read from the
-// token when staking is configured and cached alongside the token address.
-// Changing the stake token after stakes exist is unsupported: the cached
-// decimals would no longer match the token backing existing stakes. The
-// interface snapshot below must be regenerated when this changes.
+/// Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
+///
+/// The interface — every exported function signature and every type and error
+/// code those functions expose — is what the indexer, the frontend and every
+/// registrant bind to. A renamed parameter or a new argument is a breaking
+/// change for all of them, and without this test it only surfaces when
+/// something downstream fails.
+///
+/// The test reads the contract spec out of the *built* wasm (the same
+/// `contractspecv0` section `stellar contract bindings` and `contractimport!`
+/// consume), renders it as plain text, and compares it with the checked-in
+/// `registry/interface.snap`. Doc comments are left out: rewording one is not
+/// an interface change.
+///
+/// To accept an intended change, rebuild the wasm and regenerate the snapshot:
+///
+/// ```bash
+/// cargo build --target wasm32v1-none --release && UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
+/// ```
+///
+/// then commit `registry/interface.snap` alongside the change so the diff is
+/// reviewed with it.
+///
+/// This file also guards the `registry-v2` upgrade fixture, a hand-maintained
+/// copy of the storage types that must stay byte-compatible with the real ones.
+/// The fixture's whole value is proving that independently written v2 types
+/// decode v1 storage, so if it drifts out of sync with the types it mirrors it
+/// quietly stops testing anything. When a storage type changes, update the
+/// fixture deliberately and regenerate its snapshot:
+///
+/// ```bash
+/// UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
+/// ```
+///
+/// then commit `registry/interface.snap` alongside the change.
 
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
 use std::path::PathBuf;
@@ -42,14 +40,11 @@ use std::path::PathBuf;
 const UPDATE_ENV: &str = "UPDATE_INTERFACE_SNAPSHOT";
 
 fn manifest_path(parts: &[&str]) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut path = PathBuf&#39;::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(parts);
     path
 }
 
-/// Renders a type as it appears in the exported interface. `StakingConfig`
-/// carries the token's decimals so callers can render raw `i128` amounts
-/// without a separate token query.
 fn render_type(ty: &ScSpecTypeDef) -> String {
     match ty {
         ScSpecTypeDef::Option(o) => format!("Option<{}>", render_type(&o.value_type)),
@@ -85,7 +80,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                 let args = f
                     .inputs
                     .iter()
-                    .map(|i| format!("{}: {}", i.name.to_utf8_string_lossy(), render_type(&i.type_)))
+                    .map(|| format!("{}: {}", i.name.to_utf8_string_lossy(), render_type(&i.type_)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let ret = match f.outputs.first() {
@@ -101,7 +96,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|f| format!("{}: {}", f.name.to_utf8_string_lossy(), render_type(&f.type_)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("struct {} {{ {} }}", s.name.to_utf8_string_lossy(), fields)
+                format!("struct {} { {} }", s.name.to_utf8_string_lossy(), fields)
             }
             ScSpecEntry::UdtUnionV0(u) => {
                 let cases = u
@@ -117,7 +112,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("union {} {{ {} }}", u.name.to_utf8_string_lossy(), cases)
+                format!("union {} { {} }", u.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtEnumV0(e) => {
                 let cases = e
@@ -126,7 +121,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("enum {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("enum {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtErrorEnumV0(e) => {
                 let cases = e
@@ -135,7 +130,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("error {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("error {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
         })
         .collect();
@@ -145,8 +140,6 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
     out
 }
 
-/// Asserts the built wasm's exported interface matches `interface.snap`,
-/// including `get_staking_config`'s reported token decimals.
 #[test]
 fn exported_interface_matches_snapshot() {
     let wasm_path = manifest_path(&["..", "target", "wasm32v1-none", "release", "lumina_registry.wasm"]);
@@ -160,7 +153,7 @@ fn exported_interface_matches_snapshot() {
     let actual = render_interface(&entries);
 
     let snap_path = manifest_path(&["interface.snap"]);
-    if std::env::var_os(UPDATE_ENV).is_some() {
+    if std::env::var_osS(UPDATE_ENV).is_some() {
         std::fs::write(&snap_path, &actual).expect("write interface snapshot");
         return;
     }
