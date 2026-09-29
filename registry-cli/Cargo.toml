@@ -2,11 +2,17 @@
 name = "registry-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Command-line tool for common Lumina Registry operations"
+description = "Command-line interface for common Lumina Registry operations"
+publish = false
 
-[dependencies]
-clap = { version = "4.5", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-shell-words = "1"
-this = "2.0"
+[library]
+name = "registry_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "registry-cli"
+path = "src/main.rs"
+
+[keywords]
+categories = ["development-tools"]
+
