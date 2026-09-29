@@ -578,6 +578,9 @@ pub enum ProposalAction {
     WithdrawFromTreasury(i128),
     /// Remap every registration from one category to another: `(from, to)`.
     MigrateCategory(Category, Category),
+    /// Set the slash-specific approval threshold.  Must satisfy the same
+    /// bounds as `ChangeThreshold`.  Zero means "use the standard threshold".
+    SetSlashThreshold(u32),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -605,6 +608,11 @@ pub struct Proposal {
     pub ready_at: u32,
     /// Whether the proposal has already been executed.
     pub executed: bool,
+    /// The number of approvals this proposal requires.  For `Slash` actions
+    /// this is the slash threshold (if one is configured); for all other
+    /// actions it is the standard threshold.  Snapshotted at proposal creation
+    /// so the required bar is stable across threshold changes.
+    pub threshold_required: u32,
 }
 
 /// Storage keys used by the Lumina Registry contract.
@@ -660,6 +668,9 @@ pub enum DataKey {
     Admins,
     /// u32 — number of approvals required to pass a proposal.
     Threshold,
+    /// u32 — elevated approvals required to pass a Slash proposal.
+    /// When absent the standard `Threshold` applies.
+    SlashThreshold,
     /// u32 — monotonically-increasing proposal counter.
     ProposalCount,
     /// Proposal — the full proposal record.
@@ -1362,6 +1373,38 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// Propose setting a slash-specific approval threshold.
+    ///
+    /// `new_slash_threshold` must satisfy `1 <= new_slash_threshold <= admins.len()`,
+    /// the same bounds as `propose_change_threshold`.  Pass `0` to reset to
+    /// "use the standard threshold".
+    pub fn propose_set_slash_threshold(
+        env: Env,
+        proposer: Address,
+        new_slash_threshold: u32,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+
+        // Zero is the "clear / use standard" sentinel — valid.
+        // Non-zero values must be satisfiable with the current admin set.
+        if new_slash_threshold > admins.len() {
+            return Err(RegistryError::InvalidThreshold);
+        }
+
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetSlashThreshold(new_slash_threshold),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_slash_threshold"), new_slash_threshold),
+        );
+        Ok(proposal_id)
+    }
+
     // ── Governance: approval ────────────────────────────────────────────────
 
     /// Record an admin's approval of a proposal.  When the number of unique
@@ -1389,11 +1432,10 @@ impl LuminaRegistry {
 
         proposal.approvals.push_back(admin.clone());
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
+        // Use the threshold that was snapshotted when the proposal was created.
+        // For Slash proposals this is the slash threshold; for everything else
+        // it is the standard threshold.
+        let threshold = proposal.threshold_required;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_approved"),),
@@ -1425,11 +1467,10 @@ impl LuminaRegistry {
             return Err(RegistryError::AlreadyExecuted);
         }
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
+        // Re-validate against the threshold snapshotted at proposal creation.
+        // This ensures a Slash proposal can't be executed by falling back to a
+        // lower standard threshold that was set after the proposal was created.
+        let threshold = proposal.threshold_required;
         if proposal.approvals.len() < threshold {
             return Err(RegistryError::ThresholdNotMet);
         }
@@ -2528,7 +2569,28 @@ env.storage().persistent()
             .ok_or(RegistryError::NotInitialized)
     }
 
+    /// The slash-specific approval threshold, if one has been configured.
+    ///
+    /// Returns the standard threshold when no slash threshold has been set,
+    /// so callers can always use this value without a special-case.
+    pub fn get_slash_threshold(env: Env) -> Result<u32, RegistryError> {
+        let standard: u32 = env.storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .ok_or(RegistryError::NotInitialized)?;
+        let slash = env.storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::SlashThreshold)
+            .unwrap_or(standard);
+        Ok(slash)
+    }
+
     /// Retrieve a proposal by ID.
+    ///
+    /// The returned `Proposal` includes a `threshold_required` field that
+    /// reflects the number of approvals this specific proposal needs —
+    /// the slash threshold for `Slash` actions, the standard threshold for
+    /// everything else.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError> {
         Self::load_proposal(&env, proposal_id)
     }
@@ -3618,12 +3680,24 @@ impl LuminaRegistry {
     }
 
     /// Allocate a new proposal ID, store the proposal, and return the ID.
-    fn create_proposal(env: &Env, proposer: Address, action: ProposalAction) -> u32 {
-        let id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposalCount)
-            .unwrap_or(0);
+    fn create_proposal(
+        env: &Env,
+        proposer: Address,
+        action: ProposalAction,
+    ) -> u32 {
+        let id: u32 = env.storage().instance().get(&DataKey::ProposalCount).unwrap_or(0);
+        let standard: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
+        // Slash proposals use the elevated slash threshold when one is set;
+        // all other actions use the standard threshold.
+        let threshold_required = match &action {
+            ProposalAction::Slash(_, _, _) => {
+                env.storage()
+                    .instance()
+                    .get::<DataKey, u32>(&DataKey::SlashThreshold)
+                    .unwrap_or(standard)
+            }
+            _ => standard,
+        };
         let proposal = Proposal {
             id,
             proposer,
@@ -3631,6 +3705,7 @@ impl LuminaRegistry {
             approvals: Vec::new(env),
             ready_at: u32::MAX,
             executed: false,
+            threshold_required,
         };
         Self::save_proposal(env, &proposal);
         env.storage()
@@ -3983,6 +4058,23 @@ impl LuminaRegistry {
                 );
                 env.events()
                     .publish((Symbol::new(env, "treasury_withdrawn"),), (*amount,));
+            }
+            ProposalAction::SetSlashThreshold(new_slash_threshold) => {
+                let admins = Self::admin_index(env);
+                // Zero is the "use standard threshold" sentinel — always valid.
+                // Non-zero values must be satisfiable by the current admin set.
+                if *new_slash_threshold > 0 && *new_slash_threshold > admins.len() {
+                    return Err(RegistryError::InvalidThreshold);
+                }
+                if *new_slash_threshold == 0 {
+                    env.storage().instance().remove(&DataKey::SlashThreshold);
+                } else {
+                    env.storage().instance().set(&DataKey::SlashThreshold, new_slash_threshold);
+                }
+                env.events().publish(
+                    (Symbol::new(env, "slash_threshold_set"),),
+                    (*new_slash_threshold,),
+                );
             }
         }
         Ok(())
@@ -8670,5 +8762,198 @@ mod test {
             },
         }]);
         client.renew(&owner, &target);
+    }
+
+    // ── Slash threshold ─────────────────────────────────────────────────────
+
+    /// Without a slash threshold configured, `get_slash_threshold` returns the
+    /// standard threshold so callers never need a special-case.
+    #[test]
+    fn get_slash_threshold_returns_standard_threshold_when_unset() {
+        let (_, client, _admin) = setup();
+        assert_eq!(client.get_slash_threshold(), client.get_threshold());
+    }
+
+    /// A slash proposal's `threshold_required` defaults to the standard
+    /// threshold when no slash threshold has been configured.
+    #[test]
+    fn slash_proposal_uses_standard_threshold_when_slash_threshold_unset() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 500);
+        let reason = String::from_str(&env, "test");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.threshold_required, client.get_threshold());
+    }
+
+    /// Governance can set a slash threshold through the propose→approve→execute
+    /// flow, after which `get_slash_threshold` reflects it.
+    #[test]
+    fn set_slash_threshold_is_applied_and_readable() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        // Standard threshold is 2-of-3; set slash threshold to 3.
+        let pid = client.propose_set_slash_threshold(&a1, &3);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        assert_eq!(client.get_slash_threshold(), 3);
+        // Standard threshold is unchanged.
+        assert_eq!(client.get_threshold(), 2);
+    }
+
+    /// A slash proposal created after a slash threshold is set records the
+    /// elevated `threshold_required`, not the standard one.
+    #[test]
+    fn slash_proposal_snapshots_the_elevated_threshold() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+
+        // Raise slash threshold to 3 (unanimous).
+        let pid = client.propose_set_slash_threshold(&a1, &3);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        // Set up staking so a slash proposal is valid.
+        let issuer = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(issuer).address();
+        let treasury = Address::generate(&env);
+        let pid2 = client.propose_configure_staking(&a1, &token_id, &treasury);
+        client.approve_proposal(&a1, &pid2);
+        client.approve_proposal(&a2, &pid2);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid2);
+
+        let (owner, target) = register_sample(&env, &client);
+        token::StellarAssetClient::new(&env, &token_id).mint(&owner, &500);
+        client.stake(&owner, &target, &500);
+
+        let reason = String::from_str(&env, "elevated");
+        let slash_pid = client.propose_slash(&a1, &target, &100, &reason);
+
+        let proposal = client.get_proposal(&slash_pid);
+        assert_eq!(proposal.threshold_required, 3);
+    }
+
+    /// A non-slash proposal always uses the standard threshold, even when a
+    /// slash threshold is configured.
+    #[test]
+    fn non_slash_proposals_are_unaffected_by_slash_threshold() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+
+        // Raise slash threshold to 3.
+        let pid = client.propose_set_slash_threshold(&a1, &3);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        // A deactivate proposal still only needs 2 approvals (standard).
+        let (_owner, target) = register_sample(&env, &client);
+        let deact_pid = client.propose_deactivate(&a1, &target);
+        let proposal = client.get_proposal(&deact_pid);
+        assert_eq!(proposal.threshold_required, 2);
+
+        // And it executes fine with 2 approvals.
+        client.approve_proposal(&a1, &deact_pid);
+        client.approve_proposal(&a2, &deact_pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&deact_pid);
+        assert!(!client.get_contract(&target).active);
+    }
+
+    /// A slash proposal that has only the standard number of approvals is
+    /// blocked when the slash threshold demands more.
+    #[test]
+    fn slash_proposal_blocked_until_elevated_threshold_is_met() {
+        let (env, client, a1, a2, a3) = setup_multisig();
+
+        // Raise slash threshold to 3 (unanimous).
+        let pid = client.propose_set_slash_threshold(&a1, &3);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        // Configure staking.
+        let issuer = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(issuer).address();
+        let treasury = Address::generate(&env);
+        let stake_pid = client.propose_configure_staking(&a1, &token_id, &treasury);
+        client.approve_proposal(&a1, &stake_pid);
+        client.approve_proposal(&a2, &stake_pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&stake_pid);
+
+        let (owner, target) = register_sample(&env, &client);
+        token::StellarAssetClient::new(&env, &token_id).mint(&owner, &500);
+        client.stake(&owner, &target, &500);
+
+        let reason = String::from_str(&env, "needs three");
+        let slash_pid = client.propose_slash(&a1, &target, &100, &reason);
+
+        // Only 2 approvals — threshold not met.
+        client.approve_proposal(&a1, &slash_pid);
+        client.approve_proposal(&a2, &slash_pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        assert_eq!(
+            client.try_execute_proposal(&slash_pid),
+            Err(Ok(RegistryError::ThresholdNotMet)),
+        );
+
+        // Third approval makes it ready; must wait out the fresh timelock.
+        client.approve_proposal(&a3, &slash_pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&slash_pid);
+        assert_eq!(client.get_stake(&target), 400);
+    }
+
+    /// Resetting the slash threshold to 0 reverts back to the standard one.
+    #[test]
+    fn slash_threshold_can_be_cleared_back_to_standard() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+
+        // Set then clear.
+        let set_pid = client.propose_set_slash_threshold(&a1, &3);
+        client.approve_proposal(&a1, &set_pid);
+        client.approve_proposal(&a2, &set_pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&set_pid);
+        assert_eq!(client.get_slash_threshold(), 3);
+
+        let clear_pid = client.propose_set_slash_threshold(&a1, &0);
+        client.approve_proposal(&a1, &clear_pid);
+        client.approve_proposal(&a2, &clear_pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&clear_pid);
+
+        // Now falls back to standard threshold.
+        assert_eq!(client.get_slash_threshold(), client.get_threshold());
+    }
+
+    /// `propose_set_slash_threshold` is rejected when the value would exceed
+    /// the current admin-set size.
+    #[test]
+    fn propose_set_slash_threshold_rejects_value_exceeding_admin_count() {
+        let (_, client, a1, _a2, _a3) = setup_multisig();
+        // There are 3 admins; 4 should be rejected immediately at proposal time.
+        assert_eq!(
+            client.try_propose_set_slash_threshold(&a1, &4),
+            Err(Ok(RegistryError::InvalidThreshold)),
+        );
+    }
+
+    /// Only admins may propose a slash threshold change.
+    #[test]
+    fn propose_set_slash_threshold_rejected_for_non_admin() {
+        let (env, client, _a1, _a2, _a3) = setup_multisig();
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_propose_set_slash_threshold(&stranger, &2),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
     }
 }

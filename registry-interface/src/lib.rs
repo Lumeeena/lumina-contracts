@@ -170,6 +170,11 @@ pub trait RegistryInterface {
     /// before the registry has been set up.
     fn get_threshold(env: Env) -> Result<u32, RegistryError>;
 
+    /// The slash-specific approval threshold.  Returns the standard threshold
+    /// when no slash threshold has been configured, so callers can always use
+    /// this without a special-case.
+    fn get_slash_threshold(env: Env) -> Result<u32, RegistryError>;
+
     /// Retrieve a governance proposal by ID.
     fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError>;
 
@@ -538,6 +543,9 @@ pub enum ProposalAction {
     SetStakingConfig(Address, Address),
     /// Set the registration fee.
     SetRegistrationFee(i128),
+    /// Set the slash-specific approval threshold.  Zero means "use the
+    /// standard threshold".
+    SetSlashThreshold(u32),
 }
 
 /// A governance proposal, with the rationale its proposer attached.
