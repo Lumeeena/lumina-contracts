@@ -1,4 +1,4 @@
-// Copyright (c) Lumina contributors
+﻿// Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
@@ -10,6 +10,7 @@
 // reason only; human-written API is documented by review, and the doc comments
 // below are the standard the crate is held to.
 #![allow(missing_docs)]
+extern crate alloc;
 //! Lumina Registry — on-chain contract registry for the Lumina indexer.
 //!
 //! Projects deploy their Soroban contracts and register them here so that
@@ -152,6 +153,7 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 27 | `InvalidAttestation` | The attestation label is empty or longer than 64 bytes, or the registration already holds 20 attestations. | Submit a non-empty label of at most 64 bytes against a registration with fewer than 20 attestations. |
 /// | 28 | `AttestationNotFound` | `revoke_attestation` found no attestation by this caller on this registration. | Read `get_attestations(contract_id)` before revoking; only the attester can withdraw its own claim. |
 /// | 29 | `OverlappingAddress` | The proposed treasury or stake-token address is itself a registered contract. | Pass an address that has no `Contract` entry; a registration's owner must not be the treasury that receives its own slashes. |
+/// | 30 | `InvalidUri` | The provided URI failed length (<= 2048) or scheme (http/https/ipfs/ipns) validation. | Provide a valid URI starting with http://, https://, ipfs://, or ipns:// and under 2048 characters. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -220,6 +222,8 @@ pub enum RegistryError {
     /// The check is cheap and the configuration is rejected at proposal time
     /// so the error surfaces immediately rather than after the timelock.
     OverlappingAddress = 29,
+    /// The provided URI is invalid.
+    InvalidUri = 30,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -358,6 +362,8 @@ pub struct ContractProfile {
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Optional URI pointing at richer off-chain metadata.
+    pub metadata_uri: Option<String>,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -609,6 +615,10 @@ pub enum DataKey {
     // ── Tags ────────────────────────────────────────────────────────────────
     /// Vec<String> — owner-set normalized tags for a registration.
     Tags(Address),
+
+    // ── Metadata ────────────────────────────────────────────────────────────
+    /// String — off-chain metadata URI (e.g., ipfs:// or https://).
+    MetadataUri(Address),
 
     // ── Succession ──────────────────────────────────────────────────────────
     /// Address — the contract that supersedes this registration, if any.
@@ -2641,6 +2651,7 @@ impl LuminaRegistry {
         Ok(ContractProfile {
             reputation,
             entry,
+            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
             superseded_by: env
                 .storage()
                 .persistent()
@@ -2669,6 +2680,7 @@ impl LuminaRegistry {
                     if entry.active {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
                             superseded_by: env
                                 .storage()
                                 .persistent()
@@ -2870,6 +2882,7 @@ impl LuminaRegistry {
                     if entry.active {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
                             superseded_by: env
                                 .storage()
                                 .persistent()
@@ -2991,6 +3004,68 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    /// Update the off-chain metadata URI for a registration.
+    ///
+    /// The URI should point to a JSON document with this suggested shape:
+    /// `json
+    /// {
+    ///   "name": "Contract Name",
+    ///   "description": "...",
+    ///   "logo_uri": "https://...",
+    ///   "links": {
+    ///     "website": "...",
+    ///     "twitter": "...",
+    ///     "github": "..."
+    ///   },
+    ///   "audit": "https://..."
+    /// }
+    /// `
+    pub fn update_metadata_uri(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        uri: Option<String>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        if let Some(u) = &uri {
+            if u.len() > 2048 {
+                return Err(RegistryError::InvalidUri);
+            }
+            
+            let u_str: alloc::string::String = alloc::format!("{}", u);
+            if !u_str.starts_with("http://") && !u_str.starts_with("https://") && !u_str.starts_with("ipfs://") && !u_str.starts_with("ipns://") {
+                return Err(RegistryError::InvalidUri);
+            }
+        }
+
+        if let Some(u) = uri {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MetadataUri(contract_id.clone()), &u);
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::MetadataUri(contract_id.clone()));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_uri_updated"),),
+            (contract_id, owner),
+        );
+
+        Ok(())
+    }
     /// Hand a registration over to a new owner.
     /// Only the current owner can call this (admin override removed — ownership
     /// transfer should be driven by the owner themselves).
