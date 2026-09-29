@@ -118,6 +118,9 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | The attestation label is empty or longer than 64 bytes, or the registration already holds the maximum number of attestations. | Pass a non-empty label of at most 64 bytes, and stay under `MAX_ATTESTATIONS_PER_CONTRACT` (20) per registration. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only call `revoke_attestation` for a label the caller previously wrote; read `get_attestations` first. |
+/// | 29 | `SelfRegistration` | `register_contract` / `register_contracts` was asked to register the registry's own address. | Pass the address of a contract deployed by the caller; a registry is not one of its own index entries. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -180,6 +183,8 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// A registration cannot point at the registry's own address.
+    SelfRegistration    = 29,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -1381,6 +1386,10 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
+        if contract_id == env.current_contract_address() {
+            return Err(RegistryError::SelfRegistration);
+        }
+
         if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
             && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
         {
@@ -1468,6 +1477,9 @@ impl LuminaRegistry {
         }
 
         for entry in entries.iter() {
+            if entry.contract_id == env.current_contract_address() {
+                return Err(RegistryError::SelfRegistration);
+            }
             if env.storage().persistent().has(&DataKey::Contract(entry.contract_id.clone())) {
                 return Err(RegistryError::AlreadyRegistered);
             }
@@ -3361,6 +3373,45 @@ mod test {
             &default_cats(&env),
         );
         assert_eq!(result, Err(Ok(RegistryError::AlreadyRegistered)));
+    }
+
+    #[test]
+    fn register_contract_rejects_self_registration() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let registry = client.address.clone();
+        assert_eq!(
+            client.try_register_contract(
+                &owner,
+                &registry,
+                &String::from_str(&env, "Registry"),
+                &String::from_str(&env, "The registry itself"),
+                &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::SelfRegistration)),
+        );
+        assert!(!client.is_registered(&registry));
+        assert_eq!(client.get_contract_count(), 0);
+    }
+
+    #[test]
+    fn register_contracts_rejects_self_registration() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let registry = client.address.clone();
+        let mut entries = Vec::new(&env);
+        entries.push_back(RegistrationEntry {
+            contract_id: registry.clone(),
+            name: String::from_str(&env, "Registry"),
+            description: String::from_str(&env, "The registry itself"),
+            categories: default_cats(&env),
+        });
+        assert_eq!(
+            client.try_register_contracts(&owner, &entries),
+            Err(Ok(RegistryError::SelfRegistration)),
+        );
+        assert!(!client.is_registered(&registry));
+        assert_eq!(client.get_contract_count(), 0);
     }
 
     #[test]
