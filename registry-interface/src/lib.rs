@@ -295,6 +295,17 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
+    /// The contract's real token balance is lower than the sum of all tracked
+    /// stakes, so the slash would transfer tokens the contract does not hold.
+    ///
+    /// Caused by accounting drift (fee-on-transfer token, direct drain, or a
+    /// rounding bug).  Fee-on-transfer tokens are unsupported by design.
+    ContractBalanceInsufficient = 29,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.

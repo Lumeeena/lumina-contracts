@@ -547,6 +547,9 @@ fn interface_error_codes_match_the_registry() {
         (RegistryError::RegistrationRateLimited as u32, "RegistrationRateLimited"),
         (RegistryError::InsufficientFee as u32, "InsufficientFee"),
         (RegistryError::InvalidTags as u32, "InvalidTags"),
+        (RegistryError::InvalidAttestation as u32, "InvalidAttestation"),
+        (RegistryError::AttestationNotFound as u32, "AttestationNotFound"),
+        (RegistryError::ContractBalanceInsufficient as u32, "ContractBalanceInsufficient"),
     ];
 
     for (code, name) in declared {

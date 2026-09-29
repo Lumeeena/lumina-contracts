@@ -118,6 +118,7 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 29 | `ContractBalanceInsufficient` | The contract's real token balance is lower than the sum of all tracked stakes, so executing the slash would transfer tokens the contract does not hold. | This indicates an accounting discrepancy — caused by a rounding bug, a fee-on-transfer token (which is unsupported by design, because they break the stake-tracking invariant), or a token transferred directly out of the contract. Investigate the root cause before retrying. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -180,6 +181,17 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The contract's real token balance is lower than the sum of all tracked
+    /// stakes, so the slash would transfer tokens the contract does not hold.
+    ///
+    /// This signals an accounting discrepancy.  The most common cause is a
+    /// fee-on-transfer token, which is **unsupported** — because every
+    /// `stake()` call credits the full `amount` to the per-registration stake
+    /// counter while the contract actually receives `amount - fee`, the two
+    /// figures drift apart immediately.  Direct token transfers into the
+    /// contract and rounding bugs in custom SEP-41 implementations can also
+    /// produce this state.
+    ContractBalanceInsufficient = 29,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -2625,6 +2637,31 @@ impl LuminaRegistry {
 
                 let (token_id, treasury) = Self::staking_config(env)?;
 
+                // Invariant guard: the contract's real token balance must be at
+                // least as large as the sum of all tracked stakes before we
+                // attempt to move any tokens.  If the two figures disagree the
+                // transfer would fail deep inside the token contract with an
+                // opaque panic; this check surfaces the discrepancy as a
+                // named, diagnosable error instead.
+                //
+                // Note: fee-on-transfer tokens are **not supported**.  Every
+                // `stake()` call credits the full `amount` to the per-
+                // registration counter while the contract receives only
+                // `amount - fee`, so the tracked total immediately exceeds
+                // the real balance, and this guard fires on the first slash.
+                {
+                    let contract_balance = token::Client::new(env, &token_id)
+                        .balance(&env.current_contract_address());
+                    let tracked_total: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::TotalStaked)
+                        .unwrap_or(0);
+                    if contract_balance < tracked_total {
+                        return Err(RegistryError::ContractBalanceInsufficient);
+                    }
+                }
+
                 token::Client::new(env, &token_id).transfer(
                     &env.current_contract_address(),
                     &treasury,
@@ -4365,6 +4402,54 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
+    #[test]
+    fn normal_slash_is_unaffected_by_the_balance_guard() {
+        // The guard must not fire when the contract is solvent — that would
+        // break every legitimate slash.
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &1_000);
+
+        let reason = String::from_str(&env, "normal slash — guard must pass");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        // This must succeed: real balance == tracked total == 1 000.
+        pass_proposal(&env, &client, &admin, pid);
+        assert_eq!(client.get_stake(&target), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn slash_against_inconsistent_balance_fails_with_contract_balance_insufficient() {
+        // Simulate accounting drift: tokens are drained from the registry's
+        // real balance (e.g. a fee-on-transfer token took a cut) while
+        // TotalStaked still reflects the full credited amount.  The slash must
+        // fail with `ContractBalanceInsufficient` rather than panicking inside
+        // the token contract.
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        // The registry credits 1 000 to TotalStaked …
+        client.stake(&owner, &target, &1_000);
+        // … but 1 token was silently removed (fee-on-transfer / direct drain).
+        token.burn_from(&client.address, &1);
+        // Now real balance (999) < tracked total (1 000).
+
+        let reason = String::from_str(&env, "slash while drained");
+        let pid = client.propose_slash(&admin, &target, &500, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::ContractBalanceInsufficient)),
+        );
+        // No side-effects: stake, history and lock are all untouched.
+        assert_eq!(client.get_stake(&target), 1_000);
+        assert_eq!(client.get_slashes(&target).len(), 0);
+        assert_eq!(client.get_reputation(&target).withdraw_locked_until, 0);
+    }
+
     // ── Withdrawal ──────────────────────────────────────────────────────────
 
     #[test]
@@ -4646,6 +4731,21 @@ mod test {
             env.storage().persistent()
                 .set(&FailingTokenKey::Balance(from), &(from_balance - amount));
             Self::mint(env, to, amount);
+        }
+
+        /// Directly reduce `account`'s balance by `amount`, bypassing any auth
+        /// or failing-flag checks.  Used in tests to simulate the registry
+        /// holding fewer tokens than its tracked total — the scenario this
+        /// guard is designed to surface.
+        pub fn burn_from(env: Env, account: Address, amount: i128) {
+            let current: i128 = env
+                .storage()
+                .persistent()
+                .get(&FailingTokenKey::Balance(account.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&FailingTokenKey::Balance(account), &(current - amount));
         }
     }
 

@@ -248,6 +248,19 @@ SEP-41 token (native XLM via its Stellar Asset Contract works) and a treasury.
 Routing that through governance rather than `initialize` means the already-live
 registry can adopt staking after an upgrade instead of being redeployed.
 
+**Token compatibility note:** the registry tracks every deposited stake exactly
+and expects the contract's real token balance to match the sum of all individual
+stakes at all times.  **Fee-on-transfer tokens are not supported**: because the
+registry credits the full transfer `amount` while the contract receives
+`amount - fee`, the two figures diverge immediately, and any subsequent slash
+will fail with `ContractBalanceInsufficient` (error 29).  Use only standard
+SEP-41 tokens where `transfer(from, to, amount)` delivers exactly `amount` to
+the recipient.  If this invariant is ever violated for any other reason (rounding
+bug in a custom token, tokens sent directly out of the contract), the same
+`ContractBalanceInsufficient` error is raised before the slash transfer, making
+the discrepancy diagnosable rather than causing an opaque panic deep inside the
+token contract.
+
 ### Third-party attestations
 
 Any address can vouch for a registration with a short, bounded label. This is a
