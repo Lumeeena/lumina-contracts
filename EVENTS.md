@@ -12,8 +12,8 @@ Events are the integration surface for downstream consumers, serving as the inte
 | Topic | Payload Shape | When it Fires | Consumers | Example Test Reference |
 ||---|---|---|---|---|
 | `proposal_proposed` | `(proposal_id: u32, proposer: Address, action: Symbol, data: T)` | When an admin proposes an action (e.g., slash, upgrade, change settings). | | `propose_deactivate_requires_admin` |
-| `proposal_approved` | `(proposal_id: u32, admin: Address, approvals_len: u32)` | When an admin approves an existing proposal. | | `approve_proposal_records_approval_and_returns_total` |
-| `proposal_ready` | `(proposal_id: u32, ready_at: u64)` | When a proposal receives enough approvals and enters the timelock. | | `proposal_enters_timelock_after_sufficient_approvals` |
+| `proposal_approved` | `(proposal_id: u32, admin: Address, approvals_len: u32, threshold: u32)` | When an admin approves an existing proposal. | | `approve_proposal_records_approval_and_returns_total` |
+| `proposal_ready` | `(proposal_id: u32, ready_at: u32, executable_from: u32)` | When a proposal receives enough approvals and enters the timelock. | | `proposal_enters_timelock_after_sufficient_approvals` |
 | `proposal_executed` | `(proposal_id: u32, executed_at: u64)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |
 | `contract_deactivated` | `(contract_id: Address, caller: Address)` or `(contract_id: Address, Symbol("governance"))` | When a contract is deactivated by its owner or governance. | Indexer, History | `deactivate_requires_contract_owner` |
 | `contract_deregistered` | `(contract_id: Address, owner: Address)` | When a deactivated and unstaked contract is fully deregistered. | Indexer, History | `deregister_removes_every_index_reference...` |
@@ -25,6 +25,7 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `stake_deposited` | `(contract_id: Address, owner: Address, amount: i128, total_staked: i128)` | When the owner deposits tokens to top up their stake. | History | `stake_tops_up_an_existing_stake` |
 | `stake_withdrawn` | `(contract_id: Address, owner: Address, total_staked: i128)` | When the owner withdraws their staked tokens after deactivation. | History | `withdraw_returns_the_full_stake_once_the_owner_has_deactivated` |
 | `stake_slashed` | `(contract_id: Address, amount: i128, reason: String, treasury: Address)` | When governance slashes a contract's stake for a violation. | History | `slash_moves_stake_to_the_treasury_and_records_the_reason` |
+| `slash_response_added` | `(contract_id: Address, slash_index: u32, owner: Address)` | When a contract owner adds a response to a slash record. | History | TBD |
 | `verification_set` | `(contract_id: Address, verified: bool)` | When governance grants or revokes verified status for a contract. | History | `governance_can_attest_and_later_revoke_verification` |
 | `category_pruned` | `(category: String, removed: u32)` | When dead references in a category's index are cleaned up. | | `prune_category_drops_dead_references_and_is_safe_to_repeat` |
 | all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |

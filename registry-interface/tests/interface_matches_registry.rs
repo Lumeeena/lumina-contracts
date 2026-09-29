@@ -31,8 +31,8 @@ use lumina_registry_interface::{
     RegistryInterfaceClient, RegistryStats, Reputation, SlashRecord,
 };
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::Address;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
+use soroban_sdk::Address;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -106,16 +106,20 @@ fn load_spec() -> Spec {
                     Some(out) => format!(" -> {}", render_type(out)),
                     None => String::new(),
                 };
-                spec.functions.insert(
-                    f.name.to_utf8_string_lossy(),
-                    format!("({}){}", args, ret),
-                );
+                spec.functions
+                    .insert(f.name.to_utf8_string_lossy(), format!("({}){}", args, ret));
             }
             ScSpecEntry::UdtStructV0(s) => {
                 let fields = s
                     .fields
                     .iter()
-                    .map(|f| format!("{}: {}", f.name.to_utf8_string_lossy(), render_type(&f.type_)))
+                    .map(|f| {
+                        format!(
+                            "{}: {}",
+                            f.name.to_utf8_string_lossy(),
+                            render_type(&f.type_)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 spec.structs.insert(
@@ -127,7 +131,10 @@ fn load_spec() -> Spec {
             // `#[contracttype] enum` is emitted as a union of void cases, and
             // every real enum here carries payloads.
             ScSpecEntry::UdtEnumV0(e) => {
-                panic!("unexpected value enum `{}` in the registry spec", e.name.to_utf8_string_lossy());
+                panic!(
+                    "unexpected value enum `{}` in the registry spec",
+                    e.name.to_utf8_string_lossy()
+                );
             }
             ScSpecEntry::UdtUnionV0(u) => {
                 let cases = u
@@ -138,7 +145,11 @@ fn load_spec() -> Spec {
                         ScSpecUdtUnionCaseV0::TupleV0(t) => format!(
                             "{}({})",
                             t.name.to_utf8_string_lossy(),
-                            t.type_.iter().map(render_type).collect::<Vec<_>>().join(",")
+                            t.type_
+                                .iter()
+                                .map(render_type)
+                                .collect::<Vec<_>>()
+                                .join(",")
                         ),
                     })
                     .collect::<Vec<_>()
@@ -170,12 +181,16 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 30] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
     ("get_threshold", "", "Result<U32, RegistryError>"),
-    ("get_proposal", "proposal_id: U32", "Result<Proposal, RegistryError>"),
+    (
+        "get_proposal",
+        "proposal_id: U32",
+        "Result<Proposal, RegistryError>",
+    ),
     ("get_categories", "contract_id: Address", "Vec<Category>"),
     ("get_tags", "contract_id: Address", "Vec<String>"),
     (
@@ -184,24 +199,38 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
         "Vec<ContractEntry>",
     ),
     (
-        "get_active_by_categories",
+        "get_contracts_by_categories",
         "categories: Vec<Category>, offset: U32, limit: U32",
         "Result<Vec<ContractEntry>, RegistryError>",
     ),
-    ("get_staking_config", "", "Result<(Address, Address), RegistryError>"),
+    ("get_minimum_stake", "", "I128"),
+    (
+        "get_staking_config",
+        "",
+        "Result<(Address, Address), RegistryError>",
+    ),
     ("get_registration_fee", "", "I128"),
     ("get_stake", "contract_id: Address", "I128"),
     ("is_verified", "contract_id: Address", "Bool"),
     ("is_registered", "contract_id: Address", "Bool"),
     ("get_registry_stats", "", "RegistryStats"),
     ("get_slashes", "contract_id: Address", "Vec<SlashRecord>"),
+    (
+        "get_attestations",
+        "contract_id: Address",
+        "Vec<Attestation>",
+    ),
     ("get_reputation", "contract_id: Address", "Reputation"),
     (
         "get_contract_profile",
         "contract_id: Address",
         "Result<ContractProfile, RegistryError>",
     ),
-    ("get_active_profiles", "offset: U32, limit: U32", "Vec<ContractProfile>"),
+    (
+        "get_active_profiles",
+        "offset: U32, limit: U32",
+        "Vec<ContractProfile>",
+    ),
     (
         "get_contract",
         "contract_id: Address",
@@ -210,9 +239,21 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
     ("get_contract_count", "", "U32"),
     ("get_total_registered", "", "U32"),
     ("get_active_contract_count", "", "U32"),
-    ("get_active_contracts", "offset: U32, limit: U32", "Vec<ContractEntry>"),
-    ("get_active_contract_ids", "offset: U32, limit: U32", "Vec<Address>"),
-    ("get_active_contracts_page", "offset: U32, limit: U32", "ContractPage"),
+    (
+        "get_active_contracts",
+        "offset: U32, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_active_contract_ids",
+        "offset: U32, limit: U32",
+        "Vec<Address>",
+    ),
+    (
+        "get_active_contracts_page",
+        "offset: U32, limit: U32",
+        "ContractPage",
+    ),
     (
         "get_active_profiles_page",
         "offset: U32, limit: U32",
@@ -234,10 +275,9 @@ fn signature(args: &str, ret: &str) -> String {
 /// Assert the registry exports a function with this exact argument list and
 /// return type.
 fn assert_function(spec: &Spec, name: &str, args: &str, ret: &str) {
-    let actual = spec
-        .functions
-        .get(name)
-        .unwrap_or_else(|| panic!("the registry no longer exports `{name}`; the interface is stale"));
+    let actual = spec.functions.get(name).unwrap_or_else(|| {
+        panic!("the registry no longer exports `{name}`; the interface is stale")
+    });
     assert_eq!(
         &signature(args, ret),
         actual,
@@ -250,7 +290,10 @@ fn assert_struct(spec: &Spec, name: &str, fields: &str) {
         .structs
         .get(name)
         .unwrap_or_else(|| panic!("the registry no longer exports struct `{name}`"));
-    assert_eq!(actual, fields, "struct `{name}` does not match the interface crate");
+    assert_eq!(
+        actual, fields,
+        "struct `{name}` does not match the interface crate"
+    );
 }
 
 fn assert_union(spec: &Spec, name: &str, cases: &str) {
@@ -258,7 +301,10 @@ fn assert_union(spec: &Spec, name: &str, cases: &str) {
         .unions
         .get(name)
         .unwrap_or_else(|| panic!("the registry no longer exports union `{name}`"));
-    assert_eq!(actual, cases, "union `{name}` does not match the interface crate");
+    assert_eq!(
+        actual, cases,
+        "union `{name}` does not match the interface crate"
+    );
 }
 
 #[test]
