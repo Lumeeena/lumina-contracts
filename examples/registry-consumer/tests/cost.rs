@@ -35,9 +35,7 @@ use soroban_sdk::{
 };
 
 mod registry_wasm {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/lumina_registry.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/lumina_registry.wasm");
 }
 
 /// A contract whose only job is to make a chosen number of reads, so the reads
@@ -74,7 +72,10 @@ impl ReadProbe {
         target: Address,
     ) -> (bool, bool) {
         let registry = RegistryInterfaceClient::new(&env, &registry);
-        (registry.is_registered(&target), registry.is_verified(&target))
+        (
+            registry.is_registered(&target),
+            registry.is_verified(&target),
+        )
     }
 
     /// One call returning the registration *and* its reputation.
@@ -87,11 +88,7 @@ impl ReadProbe {
 
     /// Three calls, to show the per-call charge is additive rather than a
     /// one-off setup cost.
-    pub fn read_three(
-        env: Env,
-        registry: Address,
-        target: Address,
-    ) -> (bool, bool, u32) {
+    pub fn read_three(env: Env, registry: Address, target: Address) -> (bool, bool, u32) {
         let registry = RegistryInterfaceClient::new(&env, &registry);
         (
             registry.is_registered(&target),
@@ -124,6 +121,7 @@ struct Cost {
     read_entries: u32,
     write_entries: u32,
     read_bytes: u32,
+    write_bytes: u32,
 }
 
 fn measure<T>(f: &Fixture, call: impl FnOnce(&Env, &Address) -> T) -> (Cost, T) {
@@ -140,6 +138,7 @@ fn measure<T>(f: &Fixture, call: impl FnOnce(&Env, &Address) -> T) -> (Cost, T) 
             read_entries: resources.read_entries,
             write_entries: resources.write_entries,
             read_bytes: resources.read_bytes,
+            write_bytes: resources.write_bytes,
         },
         value,
     )
@@ -224,6 +223,29 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
         probe_client(env, probe).read_local(&true);
     });
 
+    // A scanning view: `get_active_contracts` walks the whole index, so its
+    // cost grows with the number of registrations. Measured here against a
+    // ceiling so an O(n) regression is visible in CI rather than only on-chain.
+    let (scan, active) = measure(&f, |env, probe| {
+        probe_client(env, probe).read_active_contracts(&registry)
+    });
+    assert!(active.len() >= 1);
+
+    // A second registration, so the scan has something more to walk. The
+    // difference between the two scans is the marginal cost per entry.
+    let second = Address::generate(&f.env);
+    registry_wasm::Client::new(&f.env, &registry).register_contract(
+        &Address::generate(&f.env),
+        &second,
+        &String::from_str(&f.env, "Second"),
+        &String::from_str(&f.env, "another counterparty"),
+        &Vec::new(&f.env),
+    );
+    let (scan_two, active_two) = measure(&f, |env, probe| {
+        probe_client(env, probe).read_active_contracts(&registry)
+    });
+    assert!(active_two.len() > active.len());
+
     println!("\n  A cross-contract read is not free. Measured against the real\n  registry wasm (release build, host-metered):\n");
     println!(
         "    {:<38} {:>10} {:>9} {:>7} {:>7} {:>9}",
@@ -237,6 +259,8 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
         ("1x get_contract_profile", &profile),
         ("2x is_registered + is_verified", &two),
         ("3x is_registered/is_verified/count", &three),
+        ("get_active_contracts (1 entry)", &scan),
+        ("get_active_contracts (2 entries)", &scan_two),
     ] {
         println!(
             "    {:<38} {:>10} {:>9} {:>7} {:>7} {:>9}",
@@ -244,7 +268,6 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
         );
     }
 
-    
     let per_call = two.instructions - one.instructions;
     let overhead = version.instructions - baseline.instructions;
     let answer = one.instructions - version.instructions;
@@ -304,7 +327,7 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
     let first_step = two.instructions - one.instructions;
     let second_step = three.instructions - two.instructions;
     assert!(
-        (first_step as i64 - second_step as i64).abs() < (first_step as i64 / 2).max(1),
+        (first_step - second_step).abs() < (first_step / 2).max(1),
         "per-call cost should be roughly constant, saw {first_step} then {second_step}"
     );
 
@@ -337,6 +360,21 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
         "a third call re-reading the same keys should not add ledger entries, saw {} -> {}",
         two.read_entries,
         three.read_entries
+    );
+
+    // 9. The scanning view is the one that grows. Its cost must stay under a
+    //    ceiling, and the marginal cost of one more entry must be small enough
+    //    that the index can grow without the entrypoint falling off-chain.
+    assert!(
+        scan.instructions < 50_000_000,
+        "get_active_contracts over one entry cost {} instructions, over the ceiling",
+        scan.instructions
+    );
+    let per_entry = scan_two.instructions - scan.instructions;
+    assert!(
+        per_entry < 5_000_000,
+        "each additional entry in get_active_contracts should cost under 5M instructions, \
+         saw {per_entry}"
     );
 }
 
@@ -372,5 +410,8 @@ fn the_registry_stores_a_registration_in_several_entries() {
     // an address nobody registered gets a boolean, not a revert. The cost of
     // asking is the same either way.
     assert!(client.is_registered(&f.target));
-    assert!(!client.is_verified(&f.target), "a fresh registration is not verified yet");
+    assert!(
+        !client.is_verified(&f.target),
+        "a fresh registration is not verified yet"
+    );
 }
