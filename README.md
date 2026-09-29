@@ -176,6 +176,36 @@ version must stay compatible with the storage shapes documented on `DataKey` and
 `ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
+### Error codes
+
+`RegistryError` crosses the contract boundary as a bare `u32`, so the
+numeric code is the API a caller actually sees. The table below is the
+reference for those codes; it is kept next to the enum in
+[registry/src/lib.rs](./registry/src/lib.rs) so the two are updated together.
+
+| Code | Name | Meaning | Usual remedy |
+| --- | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` was called on a registry that already has an admin. | Do not call `initialize` again; read `get_admin()` to confirm the live admin, and use `upgrade` for code changes. |
+| 2 | `NotInitialized` | A method that needs an admin ran before `initialize`. | Call `initialize(admin)` once, then retry the original call. |
+| 3 | `Unauthorized` | The caller is not the admin or the registered owner for this action. | Re-sign the transaction with the admin key or the entry's current owner; check `get_contracts_by_owner` if the owner is unclear. |
+| 4 | `ContractNotFound` | No registration exists for the given `contract_id`. | Verify the ID against `get_active_contracts` / `get_contracts_by_owner`; register it first if it was never listed. |
+| 5 | `ContractAlreadyRegistered` | The `contract_id` is already in the registry. | Use `update_metadata` or `set_categories` to change the existing entry instead of registering again. |
+| 6 | `ContractNotActive` | The entry exists but is deactivated, so the action requires an active registration. | Reactivate by re-registering, or pick a different contract; `get_active_contracts` lists only active entries. |
+| 7 | `ContractStillActive` | `deregister` was called on an entry that is still active. | Call `deactivate(caller, contract_id)` first, then `deregister`. |
+| 8 | `InvalidName` | The supplied name is empty or exceeds the length limit. | Pass a non-empty name within the documented byte limit. |
+| 9 | `InvalidDescription` | The supplied description exceeds the length limit. | Shorten the description to fit the limit. |
+| 10 | `InvalidCategory` | The category list is empty or contains a value outside the `Category` enum. | Pass at least one valid `Category` variant; see the Categories section for the current vocabulary. |
+| 11 | `TooManyCategories` | More categories were supplied than the entry allows. | Trim the list to the maximum number of categories per registration. |
+| 12 | `StakeNotFound` | `withdraw_stake` was called for an entry with no stake. | Stake first with `stake(owner, contract_id, amount)`, or skip the withdrawal. |
+| 13 | `InsufficientStake` | The requested slash or withdrawal exceeds the staked amount. | Lower the amount to at most `get_stake(contract_id)`, or have the owner top up the stake. |
+| 14 | `StakeLocked` | The stake is still locked, so it cannot be withdrawn yet. | Wait until the lock expiry reported by `get_reputation(contract_id)` has passed, then retry. |
+| 15 | `NotVerified` | The action requires a verified registration, but the entry is not verified. | Have an admin run `propose_set_verified(proposer, contract_id, true)` and wait out the timelock. |
+| 16 | `AlreadyVerified` | `propose_set_verified` was called with the value the entry already has. | Skip the proposal; read `is_verified(contract_id)` before proposing. |
+| 17 | `ProposalNotFound` | No governance proposal exists for the given ID. | List proposals and retry with a valid ID; the proposal may have already been executed or cancelled. |
+| 18 | `ProposalNotReady` | The proposal exists but its timelock has not elapsed. | Wait until the proposal's execution ledger, then call `execute_proposal` again. |
+| 19 | `ProposalAlreadyExecuted` | The proposal was already executed or cancelled. | Do not re-execute; read the proposal's final state to confirm the outcome. |
+| 20 | `RegistrationLimitReached` | The per-owner registration limit is enabled and this owner has hit it. | Deregister an unused entry, or have an admin raise the limit via `propose_configure_registration_rate_limit`. |
+
 ### Staking & reputation
 
 Registration stays free and permissionless by default — anyone can list a

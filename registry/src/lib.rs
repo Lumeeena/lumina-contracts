@@ -80,6 +80,43 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 /// Errors returned by the Lumina Registry contract operations.
+///
+/// ## Error code reference
+///
+/// Error codes cross the contract boundary as bare `u32` values, so this
+/// table is the authoritative documentation for a consumer that only has a
+/// numeric code in hand. It is kept next to the enum so the two are updated
+/// together; if you add or renumber a variant, update this table in the same
+/// commit.
+///
+/// | Code | Name | Meaning | Usual remedy |
+/// |------|------|---------|--------------|
+/// | 1 | `AlreadyInitialized` | `initialize` was called on a deployment that already has an admin set. | Do not call `initialize` again; read `get_admins` / `get_threshold` to inspect the existing configuration. |
+/// | 2 | `Unauthorized` | The caller is not the registered owner and not permitted to perform this action. | Call from the registered owner's address, or route the action through the governance flow (`propose_*` → `approve_proposal` → `execute_proposal`). |
+/// | 3 | `AlreadyRegistered` | A `Contract` entry already exists for this `contract_id`. | Use `update_metadata` / `set_categories` to change the existing entry, or `deregister` it first if you intend to re-register. |
+/// | 4 | `ContractNotFound` | No `Contract` entry exists for the given `contract_id`. | Check `is_registered` before calling; register the contract first with `register_contract`. |
+/// | 5 | `InvalidMetadata` | The supplied metadata failed validation (e.g. empty batch, batch larger than 100 entries). | Pass a non-empty batch of at most 100 entries and ensure each entry has a name and description. |
+/// | 6 | `NotOwner` | The caller is not the `owner` recorded on the registration. | Call from the recorded owner's address, or have the current owner call `transfer_ownership` first. |
+/// | 7 | `NotInitialized` | The registry has no admin set because `initialize` was never called. | Deploy with the `__constructor` bootstrap admin, or call `initialize` once with a non-empty admin set. |
+/// | 8 | `ProposalNotFound` | No proposal exists for the given `proposal_id`. | Read `get_proposal` for a valid ID; IDs are assigned sequentially starting at 0. |
+/// | 9 | `ThresholdNotMet` | The proposal has not collected enough approvals, or has not yet become ready. | Have additional admins call `approve_proposal` until `approvals.len()` reaches `get_threshold`. |
+/// | 10 | `TimelockNotElapsed` | Fewer than `TIMELOCK_LEDGERS` ledgers have passed since the proposal became ready. | Wait until `ready_at + TIMELOCK_LEDGERS` and retry `execute_proposal`. |
+/// | 11 | `AlreadyApproved` | This admin address has already approved this proposal. | Do not re-approve; have a different admin approve instead. |
+/// | 12 | `NotAdmin` | The caller is not a member of the current admin set. | Call from an address returned by `get_admins`, or propose adding the caller via `propose_add_admin`. |
+/// | 13 | `InvalidThreshold` | The admin set would be empty, or the threshold is zero or exceeds the set size. | Pass a non-empty admin set with `1 <= threshold <= admins.len()`. |
+/// | 14 | `AlreadyExecuted` | The proposal has already been executed. | Do not retry; create a new proposal if further action is needed. |
+/// | 15 | `StakingNotConfigured` | No stake token / treasury has been set, so staking is not open. | Have governance pass `propose_configure_staking` and execute it before staking. |
+/// | 16 | `InvalidAmount` | A stake, slash, or fee amount was zero or negative. | Pass a strictly positive amount for `stake` / `propose_slash`, and a non-negative fee for `propose_set_registration_fee`. |
+/// | 17 | `InsufficientStake` | The registration's staked balance is smaller than the requested amount. | Stake more first with `stake`, or reduce the requested amount to at most `get_stake`. |
+/// | 18 | `StakeLocked` | The stake is still inside the post-slash lock window. | Wait until `get_reputation(...).withdraw_locked_until` and retry `withdraw_stake`. |
+/// | 19 | `RegistrationActive` | The registration is still active, so it cannot be withdrawn or deregistered. | Call `deactivate` first, then retry `withdraw_stake` or `deregister`. |
+/// | 20 | `NoCategories` | A registration or category query declared no categories. | Pass at least one `Category` (use `Category::Other` if none of the vocabulary fits). |
+/// | 21 | `StakeNotEmpty` | The registration still holds stake, so it cannot be deregistered. | Call `withdraw_stake` until `get_stake` returns zero, then retry `deregister`. |
+/// | 22 | `InvalidRateLimit` | The rate limit configuration is invalid (zero window with a non-zero limit, or a window larger than `max_ttl`). | Pass `window_ledgers` in `1..=max_ttl` when `limit > 0`, or set `limit = 0` to disable limiting. |
+/// | 23 | `NotAllowlisted` | The owner is not allowlisted while permissioned registration is enabled. | Have governance execute `propose_set_allowlisted(owner, true)`, or disable the allowlist with `propose_set_allowlist_enabled(false)`. |
+/// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
+/// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
+/// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
