@@ -194,7 +194,7 @@ was typed into a form:
 | `propose_configure_staking(proposer, token, treasury)` | an admin — same |
 | `propose_set_allowlist_enabled(proposer, enabled)` | an admin — same |
 | `propose_set_allowlisted(proposer, owner, allowed)` | an admin — same |
-| `propose_configure_registration_rate_limit(proposer, limit, window_ledgers)` | an admin — same; zero limit disables it |
+| `propose_set_rate_limit(proposer, limit, window_ledgers)` | an admin — same; zero limit disables it |
 | `get_reputation(contract_id)` | anyone — stake, verified, lifetime slashed, lock expiry |
 | `get_contract_profile(contract_id)` | anyone — the entry and its reputation in one call |
 | `get_active_profiles(offset, limit)` | anyone — `get_active_contracts` with reputation attached |
@@ -215,6 +215,79 @@ Staking is closed until governance runs `propose_configure_staking` to name a
 SEP-41 token (native XLM via its Stellar Asset Contract works) and a treasury.
 Routing that through governance rather than `initialize` means the already-live
 registry can adopt staking after an upgrade instead of being redeployed.
+
+## Consuming the registry from another contract
+
+Everything in [Lumina Registry](#lumina-registry) above is callable by any other
+contract, but a Soroban call between contracts needs a typed client, and until
+now writing one meant copying signatures by hand. `registry-interface/` is that
+client, published:
+
+```rust
+use lumina_registry_interface::RegistryInterfaceClient;
+
+let registry = RegistryInterfaceClient::new(&env, &registry_address);
+if registry.is_registered(&some_contract) && registry.is_verified(&some_contract) { /* … */ }
+```
+
+The crate declares a `RegistryInterface` trait over the registry's 28 read-only
+entrypoints — the `get_*`/`is_*` functions, nothing mutating — and the types and
+error codes those signatures use. `is_registered` returns `false` rather than
+erroring for an address nobody registered, so an unregistered counterparty is a
+value you branch on, not a revert you unwind; `get_contract` and
+`get_contract_profile` are the strict ones and do error with `ContractNotFound`.
+
+[examples/registry-consumer/](./examples/registry-consumer) is a small venue
+contract using it for real: it lists a counterparty only if the registry says the
+counterparty is registered, prices deposits by the counterparty's verification
+and stake, and reads everything through the client — including the `try_*`
+variants that return a `Result` instead of panicking on a contract error. Its
+tests deploy the actual registry wasm, so the example is checked against the
+contract as built, not against a mock that agrees with itself.
+
+The interface crate re-declares the registry's types instead of depending on the
+contract crate, which would drag the registry's entire `#[contractimpl]` into
+every consumer's wasm. That duplication is safe only while the two declarations
+agree, so `registry-interface` is tested against the *built wasm's* contract
+spec: a function renamed in the contract without mirroring it in the interface
+fails `cargo test` here, naming the signature that moved. If a change is
+intended, update `registry-interface/src/lib.rs` in the same PR.
+
+## What a cross-contract read costs
+
+"It's only a read" is the reasoning that produces a contract with an accidental
+per-call fee, so the cost is measured rather than assumed.
+`examples/registry-consumer/tests/cost.rs` deploys the real registry wasm and
+prints (with `cargo test -p lumina-registry-consumer-example --test cost -- --nocapture`)
+what the host meters for transactions that read from it:
+
+| transaction | instructions | ledger entries read |
+| --- | --- | --- |
+| no cross-contract call (baseline) | 11,260 | 1 |
+| one `get_version` — one instance key | 9,077,551 | 3 |
+| one `is_registered` | 9,124,508 | 4 |
+| one `get_contract_profile` (entry + reputation) | 9,367,725 | 8 |
+| `is_registered` + `is_verified` — two calls | 18,238,950 | 5 |
+| three calls | 27,360,220 | 5 |
+
+The test asserts the shape of this table so it cannot quietly drift, but read
+the *differences*, not the absolute numbers — fee rates are set by the network
+and change; these relationships do not:
+
+- **Crossing the boundary is the cost.** ~9.07 M of the ~9.12 M instructions in
+  one `is_registered` are the invocation itself; the answer — one `has` against
+  a persistent entry — is ~47 K of them, under 1% of the call.
+- **That fixed charge is per call.** A second call adds ~9.11 M again. A loop
+  over N counterparties is N invocations, not one.
+- **Batch the questions.** One `get_contract_profile` answers registered *and*
+  verified (and stake, and slash history) for ~9.37 M instructions — about 49%
+  cheaper than the two `is_*` calls it replaces. Prefer one rich read over
+  several cheap ones.
+- **Entries are paid once, calls every time.** Reading the same keys three
+  times costs ~27.6 M instructions but no additional ledger entries beyond the
+  second call: re-reading cached state buys nothing and charges per call.
+- **The caller pays.** These ledger reads land in the invoking transaction's
+  resources, whoever triggers it — not on the registry's balance sheet.
 
 ## Build & Test
 
@@ -244,6 +317,16 @@ before the build-and-test sequence.
 
 Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
+
+### Upgrading the Rust Toolchain
+
+The project pins its Rust compiler version using a `rust-toolchain.toml` file to ensure that CI and local builds compile with the exact same compiler. A floating toolchain can cause unexpected breakages (such as the reference-types proposal being emitted by newer Rust versions on `wasm32-unknown-unknown`).
+
+To upgrade the compiler version:
+1. Update the `channel` value in `rust-toolchain.toml` to the new stable version.
+2. Ensure `targets = ["wasm32v1-none"]` remains present in the file.
+3. Re-run `cargo build --target wasm32v1-none --release` and `cargo test` locally to verify the new compiler version doesn't introduce any new build errors or warnings.
+4. Commit the updated `rust-toolchain.toml` file and open a PR. CI will automatically honor the newly pinned version instead of defaulting to `stable`.
 
 ### Interface snapshot
 

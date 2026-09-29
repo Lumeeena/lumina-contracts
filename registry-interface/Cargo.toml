@@ -1,0 +1,18 @@
+[package]
+name = "lumina-registry-interface"
+version = "0.1.0"
+edition = "2021"
+description = "Typed read-only client for the Lumina Registry, for use by other Soroban contracts."
+license = "MIT"
+
+[lib]
+# rlib only. This crate is a dependency of other contracts, never a contract
+# itself, so it must not emit a cdylib.
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-spec = "22.0.11"
