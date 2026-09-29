@@ -34,7 +34,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token,
-    Address, BytesN, Env, Symbol, String, Vec,
+    Address, BytesN, Env, Symbol, SymbolStr, String, TryFromVal, Vec,
 };
 
 // ─── Version ───────────────────────────────────────────────────────────────
@@ -796,7 +796,12 @@ impl LuminaRegistry {
     }
 
     /// Govern a fixed-window per-owner registration limit. Zero disables it.
-    pub fn propose_configure_registration_rate_limit(
+    ///
+    /// Named `propose_set_rate_limit` rather than the longer
+    /// `propose_configure_registration_rate_limit`: Soroban caps exported
+    /// contract function names at 32 characters, and the descriptive spelling
+    /// overflows that (41 chars), which the SDK rejects at compile time.
+    pub fn propose_set_rate_limit(
         env: Env,
         proposer: Address,
         limit: u32,
@@ -1406,8 +1411,9 @@ impl LuminaRegistry {
         }
 
         for tag in tags.iter() {
-            let s = tag.to_string(&env);
-            if s.len() > MAX_TAG_LEN {
+            // `Symbol::to_string` only exists for non-wasm targets, so measure
+            // the symbol through its XDR form, which is available in both.
+            if Self::symbol_len(&env, &tag) > MAX_TAG_LEN {
                 return Err(RegistryError::InvalidTags);
             }
         }
@@ -1637,7 +1643,11 @@ impl LuminaRegistry {
     /// iterating the combined indices).
     ///
     /// `categories` may not be empty; an empty selection returns a validation error.
-    pub fn get_active_contracts_by_categories(
+    ///
+    /// Named `get_contracts_by_categories` because Soroban caps exported
+    /// contract function names at 32 characters and the longer spelling
+    /// (34) is rejected at compile time.
+    pub fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
         offset: u32,
@@ -1707,7 +1717,7 @@ impl LuminaRegistry {
         let total_registered = env.storage().instance()
             .get::<DataKey, u32>(&DataKey::TotalRegistered)
             .unwrap_or(0);
-        let active_count = Self::get_active_contract_count(&env);
+        let active_count = Self::get_active_contract_count(env.clone());
         let verified_count = env.storage().instance()
             .get::<DataKey, u32>(&DataKey::VerifiedCount)
             .unwrap_or(0);
@@ -2339,6 +2349,19 @@ impl LuminaRegistry {
             .unwrap_or(0)
     }
 
+    /// Character length of a `Symbol`.
+    ///
+    /// `Symbol::to_string` is gated behind `not(target_family = "wasm")` and so
+    /// does not exist in the contract build. `SymbolStr` is the one conversion
+    /// available to both targets, and it exposes a length directly — so no
+    /// `String` is allocated just to measure it.
+    fn symbol_len(env: &Env, symbol: &Symbol) -> u32 {
+        match SymbolStr::try_from_val(env, &symbol.to_symbol_val()) {
+            Ok(s) => s.len() as u32,
+            Err(_) => u32::MAX,
+        }
+    }
+
     fn slash_history(env: &Env, contract_id: &Address) -> Vec<SlashRecord> {
         env.storage().persistent()
             .get(&DataKey::Slashes(contract_id.clone()))
@@ -2928,7 +2951,7 @@ mod test {
     fn registration_rate_limit_resets_after_governed_window() {
         let (env, client, admin) = setup();
         let owner = Address::generate(&env);
-        let configure = client.propose_configure_registration_rate_limit(&admin, &1, &3);
+        let configure = client.propose_set_rate_limit(&admin, &1, &3);
         pass_proposal(&env, &client, &admin, configure);
         let first = Address::generate(&env);
         client.register_contract(
@@ -3151,6 +3174,13 @@ mod test {
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
         let admin = Address::generate(env);
+        // `__constructor` calls `require_auth()`, and deploying *from wasm*
+        // runs it as a sub-invocation of the `CreateContractV2` host function
+        // rather than as the root invocation. `mock_all_auths` rejects a
+        // `require_auth` that is not tied to the root frame, so the upgrade
+        // tests need the non-root variant. (Native `env.register(LuminaRegistry,
+        // ..)` in `setup` needs no such allowance and keeps plain mocking.)
+        env.mock_all_auths_allowing_non_root_auth();
         let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
         let client = registry_v1_wasm::Client::new(env, &contract_id);
         (client, admin, contract_id)
