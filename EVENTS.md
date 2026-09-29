@@ -21,18 +21,18 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>)` | When a contract's categories are updated by its owner or manager. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
 | `tags_updated` | `(contract_id: Address, owner: Address, tags_len: u32)` | When a contract's tags are updated by its owner or manager. | History | `tags_are_updated_and_returned` |
 | `metadata_updated` | `(contract_id: Address, owner: Address, name: String)` | When the contract's metadata (name) is updated by its owner or manager. | Indexer, History | `update_metadata_succeeds_with_real_owner_signature` |
-| `ownership_transferred` | `(contract_id: Address, previous_owner: Address, new_owner: Address)` | When the contract's ownership is transferred to a new address. Only the owner may transfer ownership. | History | `ownership_transfer_preserves_stake_and_verification` |
-| `manager_updated` | `(contract_id: Address, owner: Address, manager: Option<Address>)` | When the owner sets or revokes the contract's manager. Revocation is immediate. | History | `set_manager_grants_and_revokes_immediately` |
+| `ownership_transferred` | `(contract_id: Address, previous_owner: Address, new_owner: Address)` | When the contract's ownership is transferred to a new address. | History | `ownership_transfer_preserves_stake_and_verification` |
+| `manager_updated` | `(contract_id: Address, owner: Address, manager: Option<Address>)` | When the owner sets or revokes the contract's manager. | History | `manager_can_be set_and_revoked_by_owner` |
 | `stake_deposited` | `(contract_id: Address, owner: Address, amount: i128, total_staked: i128)` | When the owner deposits tokens to top up their stake. | History | `stake_tops_up_an_existing_stake` |
-| `stake_withdrawn` | `(contract_id: Address, owner: Address, total_staked: i128)` | When the owner withdraws their staked tokens after deactivation. Only the owner may withdraw stake. | History | `withdraw_returns_the_full_stake_once_the_owner_has_deactivated` |
+| `stake_withdrawn` | `(contract_id: Address, owner: Address, total_staked: i128)` | When the owner withdraws their staked tokens after deactivation. | History | `withdraw_returns_the_full_stake_once_the_owner_has_deactivated` |
 | `stake_slashed` | `(contract_id: Address, amount: i128, reason: String, treasury: Address)` | When governance slashes a contract's stake for a violation. | History | `slash_moves_stake_to_the_treasury_and_records_the_reason` |
 | `verification_set` | `(contract_id: Address, verified: bool)` | When governance grants or revokes verified status for a contract. | History | `governance_can_attest_and_later_revoke_verification` |
 | `category_pruned` | `(category: String, removed: u32)` | When dead references in a category's index are cleaned up. | | `prune_category_drops_dead_references_and_is_safe_to_repeat` |
-| `all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
+| all_contracts_pruned | `(removed: u32,` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
 | `registry_upgraded` | `(new_wasm_hash: BytesN<32>, version: u32)` | When the registry contract's WASM is upgraded. | | `upgrade_carries_admin_across_swap` |
 | `admin_added` | `(new_admin: Address,)` | When a new governance admin is added via executed proposal. | | `propose_add_admin_adds_a_new_admin` |
 | `admin_removed` | `(admin_to_remove: Address,)` | When a governance admin is removed via executed proposal. | | `propose_remove_admin_removes_the_admin` |
-| `threshold_changed` | `(new_threshold: u32,)` | When the multisig approval threshold is changed. | | `propose_change_threshold_changes_the_threshold` |
+| `threshold_changed` | `(new_threshold: u32,` | When the multisig approval threshold is changed. | | `propose_change_threshold_changes_the_threshold` |
 | `staking_configured` | `(token_id: Address, treasury: Address)` | When governance configures the staking token and treasury. | | `configure_staking_records_token_and_treasury` |
 | `allowlist_mode_changed` | `(enabled: bool,)` | When governance enables or disables the owner allowlist. | | `allowlist_mode_can_be_toggled` |
 | `owner_allowlisted` | `(owner: Address, allowed: bool)` | When governance adds or removes an owner from the allowlist. | | `owner_can_be_added_to_allowlist` |
