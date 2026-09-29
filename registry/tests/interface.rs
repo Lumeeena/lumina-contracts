@@ -30,7 +30,13 @@
 //! quietly stops testing anything. When a storage type changes, update the
 //! fixture deliberately and regenerate its snapshot:
 //!
+//! 
 //!
+//! The interface snapshot also covers the delegation surface: `set_manager`,
+//! `manager`, and `revoke_manager` are exported so that an owner can delegate
+//! metadata and category management without exposing stake withdrawal or
+//! ownership transfer. Managers are intentionally limited to the metadata and
+//! category entry points; the value-moving entry points remain owner-only.
 
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
@@ -75,6 +81,10 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
 /// One line per exported item, sorted so that moving code around in `lib.rs`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
+///
+/// Delegation entry points (`set_manager`, `manager`, `revoke_manager`) are
+/// rendered like any other exported function so that adding or removing them
+/// is caught by the snapshot check.
 fn render_interface(entries: &[ScSpecEntry]) -> String {
     let mut lines: Vec<String> = entries
         .iter()
@@ -159,6 +169,12 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
     out
 }
 
+/// The delegation surface is part of the exported interface: consumers must be
+/// able to observe the current manager and the owner must be able to revoke it
+/// immediately. Any change to these signatures is a breaking change and must be
+/// reviewed alongside `registry/interface.snap`.
+const _DELEGATION_SURFACE: &[&str] = &["set_manager", "manager", "revoke_manager"];
+
 #[test]
 fn exported_interface_matches_snapshot() {
     let wasm_path = manifest_path(&[
@@ -176,6 +192,14 @@ fn exported_interface_matches_snapshot() {
     });
     let entries = soroban_spec::read::from_wasm(&wasm).expect("wasm has no readable contract spec");
     let actual = render_interface(&entries);
+
+    for expected_fn in _DELEGATION_SURFACE {
+        assert!(
+            actual.contains(&format!("fn {expected_fn}(")),
+            "delegation entry point `{expected_fn}` is missing from the exported interface; \
+             the owner-delegated manager surface must remain part of the contract spec"
+        );
+    }
 
     let snap_path = manifest_path(&["interface.snap"]);
     if std::env::var_os(UPDATE_ENV).is_some() {

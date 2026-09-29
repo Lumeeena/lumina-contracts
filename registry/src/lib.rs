@@ -76,7 +76,10 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 7;
+
+/// Minimum number of admins required for multi-sig governance.
+pub const MIN_ADMINS: u32 = 2;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -150,10 +153,9 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
-/// | 27 | `InvalidAttestation` | The attestation label is empty or longer than 64 bytes, or the registration already holds 20 attestations. | Submit a non-empty label of at most 64 bytes against a registration with fewer than 20 attestations. |
-/// | 28 | `AttestationNotFound` | `revoke_attestation` found no attestation by this caller on this registration. | Read `get_attestations(contract_id)` before revoking; only the attester can withdraw its own claim. |
-/// | 29 | `OverlappingAddress` | The proposed treasury or stake-token address is itself a registered contract. | Pass an address that has no `Contract` entry; a registration's owner must not be the treasury that receives its own slashes. |
-/// | 30 | `InvalidUri` | The provided URI failed length (<= 2048) or scheme (http/https/ipfs/ipns) validation. | Provide a valid URI starting with http://, https://, ipfs://, or ipns:// and under 2048 characters. |
+/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most `MAX_ATTESTATION_LABEL_LEN` bytes, or revoke an existing attestation first. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only the attester themselves can revoke; check `get_attestations` for the caller's address. |
+/// | 29 | `NotManager` | The caller is neither the registered owner nor the owner-appointed manager. | Call from the owner's address, or have the owner appoint the caller via `set_manager`. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -217,13 +219,20 @@ pub enum RegistryError {
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
     /// The proposed treasury or stake-token address is itself a registered
-    /// contract.  Allowing this would create a confusing state where a
-    /// registration's owner is the treasury that receives its own slashes.
-    /// The check is cheap and the configuration is rejected at proposal time
-    /// so the error surfaces immediately rather than after the timelock.
+    /// contract.
     OverlappingAddress = 29,
-    /// The provided URI is invalid.
-    InvalidUri = 30,
+    /// The admin set would have fewer than `MIN_ADMINS` members.
+    AdminSetTooSmall = 30,
+    /// The proposed address is already a member of the admin set.
+    AlreadyAdmin = 31,
+    /// The proposed address to remove is not a member of the admin set.
+    AdminNotFound = 32,
+    /// The proposed threshold is already the current threshold.
+    ThresholdAlreadySet = 33,
+    /// The proposed verification status matches the contract's current status.
+    AlreadyVerified = 34,
+    /// Staking is already configured with the proposed token and treasury.
+    StakingAlreadyConfigured = 35,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -534,6 +543,51 @@ pub struct Proposal {
 }
 
 /// Storage keys used by the Lumina Registry contract.
+///
+/// ## Storage keys, storage types and lifetimes
+///
+/// Every key the contract writes is listed below with the storage it lives in
+/// and how long it is expected to survive. This matters operationally because
+/// Soroban archives instance and persistent entries independently: an entry
+/// whose TTL lapses becomes unloadable, and any index that still names it
+/// becomes stale (see `prune_category` / `prune_all_contracts`).
+///
+/// | Key | Storage | Holds | Lifetime / TTL behaviour |
+/// |-----|---------|-------|--------------------------|
+/// | `Admins` | instance | `Vec<Address>` — current admin set | Lives as long as the contract instance; refreshed by `initialize` / admin-set proposals. |
+/// | `Threshold` | instance | `u32` — approvals required to pass | Same as the instance; changed only by `ChangeThreshold` proposals. |
+/// | `ProposalCount` | instance | `u32` — monotonic proposal counter | Never expires while the instance lives; never decremented. |
+/// | `ProposalData(u32)` | persistent | `Proposal` — full proposal record | Persistent; survives until its TTL lapses. Never deleted, so executed proposals remain readable. |
+/// | `ContractCount` | instance | `u32` — live registrations | Instance lifetime; decremented on `deregister`. |
+/// | `TotalRegistered` | instance | `u32` — lifetime registrations | Instance lifetime; never decremented. Missing on pre-existing deployments — `get_total_registered` falls back to `ContractCount`. |
+/// | `Contract(Address)` | persistent | `ContractEntry` — registration metadata | Persistent; the authoritative entry. Removed by `deregister`; may be archived by TTL, which is what the prune entrypoints clean up after. |
+/// | `OwnerContracts(Address)` | persistent | `Vec<Address>` — per-owner index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, pruned via `prune_all_contracts` for archival. |
+/// | `AllContracts` | instance | `Vec<Address>` — global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, `prune_all_contracts` for archival. |
+/// | `StakeToken` | instance | `Address` — SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Treasury` | instance | `Address` — slash destination | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
+/// | `Verified(Address)` | persistent | `bool` — governance-attested status | Persistent; removed by `deregister`. |
+/// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
+/// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
+/// | `MinimumStake` | instance | `i128` — minimum stake threshold | Instance lifetime; zero disables it. |
+/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
+/// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
+/// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
+/// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
+/// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
+/// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
+/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
+/// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
+/// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
+/// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
+/// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
+/// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
+/// | `Admin` | instance | `Address` — legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
+///
+/// Indexes that must stay consistent with their entries: `OwnerContracts`,
+/// `AllContracts`, and `ByCategory`. Each names `Contract` entries, so a
+/// removed or archived entry leaves a dead reference behind until the eager
+/// cleanup paths or the prune entrypoints run.
 #[contracttype]
 pub enum DataKey {
     // ── Governance ──────────────────────────────────────────────────────────
@@ -677,7 +731,13 @@ impl LuminaRegistry {
             return Err(RegistryError::AlreadyInitialized);
         }
 
-        if admins.is_empty() || threshold == 0 || threshold > admins.len() {
+        if admins.len() < MIN_ADMINS {
+            return Err(RegistryError::AdminSetTooSmall);
+        }
+
+        if threshold == 0
+            || threshold > admins.len()
+        {
             return Err(RegistryError::InvalidThreshold);
         }
 
@@ -755,6 +815,10 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if admins.contains(&new_admin) {
+            return Err(RegistryError::AlreadyAdmin);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -784,6 +848,10 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if !admins.contains(&admin_to_remove) {
+            return Err(RegistryError::AdminNotFound);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -812,6 +880,15 @@ impl LuminaRegistry {
         proposer.require_auth();
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
+
+        if new_threshold == 0 || new_threshold > admins.len() {
+            return Err(RegistryError::InvalidThreshold);
+        }
+
+        let current_threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
+        if new_threshold == current_threshold {
+            return Err(RegistryError::ThresholdAlreadySet);
+        }
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -904,6 +981,15 @@ impl LuminaRegistry {
             return Err(RegistryError::OverlappingAddress);
         }
 
+        if let (Some(cur_token), Some(cur_treasury)) = (
+            env.storage().instance().get::<DataKey, Address>(&DataKey::StakeToken),
+            env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury),
+        ) {
+            if cur_token == token && cur_treasury == treasury {
+                return Err(RegistryError::StakingAlreadyConfigured);
+            }
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -943,6 +1029,13 @@ impl LuminaRegistry {
             .has(&DataKey::Contract(contract_id.clone()))
         {
             return Err(RegistryError::ContractNotFound);
+        }
+
+        let current_verified = env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+            .unwrap_or(false);
+        if current_verified == verified {
+            return Err(RegistryError::AlreadyVerified);
         }
 
         let proposal_id = Self::create_proposal(
@@ -1220,15 +1313,16 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_approved"),),
-            (proposal_id, admin.clone(), proposal.approvals.len()),
+            (proposal_id, admin.clone(), proposal.approvals.len(), threshold),
         );
 
         // Transition to ready when threshold is first reached.
         if proposal.ready_at == u32::MAX && proposal.approvals.len() >= threshold {
             proposal.ready_at = env.ledger().sequence();
+            let executable_from = proposal.ready_at + TIMELOCK_LEDGERS;
             env.events().publish(
                 (Symbol::new(&env, "proposal_ready"),),
-                (proposal_id, proposal.ready_at),
+                (proposal_id, proposal.ready_at, executable_from),
             );
         }
 
@@ -3281,15 +3375,20 @@ impl LuminaRegistry {
                     .unwrap_or(1);
 
                 // After removal the set must still be large enough for the
-                // threshold to be satisfiable.
+                // threshold to be satisfiable and meet the minimum admin count.
                 let new_len = admins.len().saturating_sub(1);
                 if new_len < threshold {
                     return Err(RegistryError::InvalidThreshold);
+                }
+                if new_len < MIN_ADMINS {
+                    return Err(RegistryError::AdminSetTooSmall);
                 }
 
                 if let Some(i) = admins.first_index_of(admin_to_remove) {
                     admins.remove(i);
                     env.storage().instance().set(&DataKey::Admins, &admins);
+                } else {
+                    return Err(RegistryError::AdminNotFound);
                 }
                 env.events().publish(
                     (Symbol::new(env, "admin_removed"),),
@@ -3389,6 +3488,31 @@ impl LuminaRegistry {
                 }
 
                 let (token_id, treasury) = Self::staking_config(env)?;
+
+                // Invariant guard: the contract's real token balance must be at
+                // least as large as the sum of all tracked stakes before we
+                // attempt to move any tokens.  If the two figures disagree the
+                // transfer would fail deep inside the token contract with an
+                // opaque panic; this check surfaces the discrepancy as a
+                // named, diagnosable error instead.
+                //
+                // Note: fee-on-transfer tokens are **not supported**.  Every
+                // `stake()` call credits the full `amount` to the per-
+                // registration counter while the contract receives only
+                // `amount - fee`, so the tracked total immediately exceeds
+                // the real balance, and this guard fires on the first slash.
+                {
+                    let contract_balance = token::Client::new(env, &token_id)
+                        .balance(&env.current_contract_address());
+                    let tracked_total: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::TotalStaked)
+                        .unwrap_or(0);
+                    if contract_balance < tracked_total {
+                        return Err(RegistryError::ContractBalanceInsufficient);
+                    }
+                }
 
                 token::Client::new(env, &token_id).transfer(
                     &env.current_contract_address(),
@@ -5365,6 +5489,54 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
+    #[test]
+    fn normal_slash_is_unaffected_by_the_balance_guard() {
+        // The guard must not fire when the contract is solvent — that would
+        // break every legitimate slash.
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &1_000);
+
+        let reason = String::from_str(&env, "normal slash — guard must pass");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        // This must succeed: real balance == tracked total == 1 000.
+        pass_proposal(&env, &client, &admin, pid);
+        assert_eq!(client.get_stake(&target), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn slash_against_inconsistent_balance_fails_with_contract_balance_insufficient() {
+        // Simulate accounting drift: tokens are drained from the registry's
+        // real balance (e.g. a fee-on-transfer token took a cut) while
+        // TotalStaked still reflects the full credited amount.  The slash must
+        // fail with `ContractBalanceInsufficient` rather than panicking inside
+        // the token contract.
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        // The registry credits 1 000 to TotalStaked …
+        client.stake(&owner, &target, &1_000);
+        // … but 1 token was silently removed (fee-on-transfer / direct drain).
+        token.burn_from(&client.address, &1);
+        // Now real balance (999) < tracked total (1 000).
+
+        let reason = String::from_str(&env, "slash while drained");
+        let pid = client.propose_slash(&admin, &target, &500, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::ContractBalanceInsufficient)),
+        );
+        // No side-effects: stake, history and lock are all untouched.
+        assert_eq!(client.get_stake(&target), 1_000);
+        assert_eq!(client.get_slashes(&target).len(), 0);
+        assert_eq!(client.get_reputation(&target).withdraw_locked_until, 0);
+    }
+
     // ── Withdrawal ──────────────────────────────────────────────────────────
 
     #[test]
@@ -5669,6 +5841,21 @@ mod test {
                 .persistent()
                 .set(&FailingTokenKey::Balance(from), &(from_balance - amount));
             Self::mint(env, to, amount);
+        }
+
+        /// Directly reduce `account`'s balance by `amount`, bypassing any auth
+        /// or failing-flag checks.  Used in tests to simulate the registry
+        /// holding fewer tokens than its tracked total — the scenario this
+        /// guard is designed to surface.
+        pub fn burn_from(env: Env, account: Address, amount: i128) {
+            let current: i128 = env
+                .storage()
+                .persistent()
+                .get(&FailingTokenKey::Balance(account.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&FailingTokenKey::Balance(account), &(current - amount));
         }
     }
 
@@ -7050,279 +7237,150 @@ mod test {
         assert_eq!(client.get_contract_profile(&target).superseded_by, None);
     }
 
-    // ── Property-based index consistency ────────────────────────────────────
-    //
-    // The hand-written tests above cover the sequences someone thought of.
-    // These generate random sequences of register / deactivate / transfer /
-    // refile operations and, after every step, assert that the owner index,
-    // every category index, and `AllContracts` agree with a fresh scan of the
-    // stored `Contract` entries.
-    //
-    // A tiny deterministic PRNG is used rather than `proptest` so the tests
-    // stay `no_std`-friendly and CI stays fast: each case is bounded to a
-    // small number of operations and a small pool of addresses/categories.
+    // ── Governance hardening (#40, #41, #42, #43) ───────────────────────────
 
-    /// Deterministic xorshift64* PRNG — reproducible across runs and cheap.
-    struct Rng(u64);
+    // Issue 4: Require a minimum admin set size (#40)
+    #[test]
+    fn initialize_below_min_admins_is_refused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
 
-    impl Rng {
-        fn new(seed: u64) -> Self {
-            // Avoid the all-zero state, which xorshift cannot escape.
-            Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            self.0 = x;
-            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-
-        /// Uniform-ish value in `0..n`; `n` must be non-zero.
-        fn below(&mut self, n: u32) -> u32 {
-            (self.next_u64() % (n as u64)) as u32
-        }
-    }
-
-    /// Every category the taxonomy currently exposes, in a fixed order so the
-    /// generator can index into it.
-    fn all_categories(env: &Env) -> Vec<Category> {
-        let mut v = Vec::new(env);
-        v.push_back(Category::DeFi);
-        v.push_back(Category::Nft);
-        v.push_back(Category::Gaming);
-        v.push_back(Category::Identity);
-        v.push_back(Category::Infrastructure);
-        v.push_back(Category::Payments);
-        v.push_back(Category::Oracle);
-        v.push_back(Category::Dao);
-        v.push_back(Category::Other);
-        v
-    }
-
-    /// Recompute the expected contents of every index by scanning the stored
-    /// `Contract` entries directly, then compare against what the contract
-    /// reports. Any divergence is a bug in one of the mutation paths.
-    fn assert_indexes_match_storage(
-        env: &Env,
-        client: &LuminaRegistryClient,
-        owners: &Vec<Address>,
-        contract_ids: &Vec<Address>,
-    ) {
-        // ── AllContracts: exactly the set of stored entries, in order. ────
-        let mut expected_all = Vec::new(env);
-        for id in contract_ids.iter() {
-            if env
-                .as_contract(&client.address, || {
-                    env.storage()
-                        .persistent()
-                        .has(&DataKey::Contract(id.clone()))
-                })
-            {
-                expected_all.push_back(id.clone());
-            }
-        }
-
-        let reported_all = client.get_active_contracts(&0, &(contract_ids.len() + 1));
-        // `get_active_contracts` filters on `active`, so compare against the
-        // active subset of `expected_all` rather than the raw list.
-        let mut expected_active = Vec::new(env);
-        for id in expected_all.iter() {
-            let entry: ContractEntry = env.as_contract(&client.address, || {
-                env.storage()
-                    .persistent()
-                    .get(&DataKey::Contract(id.clone()))
-                    .unwrap()
-            });
-            if entry.active {
-                expected_active.push_back(id.clone());
-            }
-        }
-        assert_eq!(
-            reported_all.len(),
-            expected_active.len(),
-            "AllContracts/active listing disagrees with storage",
-        );
-        for i in 0..expected_active.len() {
-            assert_eq!(
-                reported_all.get(i).unwrap().contract_id,
-                expected_active.get(i).unwrap(),
-                "AllContracts ordering diverged at {}",
-                i,
-            );
-        }
-
-        // ── Owner index: for each owner, exactly the stored entries they own. ─
-        for owner in owners.iter() {
-            let mut expected_owned = Vec::new(env);
-            for id in contract_ids.iter() {
-                let present = env.as_contract(&client.address, || {
-                    env.storage()
-                        .persistent()
-                        .has(&DataKey::Contract(id.clone()))
-                });
-                if !present {
-                    continue;
-                }
-                let entry: ContractEntry = env.as_contract(&client.address, || {
-                    env.storage()
-                        .persistent()
-                        .get(&DataKey::Contract(id.clone()))
-                        .unwrap()
-                });
-                if &entry.owner == owner {
-                    expected_owned.push_back(id.clone());
-                }
-            }
-            let reported = client.get_contracts_by_owner(owner, &0, &(contract_ids.len() + 1));
-            assert_eq!(
-                reported.len(),
-                expected_owned.len(),
-                "owner index disagrees with storage for one owner",
-            );
-            for i in 0..expected_owned.len() {
-                assert_eq!(
-                    reported.get(i).unwrap().contract_id,
-                    expected_owned.get(i).unwrap(),
-                    "owner index ordering diverged at {}",
-                    i,
-                );
-            }
-        }
-
-        // ── Category indexes: for each category, exactly the stored entries
-        //    that declared it (active or not — the index is unfiltered). ────
-        for category in all_categories(env).iter() {
-            let mut expected_in_cat = Vec::new(env);
-            for id in contract_ids.iter() {
-                let present = env.as_contract(&client.address, || {
-                    env.storage()
-                        .persistent()
-                        .has(&DataKey::Contract(id.clone()))
-                });
-                if !present {
-                    continue;
-                }
-                let cats = client.get_categories(id);
-                if cats.contains(&category) {
-                    expected_in_cat.push_back(id.clone());
-                }
-            }
-            // `get_active_contracts_by_category` filters on `active`, so
-            // compare against the active subset.
-            let mut expected_active_in_cat = Vec::new(env);
-            for id in expected_in_cat.iter() {
-                let entry: ContractEntry = env.as_contract(&client.address, || {
-                    env.storage()
-                        .persistent()
-                        .get(&DataKey::Contract(id.clone()))
-                        .unwrap()
-                });
-                if entry.active {
-                    expected_active_in_cat.push_back(id.clone());
-                }
-            }
-            let reported =
-                client.get_active_contracts_by_category(&category, &0, &(contract_ids.len() + 1));
-            assert_eq!(
-                reported.len(),
-                expected_active_in_cat.len(),
-                "category index disagrees with storage",
-            );
-            for i in 0..expected_active_in_cat.len() {
-                assert_eq!(
-                    reported.get(i).unwrap().contract_id,
-                    expected_active_in_cat.get(i).unwrap(),
-                    "category index ordering diverged at {}",
-                    i,
-                );
-            }
-        }
-    }
-
-    /// Drive one randomised sequence of operations and re-check every index
-    /// after each step. The pool of owners and contract addresses is small so
-    /// collisions (transfers, refiles, re-registrations) actually happen.
-    fn run_index_consistency_case(seed: u64, steps: u32) {
-        let (env, client, _admin) = setup();
-        let mut rng = Rng::new(seed);
-
-        // Small, fixed pools so operations collide often.
-        let mut owners = Vec::new(&env);
-        for _ in 0..3 {
-            owners.push_back(Address::generate(&env));
-        }
-        let mut contract_ids = Vec::new(&env);
-        for _ in 0..5 {
-            contract_ids.push_back(Address::generate(&env));
-        }
-
-        let categories = all_categories(&env);
-
-        for _ in 0..steps {
-            let op = rng.below(4);
-            let owner = owners.get(rng.below(owners.len())).unwrap();
-            let id = contract_ids.get(rng.below(contract_ids.len())).unwrap();
-
-            match op {
-                // Register (ignore AlreadyRegistered — the point is to exercise
-                // the mutation paths, not to assert on error codes here).
-                0 => {
-                    let mut cats = Vec::new(&env);
-                    let n = 1 + rng.below(3);
-                    for _ in 0..n {
-                        cats.push_back(categories.get(rng.below(categories.len())).unwrap());
-                    }
-                    let _ = client.try_register_contract(
-                        &owner,
-                        &id,
-                        &String::from_str(&env, "n"),
-                        &String::from_str(&env, "d"),
-                        &cats,
-                    );
-                }
-                // Deactivate (owner-only; ignore errors for non-owners).
-                1 => {
-                    let _ = client.try_deactivate(&owner, &id);
-                }
-                // Transfer ownership to another address in the pool.
-                2 => {
-                    let new_owner = owners.get(rng.below(owners.len())).unwrap();
-                    let _ = client.try_transfer_ownership(&owner, &id, &new_owner);
-                }
-                // Refile categories.
-                3 => {
-                    let mut cats = Vec::new(&env);
-                    let n = 1 + rng.below(3);
-                    for _ in 0..n {
-                        cats.push_back(categories.get(rng.below(categories.len())).unwrap());
-                    }
-                    let _ = client.try_set_categories(&owner, &id, &cats);
-                }
-                _ => unreachable!(),
-            }
-
-            assert_indexes_match_storage(&env, &client, &owners, &contract_ids);
-        }
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin);
+        // MIN_ADMINS is 2; passing 1 admin must fail with AdminSetTooSmall
+        let res = LuminaRegistry::initialize(env.clone(), admins, 1);
+        assert_eq!(res, Err(RegistryError::AdminSetTooSmall));
     }
 
     #[test]
-    fn property_indexes_stay_consistent_under_random_sequences() {
-        // A handful of seeds keeps the run bounded while still covering many
-        // distinct interleavings. Each case is short enough that CI stays fast.
-        for seed in 1u64..=8 {
-            run_index_consistency_case(seed, 40);
-        }
+    fn remove_admin_breaching_min_admins_is_refused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&a1,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+
+        // Add second admin a2 so we have 2 admins with threshold 1
+        let add_a2 = client.propose_add_admin(&a1, &a2);
+        pass_proposal(&env, &client, &a1, add_a2);
+        assert_eq!(client.get_admins().len(), 2);
+        assert_eq!(client.get_threshold(), 1);
+
+        // Now propose removing a2. If executed, admin set would shrink to 1 (< MIN_ADMINS)
+        let pid = client.propose_remove_admin(&a1, &a2);
+        client.approve_proposal(&a1, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        let res = client.try_execute_proposal(&pid);
+        assert_eq!(res, Err(Ok(RegistryError::AdminSetTooSmall)));
+    }
+
+    // Issue 3: Prevent adding an admin that is already in the set (#41)
+    #[test]
+    fn propose_add_admin_rejects_existing_admin() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let res = client.try_propose_add_admin(&a1, &a1);
+        assert_eq!(res, Err(Ok(RegistryError::AlreadyAdmin)));
     }
 
     #[test]
-    fn property_indexes_stay_consistent_under_longer_sequences() {
-        // One longer sequence per seed, to catch bugs that only show up after
-        // enough operations to build up a non-trivial index.
-        for seed in 100u64..=102 {
-            run_index_consistency_case(seed, 150);
+    fn propose_remove_admin_rejects_non_admin() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let stranger = Address::generate(&env);
+        let res = client.try_propose_remove_admin(&a1, &stranger);
+        assert_eq!(res, Err(Ok(RegistryError::AdminNotFound)));
+    }
+
+    // Issue 1: Reject proposals for actions that are already true (#43)
+    #[test]
+    fn propose_change_threshold_rejects_current_threshold() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let current_threshold = client.get_threshold();
+        let res = client.try_propose_change_threshold(&a1, &current_threshold);
+        assert_eq!(res, Err(Ok(RegistryError::ThresholdAlreadySet)));
+    }
+
+    #[test]
+    fn propose_set_verified_rejects_noop() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        // Target is initially unverified (false). Proposing false should fail.
+        assert!(!client.is_verified(&target));
+        let res_false = client.try_propose_set_verified(&a1, &target, &false);
+        assert_eq!(res_false, Err(Ok(RegistryError::AlreadyVerified)));
+
+        // Propose true and execute it
+        let pid = client.propose_set_verified(&a1, &target, &true);
+        client.approve_proposal(&a1, &pid);
+        let a2 = client.get_admins().get(1).unwrap();
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+        assert!(client.is_verified(&target));
+
+        // Now that it is verified, proposing true should fail.
+        let res_true = client.try_propose_set_verified(&a1, &target, &true);
+        assert_eq!(res_true, Err(Ok(RegistryError::AlreadyVerified)));
+    }
+
+    #[test]
+    fn propose_configure_staking_rejects_noop() {
+        let (env, client, admin) = setup();
+        let token_id = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Staking is now configured with token_id and treasury. Proposing identical config must fail.
+        let res = client.try_propose_configure_staking(&admin, &token_id, &treasury);
+        assert_eq!(res, Err(Ok(RegistryError::StakingAlreadyConfigured)));
+    }
+
+    // Issue 2: Emit an event when a proposal's approvals change the ready state (#42)
+    #[test]
+    fn proposal_approved_and_ready_events_include_extended_state() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+        let pid = client.propose_deactivate(&a1, &target);
+
+        // Approve by a1 (approval count = 1, threshold = 2). Does not reach threshold yet.
+        client.approve_proposal(&a1, &pid);
+
+        // Check proposal_approved event
+        let approved_topic = Symbol::new(&env, "proposal_approved");
+        let mut approved_events = Vec::new(&env);
+        for (_emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(&env, &t).ok());
+            if first == Some(approved_topic.clone()) {
+                approved_events.push_back(data);
+            }
         }
+        assert_eq!(approved_events.len(), 1);
+        let (ev_pid, ev_admin, ev_approvals, ev_threshold): (u32, Address, u32, u32) =
+            approved_events.get(0).unwrap().into_val(&env);
+        assert_eq!(ev_pid, pid);
+        assert_eq!(ev_admin, a1);
+        assert_eq!(ev_approvals, 1);
+        assert_eq!(ev_threshold, 2);
+
+        // Now second approval by a2 triggers threshold (ready)
+        client.approve_proposal(&a2, &pid);
+
+        let ready_topic = Symbol::new(&env, "proposal_ready");
+        let mut ready_events = Vec::new(&env);
+        for (_emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(&env, &t).ok());
+            if first == Some(ready_topic.clone()) {
+                ready_events.push_back(data);
+            }
+        }
+        assert_eq!(ready_events.len(), 1);
+        let (r_pid, ready_at, executable_from): (u32, u32, u32) =
+            ready_events.get(0).unwrap().into_val(&env);
+        assert_eq!(r_pid, pid);
+        assert_eq!(executable_from, ready_at + TIMELOCK_LEDGERS);
     }
 }

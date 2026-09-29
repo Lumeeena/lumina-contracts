@@ -154,6 +154,9 @@ pub trait RegistryInterface {
     /// Which build of the registry is live at this address.
     fn get_version(env: Env) -> u32;
 
+    /// The address an owner has delegated registration management to, if any.
+    fn get_manager(env: Env, contract_id: Address) -> Option<Address>;
+
     /// The first admin address. Errors with `NotInitialized` before the
     /// registry has been set up.
     fn get_admin(env: Env) -> Result<Address, RegistryError>;
@@ -376,40 +379,28 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
-    /// Attestation label is empty, too long, or the registration already has
-    /// the maximum number of attestations.
-    InvalidAttestation = 27,
-    /// The caller has no attestation to revoke on this registration.
-    AttestationNotFound = 28,
-    /// A proposed treasury or stake-token address is itself a registered
-    /// contract, so a registration would be its own counterparty.
-    OverlappingAddress = 29,
+    /// Caller is not the registered owner nor its delegated manager.
+    NotManager = 27,
 }
 
-/// A governance proposal.
-///
-/// Duplicated from `lumina-registry` for the reasons given in the crate
-/// docs. `tests/interface_matches_registry.rs` pins the fields against the
-/// contract's spec.
-Ncontracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Proposal {
-    /// The proposal ID.
-    public id: u32,
-    /// The address that created the proposal.
-    public proposer: Address,
-    /// The kind of action the proposal carries.
-    public action: ProposalAction,
-    /// The addresses that have approved.
-    public approvals: Vec<Address>,
-    /// Whether the proposal has been executed.
-    public executed: bool,
-    /// Whether the proposal has been rejected.
-    public rejected: bool,
-    /// When the proposal was created.
-    public created_at: u64,
-    /// When the proposal expires.
-    public expires_at: u64,
+/// Byte-compatible with `lumina_registry::ContractEntry`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractEntry {
+    /// The registered Soroban contract address.
+    pub contract_id: Address,
+    /// Owner/deployer who registered this contract.
+    pub owner: Address,
+    /// Human-readable name.
+    pub name: String,
+    /// Short description of what the contract does.
+    pub description: String,
+    /// Ledger at which this contract was registered.
+    pub registered_at: u32,
+    /// Whether indexing is currently active for this contract.
+    pub active: bool,
+    /// Address the owner delegated registration management to, if any.
+    pub manager: Option<Address>,
 }
 
 /// The kind of action a proposal carries.

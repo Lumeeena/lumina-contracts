@@ -284,6 +284,11 @@ slash proposal to clear its own timelock.
 A slash for more than the registration has staked passes governance but reverts
 at execution with `InsufficientStake`; check `get_stake` before proposing.
 
+A slash will also revert with `ContractBalanceInsufficient` if the registry's
+real token balance is less than its tracked total — a sign of accounting drift
+(fee-on-transfer token, rounding bug, or tokens moved directly out of the
+contract).  Fee-on-transfer tokens are **not supported** as stake tokens.
+
 ### Reclaiming a stake (registrant)
 
 Withdrawal requires **good standing**: you are the registered owner, the
