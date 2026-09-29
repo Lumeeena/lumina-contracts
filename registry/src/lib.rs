@@ -44,7 +44,12 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 7;
+
+/// Maximum number of addresses stored per chunk in the global registration index.
+/// Chunks live in persistent storage to avoid the instance-storage ceiling that
+/// made the old single `Vec<Address>` in `DataKey::AllContracts` scale poorly.
+pub const ALL_CONTRACTS_PAGE_SIZE: u32 = 64;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -525,8 +530,13 @@ pub enum DataKey {
     Contract(Address),
     /// Vec<Address> — list of contracts registered by a specific owner.
     OwnerContracts(Address),
-    /// Vec<Address> — insertion-ordered list of every registered contract.
+    /// Legacy Vec<Address> — retained so old instance-backed deployments can be
+    /// migrated to the chunked persistent index on first access.
     AllContracts,
+    /// u32 — number of entries in the chunked persistent `AllContracts` index.
+    AllContractsLength,
+    /// Vec<Address> — one chunk of the insertion-ordered global registration list.
+    AllContractsPage(u32),
 
     // ── Staking & reputation ────────────────────────────────────────────────
     /// Address — the SEP-41 token stakes are denominated in.
@@ -616,6 +626,70 @@ impl LuminaRegistry {
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
         env.storage().instance().set(&DataKey::ContractCount, &0u32);
         env.storage().instance().set(&DataKey::Admin, &bootstrap_admin);
+        env.storage().persistent().set(&DataKey::AllContractsLength, &0u32);
+    }
+
+    /// Read the global registration index from its chunked persistent form,
+    /// migrating any legacy instance-backed vector the first time it is used.
+    fn all_contracts(env: &Env) -> Vec<Address> {
+        if env.storage().persistent().has(&DataKey::AllContractsLength) {
+            let len: u32 = env.storage().persistent()
+                .get::<DataKey, u32>(&DataKey::AllContractsLength)
+                .unwrap_or(0);
+            let mut all = Vec::new(env);
+            let page_size = ALL_CONTRACTS_PAGE_SIZE;
+            let pages = len.div_ceil(page_size);
+
+            for page in 0..pages {
+                let page_entries: Vec<Address> = env.storage().persistent()
+                    .get(&DataKey::AllContractsPage(page))
+                    .unwrap_or(Vec::new(env));
+                for contract_id in page_entries.iter() {
+                    all.push_back(contract_id);
+                }
+            }
+            return all;
+        }
+
+        let legacy: Vec<Address> = env.storage().instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(env));
+
+        if !legacy.is_empty() {
+            Self::set_all_contracts_index(env, &legacy);
+            env.storage().instance().remove(&DataKey::AllContracts);
+        } else {
+            env.storage().persistent().set(&DataKey::AllContractsLength, &0u32);
+        }
+
+        legacy
+    }
+
+    /// Rewrite the global registration index in its new chunked persistent form.
+    fn set_all_contracts_index(env: &Env, all: &Vec<Address>) {
+        let len = all.len();
+        let page_size = ALL_CONTRACTS_PAGE_SIZE;
+        let pages = len.div_ceil(page_size);
+
+        for page in 0..pages {
+            let start = page * page_size;
+            let end = start + page_size;
+            let mut chunk = Vec::new(env);
+            for i in start..end {
+                if let Some(contract_id) = all.get(i) {
+                    chunk.push_back(contract_id);
+                }
+            }
+            env.storage().persistent().set(&DataKey::AllContractsPage(page), &chunk);
+        }
+
+        let mut stale = pages;
+        while env.storage().persistent().has(&DataKey::AllContractsPage(stale)) {
+            env.storage().persistent().remove(&DataKey::AllContractsPage(stale));
+            stale += 1;
+        }
+
+        env.storage().persistent().set(&DataKey::AllContractsLength, &len);
     }
 
     // ── Initialization ──────────────────────────────────────────────────────
@@ -1221,10 +1295,10 @@ impl LuminaRegistry {
         env.storage().persistent().remove(&DataKey::Categories(contract_id.clone()));
 
         // Drop the global and owner indexes.
-        let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut all = Self::all_contracts(&env);
         if let Some(i) = all.first_index_of(&contract_id) {
             all.remove(i);
-            env.storage().instance().set(&DataKey::AllContracts, &all);
+            Self::set_all_contracts_index(&env, &all);
         }
         let mut owned = Self::owner_index(&env, &entry.owner);
         if let Some(i) = owned.first_index_of(&contract_id) {
@@ -1317,7 +1391,7 @@ impl LuminaRegistry {
     /// category. Callers that prune categories on a schedule should prune the
     /// global index on the same schedule.
     pub fn prune_all_contracts(env: Env) -> u32 {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut live = Vec::new(&env);
         let mut removed: u32 = 0;
 
@@ -1330,7 +1404,7 @@ impl LuminaRegistry {
         }
 
         if removed > 0 {
-            env.storage().instance().set(&DataKey::AllContracts, &live);
+            Self::set_all_contracts_index(&env, &live);
         }
 
         env.events().publish(
@@ -1438,9 +1512,9 @@ impl LuminaRegistry {
         owned.push_back(contract_id.clone());
         Self::set_owner_index(&env, &owner, &owned);
 
-        let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let mut all = Self::all_contracts(&env);
         all.push_back(contract_id.clone());
-        env.storage().instance().set(&DataKey::AllContracts, &all);
+        Self::set_all_contracts_index(&env, &all);
 
         let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
         env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
@@ -1522,9 +1596,9 @@ impl LuminaRegistry {
             owned.push_back(entry.contract_id.clone());
             Self::set_owner_index(&env, &owner, &owned);
 
-            let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+            let mut all = Self::all_contracts(&env);
             all.push_back(entry.contract_id.clone());
-            env.storage().instance().set(&DataKey::AllContracts, &all);
+            Self::set_all_contracts_index(&env, &all);
 
             let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
             env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
@@ -2094,7 +2168,7 @@ impl LuminaRegistry {
             .unwrap_or(0);
 
         let mut staked_count: u32 = 0;
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         for contract_id in all.iter() {
             if Self::stake_of(&env, &contract_id) > 0 {
                 staked_count += 1;
@@ -2193,7 +2267,7 @@ impl LuminaRegistry {
     /// `get_active_contracts`, with each entry's reputation attached. Same
     /// offset/limit and active-filtering semantics.
     pub fn get_active_profiles(env: Env, offset: u32, limit: u32) -> Vec<ContractProfile> {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut result = Vec::new(&env);
 
         let mut i = offset;
@@ -2248,7 +2322,7 @@ impl LuminaRegistry {
     /// counts entries that still load and are flagged active, skipping dead
     /// references exactly as `get_active_contracts` does.
     pub fn get_active_contract_count(env: Env) -> u32 {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut active: u32 = 0;
         for contract_id in all.iter() {
             if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
@@ -2266,7 +2340,7 @@ impl LuminaRegistry {
 
     /// Paginated list of active registered contracts in registration order.
     pub fn get_active_contracts(env: Env, offset: u32, limit: u32) -> Vec<ContractEntry> {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut result = Vec::new(&env);
 
         let mut i = offset;
@@ -2287,7 +2361,7 @@ impl LuminaRegistry {
     /// Paginated list of active contract addresses only, intended for indexers
     /// that need only the addresses without the full entries.
     pub fn get_active_contract_ids(env: Env, offset: u32, limit: u32) -> Vec<Address> {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut result = Vec::new(&env);
 
         let mut i = offset;
@@ -2307,7 +2381,7 @@ impl LuminaRegistry {
 
     /// Paginated list of active registered contracts with indication of whether more results exist.
     pub fn get_active_contracts_page(env: Env, offset: u32, limit: u32) -> ContractPage {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut entries = Vec::new(&env);
 
         let mut i = offset;
@@ -2329,7 +2403,7 @@ impl LuminaRegistry {
 
     /// Paginated list of contract profiles with indication of whether more results exist.
     pub fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut entries = Vec::new(&env);
 
         let mut i = offset;
@@ -4166,9 +4240,7 @@ mod test {
     /// than only the active listing.
     fn tracked_stake_total(env: &Env, client: &LuminaRegistryClient) -> i128 {
         env.as_contract(&client.address, || {
-            let all: Vec<Address> = env.storage().instance()
-                .get(&DataKey::AllContracts)
-                .unwrap_or(Vec::new(env));
+            let all = LuminaRegistry::all_contracts(env);
             let mut total: i128 = 0;
             for contract_id in all.iter() {
                 total += env.storage().persistent()

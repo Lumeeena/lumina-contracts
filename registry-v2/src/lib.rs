@@ -96,8 +96,12 @@ pub enum DataKey {
     Contract(Address),
     /// List of contract addresses owned by an address.
     OwnerContracts(Address),
-    /// List of all registered contract addresses.
+    /// Legacy single-vector index kept only for migration compatibility.
     AllContracts,
+    /// Number of addresses in the chunked persistent global registration index.
+    AllContractsLength,
+    /// One chunk of the global registration index.
+    AllContractsPage(u32),
 }
 
 /// Upgraded v2 registry contract target used for upgrade testing.
@@ -163,21 +167,36 @@ impl LuminaRegistryV2 {
     /// real registry ever gains `count_active`, update this fixture instead.
     /// confirm the upgrade shipped new behaviour, not just a new version number.
     pub fn count_active(env: Env) -> u32 {
-        let all: Vec<Address> = env
+        let len: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::AllContracts)
-            .unwrap_or(Vec::new(&env));
+            .persistent()
+            .get(&DataKey::AllContractsLength)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::AllContracts)
+                    .map(|all: Vec<Address>| all.len())
+                    .unwrap_or(0)
+            });
 
         let mut active = 0u32;
-        for contract_id in all.iter() {
-            if let Some(entry) = env
+        let page_size = 64u32;
+        let pages = len.div_ceil(page_size);
+        for page in 0..pages {
+            let chunk: Vec<Address> = env
                 .storage()
                 .persistent()
-                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
-            {
-                if entry.active {
-                    active += 1;
+                .get(&DataKey::AllContractsPage(page))
+                .unwrap_or(Vec::new(&env));
+            for contract_id in chunk.iter() {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+                {
+                    if entry.active {
+                        active += 1;
+                    }
                 }
             }
         }
