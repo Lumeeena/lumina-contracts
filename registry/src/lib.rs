@@ -413,6 +413,7 @@ pub enum DataKey {
     OwnerContracts(Address),
     /// Vec<Address> — insertion-ordered list of every registered contract.
     AllContracts,
+    Expiry(Address),
 
     // ── Staking & reputation ────────────────────────────────────────────────
     /// Address — the SEP-41 token stakes are denominated in.
@@ -1221,6 +1222,7 @@ impl LuminaRegistry {
 
         env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
 
+        env.storage().persistent().set(&DataKey::Expiry(contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
         let mut owned = Self::owner_index(&env, &owner);
         owned.push_back(contract_id.clone());
         Self::set_owner_index(&env, &owner, &owned);
@@ -1304,6 +1306,7 @@ impl LuminaRegistry {
 
             env.storage().persistent().set(&DataKey::Contract(entry.contract_id.clone()), &contract_entry);
 
+            env.storage().persistent().set(&DataKey::Expiry(entry.contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
             let mut owned = Self::owner_index(&env, &owner);
             owned.push_back(entry.contract_id.clone());
             Self::set_owner_index(&env, &owner, &owned);
@@ -1618,7 +1621,7 @@ impl LuminaRegistry {
         while i < index.len() && result.len() < limit {
             if let Some(contract_id) = index.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(entry);
                     }
                 }
@@ -1657,7 +1660,7 @@ impl LuminaRegistry {
                     seen.push_back(contract_id.clone());
 
                     if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                        if entry.active {
+                        if Self::is_active_listing(&env, &entry) {
                             result.push_back(entry);
                         }
                     }
@@ -1791,7 +1794,7 @@ impl LuminaRegistry {
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
                             entry,
@@ -1841,12 +1844,22 @@ impl LuminaRegistry {
         let mut active: u32 = 0;
         for contract_id in all.iter() {
             if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
+                if Self::is_active_listing(&env, &entry) {
                     active += 1;
                 }
             }
         }
         active
+    }
+
+    fn is_active_listing(env: &Env, entry: &ContractEntry) -> bool {
+        if !entry.active {
+            return false;
+        }
+        let expiry: u32 = env.storage().persistent()
+            .get(&DataKey::Expiry(entry.contract_id.clone()))
+            .unwrap_or(entry.registered_at + EXPIRY_LEDGERS);
+        env.ledger().sequence() <= expiry
     }
 
     pub fn is_registered(env: Env, contract_id: Address) -> bool {
@@ -1862,7 +1875,7 @@ impl LuminaRegistry {
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(entry);
                     }
                 }
@@ -1883,7 +1896,7 @@ impl LuminaRegistry {
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(contract_id);
                     }
                 }
@@ -1903,7 +1916,7 @@ impl LuminaRegistry {
         while i < all.len() && entries.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         entries.push_back(entry);
                     }
                 }
@@ -1925,7 +1938,7 @@ impl LuminaRegistry {
         while i < all.len() && entries.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
                             entry,
@@ -1962,6 +1975,47 @@ impl LuminaRegistry {
 
     /// Update a registered contract's name and description.
     /// Only the current registered owner can call this.
+    /// Renew a registration, adding EXPIRY_LEDGERS to its expiration.
+    /// Only the registered owner can call this.
+    pub fn renew(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let expiry_key = DataKey::Expiry(contract_id.clone());
+        let current_expiry: u32 = env.storage().persistent()
+            .get(&expiry_key)
+            .unwrap_or(entry.registered_at + EXPIRY_LEDGERS);
+
+        if current_ledger > current_expiry {
+            env.events().publish(
+                (Symbol::new(&env, "contract_expired"),),
+                (contract_id.clone(), owner.clone(), current_expiry),
+            );
+        }
+
+        let new_expiry = current_ledger.max(current_expiry) + EXPIRY_LEDGERS;
+
+        env.storage().persistent().set(&expiry_key, &new_expiry);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_renewed"),),
+            (contract_id, owner, new_expiry),
+        );
+
+        Ok(())
+    }
     pub fn update_metadata(
         env: Env,
         owner: Address,
