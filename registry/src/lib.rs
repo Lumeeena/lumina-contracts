@@ -118,6 +118,9 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most `MAX_ATTESTATION_LABEL_LEN` bytes, or revoke an existing attestation first. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only the attester themselves can revoke; check `get_attestations` for the caller's address. |
+/// | 29 | `NotManager` | The caller is neither the registered owner nor the owner-appointed manager. | Call from the owner's address, or have the owner appoint the caller via `set_manager`. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -180,8 +183,6 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
-    /// The caller is neither the owner nor the manager for this registration.
-    NotManager          = 29,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────

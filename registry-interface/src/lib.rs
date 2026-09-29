@@ -97,6 +97,9 @@ pub trait RegistryInterface {
     /// Which build of the registry is live at this address.
     fn get_version(env: Env) -> u32;
 
+    /// The address an owner has delegated registration management to, if any.
+    fn get_manager(env: Env, contract_id: Address) -> Option<Address>;
+
     /// The first admin address. Errors with `NotInitialized` before the
     /// registry has been set up.
     fn get_admin(env: Env) -> Result<Address, RegistryError>;
@@ -118,14 +121,6 @@ pub trait RegistryInterface {
     /// Owner-set search tags for a registration. Empty for one that has none,
     /// or that was never registered.
     fn get_tags(env: Env, contract_id: Address) -> Vec<String>;
-
-    /// The manager address an owner has delegated registration management to,
-    /// or `None` if no delegation is active.
-    ///
-    /// A manager may update metadata and categories for the registration, but
-    /// cannot transfer ownership or withdraw stake. The owner can revoke at
-    /// any time, which takes effect immediately.
-    fn get_manager(env: Env, contract_id: Address) -> Option<Address>;
 
     /// One page of active registrations filed under `category`, in
     /// registration order.
@@ -303,10 +298,8 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
-    /// Caller is neither the registered owner nor the delegated manager.
+    /// Caller is not the registered owner nor its delegated manager.
     NotManager = 27,
-    /// A manager attempted an action reserved for the owner.
-    ManagerNotAuthorized = 28,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -325,6 +318,8 @@ pub struct ContractEntry {
     pub registered_at: u32,
     /// Whether indexing is currently active for this contract.
     pub active: bool,
+    /// Address the owner delegated registration management to, if any.
+    pub manager: Option<Address>,
 }
 
 /// Byte-compatible with `lumina_registry::Category`.
@@ -478,6 +473,4 @@ pub enum ProposalAction {
     ConfigureRegistrationRateLimit(u32, u32),
     /// Set the registration fee in the stake token; zero disables it.
     SetRegistrationFee(i128),
-    /// Set or clear the delegated manager for a registration. `None` revokes.
-    SetManager(Address, Option<Address>),
 }
