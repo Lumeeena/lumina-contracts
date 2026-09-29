@@ -218,15 +218,29 @@ registry can adopt staking after an upgrade instead of being redeployed.
 
 ## Build & Test
 
+Install GNU Make, the Rust stable toolchain, and the Soroban wasm target:
+
 ```bash
-cargo build --target wasm32v1-none --release
-cargo test
+rustup target add wasm32v1-none
+rustup component add rustfmt clippy
 ```
 
-The wasm build has to come first: the upgrade tests deploy the registry from its
-compiled wasm — the only form a Soroban upgrade can be performed on — and upgrade
-it to `registry-v2/`, a deliberately minimal second version that exists only as
-that test's upgrade target and is never deployed.
+Run the same full check used by CI, or run individual targets:
+
+```bash
+make check
+make build
+make test
+make fmt
+make clippy
+```
+
+`make test` builds the release wasm for the workspace before running tests. The
+upgrade tests deploy the registry from its compiled wasm — the only form a
+Soroban upgrade can be performed on — and upgrade it to `registry-v2/`, a
+deliberately minimal second version that exists only as that test's upgrade
+target and is never deployed. `make check` runs formatting and clippy checks
+before the build-and-test sequence.
 
 Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
@@ -236,13 +250,14 @@ emits the reference-types proposal, which the Soroban host refuses to load.
 [registry/interface.snap](./registry/interface.snap) is the registry's exported
 interface as read from the built wasm's contract spec: every function signature,
 struct, union, enum and error code, one per line and without doc comments.
-`cargo test` compares the current build against it, so CI fails on any change
+`make test` compares the current build against it, so CI fails on any change
 nobody reviewed, and the failure message lists the lines that changed.
 
 To accept an intended change, run one line after the wasm build and commit the
 updated snapshot along with the change:
 
 ```bash
+make build
 UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
 ```
 
