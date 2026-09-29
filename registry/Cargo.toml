@@ -23,3 +23,4 @@ soroban-sdk-env = { version = "22.0.0", features = ["testutils"] }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 soroban-spec = "22.0.11"
+proptest = "1.4.6"
