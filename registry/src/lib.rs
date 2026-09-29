@@ -391,6 +391,17 @@ pub const MAX_ATTESTATIONS_PER_CONTRACT: u32 = 20;
 /// Maximum length of an attestation label, in bytes.
 pub const MAX_ATTESTATION_LABEL_LEN: u32 = 64;
 
+/// Maximum number of slash records retained per registration.
+///
+/// `DataKey::Slashes(Address)` is rewritten in full on every slash, so an
+/// unbounded history would make each slash progressively more expensive and
+/// eventually push the entry past the storage limit — which would let the
+/// worst actors escape further slashing. Retaining only the most recent
+/// [`MAX_SLASH_HISTORY`] records bounds that cost. The aggregate
+/// `slashed_total` on [`Reputation`] is unaffected by pruning and stays
+/// accurate for the full lifetime of the registration.
+pub const MAX_SLASH_HISTORY: u32 = 20;
+
 /// Entry for batch registration.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -525,7 +536,9 @@ pub enum DataKey {
     Stake(Address),
     /// bool — governance-attested verified status.
     Verified(Address),
-    /// Vec<SlashRecord> — every slash ever levied, oldest first.
+    /// Vec<SlashRecord> — the most recent slashes levied, oldest first,
+    /// capped at [`MAX_SLASH_HISTORY`]. Older records are pruned; the
+    /// lifetime total lives in `Reputation::slashed_total`.
     Slashes(Address),
     /// u32 — ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),

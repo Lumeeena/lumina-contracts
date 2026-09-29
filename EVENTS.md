@@ -1,11 +1,11 @@
 # Registry Events Reference
 
-Events are the integration surface for downstream consumers, serving as the interface for both `lumina-backend`'s indexer and `lumina-frontend`'s registry history view.
+Events are the integration surface for downstream consumers, serving as the interface for both `lumina-backend`s indexer and `lumina-frontend`s registry history view.
 
 ## Downstream Consumers
 
-- **Registry History (`lumina-frontend`)**: The frontend's history view rebuilds the per-contract event timeline by matching on the **first topic** (which must be the event name) and treating the **first data slot** as the subject ID (`contract_id`). Any events matching this shape will be attributed to the respective contract's history. Unknown topics will still be displayed as generic "Registry event" rows.
-- **Indexer (`lumina-backend`)**: The backend indexer discovers contracts and listens to registry events to keep its database synchronized with the on-chain manifest. It specifically looks for registration, deactivation, and metadata/category changes to maintain an up-to-date registry graph.
+- `Registry History (`lumina-frontend`)`: The frontend's history view rebuilds the per-contract event timeline by matching on the **first topic** (which must be the event name) and treating the **first data slot** as the subject ID (`contract_id`). Any events matching this shape will be attributed to the respective contract's history. Unknown topics will still be displayed as generic "Registry event" rows.
+- `Indexer (`lumina-backend`)`: The backend indexer discovers contracts and listens to registry events to keep its database synchronized with the on-chain manifest. It specifically looks for registration, deactivation, and metadata/category changes to maintain an up-to-date registry graph.
 
 ## Events
 
@@ -37,3 +37,11 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `owner_allowlisted` | `(owner: Address, allowed: bool)` | When governance adds or removes an owner from the allowlist. | | `owner_can_be_added_to_allowlist` |
 | `registration_rate_limit_changed` | `(limit: u32, window: u32)` | When governance updates the rate limit parameters. | | `registration_rate_limit_can_be_changed` |
 | `registration_fee_set` | `(fee: i128,)` | When governance sets a flat fee for new registrations. | | `registration_fee_can_be_set` |
+
+## Slash History Retention
+
+Per-registration slash history is stored under `DataKey::Slashes(Address)` as a bounded `Vec<SlashRecord>`. To keep write cost bounded and prevent a registration from becoming unslashable due to an oversized history entry, the contract retains only the most recent `MAX_SLASH_HISTORY` records per registration.
+
+- **Cap**: @{MAX_SLASH_HISTORY} records are kept per registration. Once the cap is reached, each new slash appends its record and evicts the oldest retained record (FIFO).
+- **Aggregate accounding**: `slashed_total` is maintained as a separate running total and is *not* derived from the retained vector. Pruning older records therefore never changes the aggregate amount attributed to a registration.
+- **Events**: `stake_slashed` is emitted for every slash, including slashes whose record later gets evicted from the retained history. Downstream consumers that need the complete slash timeline should index the event stream rather than reading the on-chain `Slashes` vector.
