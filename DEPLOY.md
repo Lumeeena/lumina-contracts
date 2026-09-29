@@ -398,6 +398,25 @@ stellar contract invoke --id lumina-registry --source lumina-deployer \
 `get_version` should report the new value and the registrations should come back
 unchanged.
 
+### Staking survives upgrade
+
+Because `StakeToken`, `Treasury`, `PreviousStakeToken`, and `PreviousTreasury`
+are stored as `DataKey` entries in instance storage, they persist across a
+Soroban upgrade. The new code will decode these entries correctly as long as:
+
+- The `DataKey` enum variant names are preserved (adding new variants is safe,
+  renaming breaks entries)
+- The `Address` type shape is unchanged (it is — `#[contracttype]` Address is
+  just a 32-byte hash)
+
+What breaks it: changing the `StakeToken` or `Treasury` field types or removing
+the `DataKey` variants without a migration. The storage compatibility rules in
+the previous section apply.
+
+After an upgrade, callers can read the new staking config with
+`get_staking_config()` and see the `PreviousStakeToken`/`PreviousTreasury`
+values emitted by the `staking_configured` event if a reconfiguration occurred.
+
 ### Storage compatibility
 
 Because storage survives the swap, the new code has to decode entries the old
