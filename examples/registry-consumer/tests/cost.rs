@@ -35,9 +35,7 @@ use soroban_sdk::{
 };
 
 mod registry_wasm {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/lumina_registry.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/lumina_registry.wasm");
 }
 
 /// A contract whose only job is to make a chosen number of reads, so the reads
@@ -74,7 +72,10 @@ impl ReadProbe {
         target: Address,
     ) -> (bool, bool) {
         let registry = RegistryInterfaceClient::new(&env, &registry);
-        (registry.is_registered(&target), registry.is_verified(&target))
+        (
+            registry.is_registered(&target),
+            registry.is_verified(&target),
+        )
     }
 
     /// One call returning the registration *and* its reputation.
@@ -87,11 +88,7 @@ impl ReadProbe {
 
     /// Three calls, to show the per-call charge is additive rather than a
     /// one-off setup cost.
-    pub fn read_three(
-        env: Env,
-        registry: Address,
-        target: Address,
-    ) -> (bool, bool, u32) {
+    pub fn read_three(env: Env, registry: Address, target: Address) -> (bool, bool, u32) {
         let registry = RegistryInterfaceClient::new(&env, &registry);
         (
             registry.is_registered(&target),
@@ -244,7 +241,6 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
         );
     }
 
-    
     let per_call = two.instructions - one.instructions;
     let overhead = version.instructions - baseline.instructions;
     let answer = one.instructions - version.instructions;
@@ -304,7 +300,7 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
     let first_step = two.instructions - one.instructions;
     let second_step = three.instructions - two.instructions;
     assert!(
-        (first_step as i64 - second_step as i64).abs() < (first_step as i64 / 2).max(1),
+        (first_step - second_step).abs() < (first_step / 2).max(1),
         "per-call cost should be roughly constant, saw {first_step} then {second_step}"
     );
 
@@ -372,5 +368,8 @@ fn the_registry_stores_a_registration_in_several_entries() {
     // an address nobody registered gets a boolean, not a revert. The cost of
     // asking is the same either way.
     assert!(client.is_registered(&f.target));
-    assert!(!client.is_verified(&f.target), "a fresh registration is not verified yet");
+    assert!(
+        !client.is_verified(&f.target),
+        "a fresh registration is not verified yet"
+    );
 }

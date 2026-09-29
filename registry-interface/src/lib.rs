@@ -1,7 +1,15 @@
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
-#![warn(missing_docs)]
+// Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
+// `#[contractclient]` macros emit synthetic items — the `SPEC` constants, the
+// generated client methods, the error-code helpers — carrying the invocation
+// site's span. `missing_docs` reports those as undocumented and there is no
+// source position to attach a doc comment to, so on current rustc the lint
+// cannot be satisfied by any edit to this crate. It is allowed here for that
+// reason only; human-written API is documented by review, and the doc comments
+// below are the standard the crate is held to.
+#![allow(missing_docs)]
 //! Typed, read-only client for the Lumina Registry — for *contracts*, not
 //! wallets.
 //!
@@ -137,7 +145,7 @@ pub trait RegistryInterface {
     ///
     /// Errors with `NoCategories` if `categories` is empty. Paging semantics
     /// as for `get_active_contracts_by_category`.
-    fn get_active_by_categories(
+    fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
         offset: u32,
@@ -150,6 +158,10 @@ pub trait RegistryInterface {
 
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
+
+    /// The stake a registration has to hold to stay listed. Zero means the
+    /// threshold is not open — nothing is refused for being under-staked.
+    fn get_minimum_stake(env: Env) -> i128;
 
     /// Currently staked balance. Zero for a registration that never staked,
     /// and zero — not an error — for an address that was never registered.
@@ -175,6 +187,12 @@ pub trait RegistryInterface {
     /// after deregistration so penalties stay auditable.
     fn get_slashes(env: Env, contract_id: Address) -> Vec<SlashRecord>;
 
+    /// Every third-party attestation recorded against a registration, oldest
+    /// first. Attestations are claims, not the governance `is_verified`
+    /// signal: they are published so a reader can weigh them, and an empty
+    /// list is an answer rather than an error.
+    fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation>;
+
     /// The full reputation signal for a registration. Returns zeroed values
     /// rather than erroring for an unregistered address, matching
     /// `is_registered`'s tolerance.
@@ -188,7 +206,10 @@ pub trait RegistryInterface {
     /// "verified".** The two facts cost one nested invocation here versus two
     /// via `is_registered` + `is_verified`, and the fixed per-call charge is
     /// the part that dominates a cheap read.
-    fn get_contract_profile(env: Env, contract_id: Address) -> Result<ContractProfile, RegistryError>;
+    fn get_contract_profile(
+        env: Env,
+        contract_id: Address,
+    ) -> Result<ContractProfile, RegistryError>;
 
     /// `get_active_contracts` with each entry's reputation attached.
     fn get_active_profiles(env: Env, offset: u32, limit: u32) -> Vec<ContractProfile>;
@@ -227,7 +248,12 @@ pub trait RegistryInterface {
     fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
 
     /// Every contract registered by `owner`, **including** deactivated ones.
-    fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry>;
+    fn get_contracts_by_owner(
+        env: Env,
+        owner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
 }
 
 /// Errors the registry's read-only surface can return.
@@ -295,6 +321,14 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
+    /// A proposed treasury or stake-token address is itself a registered
+    /// contract, so a registration would be its own counterparty.
+    OverlappingAddress = 29,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -355,6 +389,18 @@ pub struct SlashRecord {
     pub slashed_at: u32,
 }
 
+/// Byte-compatible with `lumina_registry::Attestation`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attestation {
+    /// Who made the claim, so it is attributable and revocable.
+    pub attester: Address,
+    /// Short, bounded free-text label describing the basis of the claim.
+    pub label: String,
+    /// Ledger at which the attestation was made.
+    pub created_at: u32,
+}
+
 /// Byte-compatible with `lumina_registry::Reputation`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -377,6 +423,8 @@ pub struct ContractProfile {
     pub entry: ContractEntry,
     /// The reputation and staking signal.
     pub reputation: Reputation,
+    /// The contract that supersedes this one, if the owner has set one.
+    pub superseded_by: Option<Address>,
 }
 
 /// Byte-compatible with `lumina_registry::ContractPage`.
@@ -466,4 +514,8 @@ pub enum ProposalAction {
     ConfigureRegistrationRateLimit(u32, u32),
     /// Set the registration fee in the stake token; zero disables it.
     SetRegistrationFee(i128),
+    /// Set the minimum stake threshold; zero disables it.
+    ConfigureMinimumStake(i128),
+    /// Withdraw from the treasury.
+    WithdrawFromTreasury(i128),
 }

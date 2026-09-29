@@ -1,3 +1,8 @@
 [toolchain]
-channel = "1.81.0"
-targets = ["wasm32v1-none"]
+# 1.88 is the floor set by the locked dependencies (serde_with, darling); the
+# pin is a later stable that ships `wasm32v1-none`, which the workspace builds
+# and the upgrade tests import, as well as `wasm32-unknown-unknown`, which CI
+# builds alongside it to catch host-incompatible output (see README, "Build &
+# test").
+channel = "1.91.0"
+targets = ["wasm32v1-none", "wasm32-unknown-unknown"]
