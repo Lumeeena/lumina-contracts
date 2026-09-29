@@ -295,6 +295,26 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
+    /// The proposed treasury or stake-token address is itself a registered
+    /// contract.
+    OverlappingAddress = 29,
+    /// The admin set would have fewer than `MIN_ADMINS` members.
+    AdminSetTooSmall = 30,
+    /// The proposed address is already a member of the admin set.
+    AlreadyAdmin = 31,
+    /// The proposed address to remove is not a member of the admin set.
+    AdminNotFound = 32,
+    /// The proposed threshold is already the current threshold.
+    ThresholdAlreadySet = 33,
+    /// The proposed verification status matches the contract's current status.
+    AlreadyVerified = 34,
+    /// Staking is already configured with the proposed token and treasury.
+    StakingAlreadyConfigured = 35,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.

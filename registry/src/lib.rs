@@ -44,7 +44,10 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 7;
+
+/// Minimum number of admins required for multi-sig governance.
+pub const MIN_ADMINS: u32 = 2;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -118,6 +121,15 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or the registration already has the maximum number of attestations. | Shorten label or prune/revoke prior attestations. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Verify the attester address before calling revoke. |
+/// | 29 | `OverlappingAddress` | The proposed treasury or stake-token address is itself a registered contract. | Use a separate, dedicated treasury and token address. |
+/// | 30 | `AdminSetTooSmall` | The admin set would have fewer than `MIN_ADMINS` members. | Maintain at least `MIN_ADMINS` (2) admins in the multi-sig set. |
+/// | 31 | `AlreadyAdmin` | The proposed address is already a member of the admin set. | Propose a new, unadded admin address. |
+/// | 32 | `AdminNotFound` | The proposed address to remove is not in the admin set. | Specify an existing admin address from `get_admins`. |
+/// | 33 | `ThresholdAlreadySet` | The proposed threshold is already the current threshold. | Propose a threshold value different from the current one. |
+/// | 34 | `AlreadyVerified` | The proposed verification status matches the contract's current status. | Check `is_verified` before proposing a verification change. |
+/// | 35 | `StakingAlreadyConfigured` | Staking is already configured with the proposed token and treasury. | Propose a different token or treasury to update configuration. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -180,6 +192,21 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The proposed treasury or stake-token address is itself a registered
+    /// contract.
+    OverlappingAddress = 29,
+    /// The admin set would have fewer than `MIN_ADMINS` members.
+    AdminSetTooSmall = 30,
+    /// The proposed address is already a member of the admin set.
+    AlreadyAdmin = 31,
+    /// The proposed address to remove is not a member of the admin set.
+    AdminNotFound = 32,
+    /// The proposed threshold is already the current threshold.
+    ThresholdAlreadySet = 33,
+    /// The proposed verification status matches the contract's current status.
+    AlreadyVerified = 34,
+    /// Staking is already configured with the proposed token and treasury.
+    StakingAlreadyConfigured = 35,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -617,8 +644,11 @@ impl LuminaRegistry {
             return Err(RegistryError::AlreadyInitialized);
         }
 
-        if admins.is_empty()
-            || threshold == 0
+        if admins.len() < MIN_ADMINS {
+            return Err(RegistryError::AdminSetTooSmall);
+        }
+
+        if threshold == 0
             || threshold > admins.len()
         {
             return Err(RegistryError::InvalidThreshold);
@@ -685,6 +715,10 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if admins.contains(&new_admin) {
+            return Err(RegistryError::AlreadyAdmin);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -709,6 +743,10 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if !admins.contains(&admin_to_remove) {
+            return Err(RegistryError::AdminNotFound);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -732,6 +770,15 @@ impl LuminaRegistry {
         proposer.require_auth();
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
+
+        if new_threshold == 0 || new_threshold > admins.len() {
+            return Err(RegistryError::InvalidThreshold);
+        }
+
+        let current_threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
+        if new_threshold == current_threshold {
+            return Err(RegistryError::ThresholdAlreadySet);
+        }
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -806,6 +853,15 @@ impl LuminaRegistry {
             return Err(RegistryError::OverlappingAddress);
         }
 
+        if let (Some(cur_token), Some(cur_treasury)) = (
+            env.storage().instance().get::<DataKey, Address>(&DataKey::StakeToken),
+            env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury),
+        ) {
+            if cur_token == token && cur_treasury == treasury {
+                return Err(RegistryError::StakingAlreadyConfigured);
+            }
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -836,6 +892,13 @@ impl LuminaRegistry {
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
+        }
+
+        let current_verified = env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+            .unwrap_or(false);
+        if current_verified == verified {
+            return Err(RegistryError::AlreadyVerified);
         }
 
         let proposal_id = Self::create_proposal(
@@ -1063,15 +1126,16 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_approved"),),
-            (proposal_id, admin.clone(), proposal.approvals.len()),
+            (proposal_id, admin.clone(), proposal.approvals.len(), threshold),
         );
 
         // Transition to ready when threshold is first reached.
         if proposal.ready_at == u32::MAX && proposal.approvals.len() >= threshold {
             proposal.ready_at = env.ledger().sequence();
+            let executable_from = proposal.ready_at + TIMELOCK_LEDGERS;
             env.events().publish(
                 (Symbol::new(&env, "proposal_ready"),),
-                (proposal_id, proposal.ready_at),
+                (proposal_id, proposal.ready_at, executable_from),
             );
         }
 
@@ -2543,15 +2607,20 @@ impl LuminaRegistry {
                 let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
 
                 // After removal the set must still be large enough for the
-                // threshold to be satisfiable.
+                // threshold to be satisfiable and meet the minimum admin count.
                 let new_len = admins.len().saturating_sub(1);
                 if new_len < threshold {
                     return Err(RegistryError::InvalidThreshold);
+                }
+                if new_len < MIN_ADMINS {
+                    return Err(RegistryError::AdminSetTooSmall);
                 }
 
                 if let Some(i) = admins.first_index_of(admin_to_remove) {
                     admins.remove(i);
                     env.storage().instance().set(&DataKey::Admins, &admins);
+                } else {
+                    return Err(RegistryError::AdminNotFound);
                 }
                 env.events().publish(
                     (Symbol::new(env, "admin_removed"),),
@@ -5702,5 +5771,152 @@ mod test {
         let (env, client, _admin) = setup();
         let (_owner, target) = register_sample(&env, &client);
         assert_eq!(client.get_contract_profile(&target).superseded_by, None);
+    }
+
+    // ── Governance hardening (#40, #41, #42, #43) ───────────────────────────
+
+    // Issue 4: Require a minimum admin set size (#40)
+    #[test]
+    fn initialize_below_min_admins_is_refused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin);
+        // MIN_ADMINS is 2; passing 1 admin must fail with AdminSetTooSmall
+        let res = LuminaRegistry::initialize(env.clone(), admins, 1);
+        assert_eq!(res, Err(RegistryError::AdminSetTooSmall));
+    }
+
+    #[test]
+    fn remove_admin_breaching_min_admins_is_refused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&a1,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+
+        // Add second admin a2 so we have 2 admins with threshold 1
+        let add_a2 = client.propose_add_admin(&a1, &a2);
+        pass_proposal(&env, &client, &a1, add_a2);
+        assert_eq!(client.get_admins().len(), 2);
+        assert_eq!(client.get_threshold(), 1);
+
+        // Now propose removing a2. If executed, admin set would shrink to 1 (< MIN_ADMINS)
+        let pid = client.propose_remove_admin(&a1, &a2);
+        client.approve_proposal(&a1, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        let res = client.try_execute_proposal(&pid);
+        assert_eq!(res, Err(Ok(RegistryError::AdminSetTooSmall)));
+    }
+
+    // Issue 3: Prevent adding an admin that is already in the set (#41)
+    #[test]
+    fn propose_add_admin_rejects_existing_admin() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let res = client.try_propose_add_admin(&a1, &a1);
+        assert_eq!(res, Err(Ok(RegistryError::AlreadyAdmin)));
+    }
+
+    #[test]
+    fn propose_remove_admin_rejects_non_admin() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let stranger = Address::generate(&env);
+        let res = client.try_propose_remove_admin(&a1, &stranger);
+        assert_eq!(res, Err(Ok(RegistryError::AdminNotFound)));
+    }
+
+    // Issue 1: Reject proposals for actions that are already true (#43)
+    #[test]
+    fn propose_change_threshold_rejects_current_threshold() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let current_threshold = client.get_threshold();
+        let res = client.try_propose_change_threshold(&a1, &current_threshold);
+        assert_eq!(res, Err(Ok(RegistryError::ThresholdAlreadySet)));
+    }
+
+    #[test]
+    fn propose_set_verified_rejects_noop() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        // Target is initially unverified (false). Proposing false should fail.
+        assert!(!client.is_verified(&target));
+        let res_false = client.try_propose_set_verified(&a1, &target, &false);
+        assert_eq!(res_false, Err(Ok(RegistryError::AlreadyVerified)));
+
+        // Propose true and execute it
+        let pid = client.propose_set_verified(&a1, &target, &true);
+        client.approve_proposal(&a1, &pid);
+        let a2 = client.get_admins().get(1).unwrap();
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+        assert!(client.is_verified(&target));
+
+        // Now that it is verified, proposing true should fail.
+        let res_true = client.try_propose_set_verified(&a1, &target, &true);
+        assert_eq!(res_true, Err(Ok(RegistryError::AlreadyVerified)));
+    }
+
+    #[test]
+    fn propose_configure_staking_rejects_noop() {
+        let (env, client, admin) = setup();
+        let token_id = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Staking is now configured with token_id and treasury. Proposing identical config must fail.
+        let res = client.try_propose_configure_staking(&admin, &token_id, &treasury);
+        assert_eq!(res, Err(Ok(RegistryError::StakingAlreadyConfigured)));
+    }
+
+    // Issue 2: Emit an event when a proposal's approvals change the ready state (#42)
+    #[test]
+    fn proposal_approved_and_ready_events_include_extended_state() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+        let pid = client.propose_deactivate(&a1, &target);
+
+        // Approve by a1 (approval count = 1, threshold = 2). Does not reach threshold yet.
+        client.approve_proposal(&a1, &pid);
+
+        // Check proposal_approved event
+        let approved_topic = Symbol::new(&env, "proposal_approved");
+        let mut approved_events = Vec::new(&env);
+        for (_emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(&env, &t).ok());
+            if first == Some(approved_topic.clone()) {
+                approved_events.push_back(data);
+            }
+        }
+        assert_eq!(approved_events.len(), 1);
+        let (ev_pid, ev_admin, ev_approvals, ev_threshold): (u32, Address, u32, u32) =
+            approved_events.get(0).unwrap().into_val(&env);
+        assert_eq!(ev_pid, pid);
+        assert_eq!(ev_admin, a1);
+        assert_eq!(ev_approvals, 1);
+        assert_eq!(ev_threshold, 2);
+
+        // Now second approval by a2 triggers threshold (ready)
+        client.approve_proposal(&a2, &pid);
+
+        let ready_topic = Symbol::new(&env, "proposal_ready");
+        let mut ready_events = Vec::new(&env);
+        for (_emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(&env, &t).ok());
+            if first == Some(ready_topic.clone()) {
+                ready_events.push_back(data);
+            }
+        }
+        assert_eq!(ready_events.len(), 1);
+        let (r_pid, ready_at, executable_from): (u32, u32, u32) =
+            ready_events.get(0).unwrap().into_val(&env);
+        assert_eq!(r_pid, pid);
+        assert_eq!(executable_from, ready_at + TIMELOCK_LEDGERS);
     }
 }
