@@ -8,6 +8,10 @@ Part of the Lumina project, split across three repos:
 - [lumina-backend](https://github.com/Lumeeena/lumina-backend) — indexer + GraphQL API + PostgreSQL schema
 - [lumina-contracts](https://github.com/Lumeeena/lumina-contracts) — this repo
 
+For a contributor-oriented map of storage, governance, registration, staking,
+slashing, and the invariants protected by the test suite, see
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ## Where the registry fits
 
 Lumina indexes Soroban contract events, but an indexer has to know *which*
@@ -386,4 +390,3 @@ This repository maintains a minimal dependency surface to minimize attack vector
 ## License
 
 MIT
-

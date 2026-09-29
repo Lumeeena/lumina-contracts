@@ -64,6 +64,37 @@ jobs:
       # Runs formatting, lint, wasm build, and the full test suite.
       - run: make check
 
+  wasm-size:
+    name: Wasm Size Budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - name: Build wasm
+        run: cargo build --release --target wasm32v1-none -p lumina_registry
+      - name: Check wasm size budget
+        run: |
+          wasm=target/wasm32v1-none/release/lumina_registry.wasm
+          if [ ! -f "$wasm" ]; then
+            echo "::error::expected wasm artifact not found at $wasm"
+            exit 1
+          fi
+          actual=$(stat -c %s "$wasm")
+          budget_file=.github/wasm-size-budget
+          if [ ! -f "$budget_file" ]; then
+            echo "::error::missing wasm size budget file at $budget_file"
+            exit 1
+          fi
+          budget=$(tr -d '[:space:]' < "$budget_file")
+          echo "wasm size: ${actual} bytes (budget: ${budget} bytes)"
+          if [ "$actual" -gt "$budget" ]; then
+            echo "::error::lumina_registry.wasm is ${actual} bytes, exceeding the ${budget} byte budget."
+            echo "Reduce the contract size or update $budget_file deliberately."
+            exit 1
+          fi
+
   registry-v2-fixture:
     name: Registry v2 Fixture
     runs-on: ubuntu-latest

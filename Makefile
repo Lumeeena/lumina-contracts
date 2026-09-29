@@ -27,6 +27,17 @@ fmt:
 	$(CARGO) fmt --all -- --check
 
 clippy:
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets - -D warnings
 
-check: fmt clippy test
+check: fmt clippy test wasm-size
+
+wasm-size: build
+	# Measure the compiled contract wasm size and enforce the committed budget.
+	@actual=$$($wc -c < "$(WASM_PATH)" | tr -d ' [:space:]'); \
+	  echo "$actual"); \
+	budget=$$(grep -v '^[^0-9]*' "$(WASM_SIZE_BUDGET_FILE)" | head -n 1 | tr -d ' \r\n'); \
+	echo "WASM size: $actual bytes (budget: $budget bytes)"; \
+	if [ "$actual" -gt "$budget" ]; then \
+	  echo "ERROR: WASM size $actual bytes exceeds budget $budget bytes" >&2; \
+	  exit 1; \
+	fi
