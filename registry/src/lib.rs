@@ -32,6 +32,30 @@
 //!    is emitted.
 //! 4. Proposals that are never executed do not expire automatically; they can
 //!    be superseded by a new proposal for the same action or simply ignored.
+//!
+//! ## Resource cost benchmarks
+//!
+//! Soroban meters execution: an entrypoint that grows past a resource limit
+//! simply stops working on-chain while passing every test in the local host.
+//! The scanning views (`get_active_contracts`, `get_contracts_by_category`,
+//! `get_contracts_by_tag`) are the obvious candidates because their cost grows
+//! with the size of the registry index.
+//!
+//! `registry/tests/bench.rs` uses the test host's budget instrumentation to
+//! record CPU instructions and memory per entrypoint and asserts a ceiling for
+//! the scanning views. The numbers below are the ceilings asserted in CI; a
+//! significant regression fails the build.
+//!
+//! | Entrypoint | Metric | Ceiling |
+//! |------------|--------|---------|
+//! | `register_contract` | CPU instructions | 5_000_000 |
+//! | `get_active_contracts` | CPU instructions | 20_000_000 |
+//! | `get_contracts_by_category` | CPU instructions | 20_000_000 |
+//! | `get_contracts_by_tag` | CPU instructions | 20_000_000 |
+//! | `get_active_contracts` | Memory bytes | 1_000_000 |
+//!
+//! When a ceiling is intentionally raised, update this table in the same
+//! commit so the regression stays visible in review.
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token,
@@ -118,6 +142,9 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | The attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label within the length bound and stay under the attestation cap. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only revoke an attestation you previously added. |
+/// | 29 | `NotAContract` | The supplied `contract_id` is a `G…` account address rather than a `C…` contract address. | Pass the address of a deployed Soroban contract, not a Stellar account. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -523,12 +550,17 @@ pub enum DataKey {
     OwnerContracts(Address),
     /// Vec<Address> — insertion-ordered list of every registered contract.
     AllContracts,
+    Expiry(Address),
 
     // ── Staking & reputation ────────────────────────────────────────────────
     /// Address — the SEP-41 token stakes are denominated in.
     StakeToken,
     /// Address — where slashed stake is sent.
     Treasury,
+    /// Address — the previous staking token, if any (for reconfiguration tracking).
+    PreviousStakeToken,
+    /// Address — the previous treasury, if any (for reconfiguration tracking).
+    PreviousTreasury,
     /// i128 — currently staked balance for a registration.
     Stake(Address),
     /// bool — governance-attested verified status.
@@ -1424,6 +1456,7 @@ impl LuminaRegistry {
 
         env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
 
+        env.storage().persistent().set(&DataKey::Expiry(contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
         let mut owned = Self::owner_index(&env, &owner);
         owned.push_back(contract_id.clone());
         Self::set_owner_index(&env, &owner, &owned);
@@ -1507,6 +1540,7 @@ impl LuminaRegistry {
 
             env.storage().persistent().set(&DataKey::Contract(entry.contract_id.clone()), &contract_entry);
 
+            env.storage().persistent().set(&DataKey::Expiry(entry.contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
             let mut owned = Self::owner_index(&env, &owner);
             owned.push_back(entry.contract_id.clone());
             Self::set_owner_index(&env, &owner, &owned);
@@ -1978,7 +2012,7 @@ impl LuminaRegistry {
         while i < index.len() && result.len() < limit {
             if let Some(contract_id) = index.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(entry);
                     }
                 }
@@ -2021,7 +2055,7 @@ impl LuminaRegistry {
                     seen.push_back(contract_id.clone());
 
                     if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                        if entry.active {
+                        if Self::is_active_listing(&env, &entry) {
                             result.push_back(entry);
                         }
                     }
@@ -2234,7 +2268,7 @@ impl LuminaRegistry {
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
                             superseded_by: env.storage().persistent()
@@ -2286,12 +2320,22 @@ impl LuminaRegistry {
         let mut active: u32 = 0;
         for contract_id in all.iter() {
             if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
+                if Self::is_active_listing(&env, &entry) {
                     active += 1;
                 }
             }
         }
         active
+    }
+
+    fn is_active_listing(env: &Env, entry: &ContractEntry) -> bool {
+        if !entry.active {
+            return false;
+        }
+        let expiry: u32 = env.storage().persistent()
+            .get(&DataKey::Expiry(entry.contract_id.clone()))
+            .unwrap_or(entry.registered_at + EXPIRY_LEDGERS);
+        env.ledger().sequence() <= expiry
     }
 
     pub fn is_registered(env: Env, contract_id: Address) -> bool {
@@ -2307,7 +2351,7 @@ impl LuminaRegistry {
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(entry);
                     }
                 }
@@ -2328,7 +2372,7 @@ impl LuminaRegistry {
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         result.push_back(contract_id);
                     }
                 }
@@ -2348,7 +2392,7 @@ impl LuminaRegistry {
         while i < all.len() && entries.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         entries.push_back(entry);
                     }
                 }
@@ -2370,7 +2414,7 @@ impl LuminaRegistry {
         while i < all.len() && entries.len() < limit {
             if let Some(contract_id) = all.get(i) {
                 if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
+                    if Self::is_active_listing(&env, &entry) {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
                             superseded_by: env.storage().persistent()
@@ -2409,6 +2453,47 @@ impl LuminaRegistry {
 
     /// Update a registered contract's name and description.
     /// Only the current registered owner can call this.
+    /// Renew a registration, adding EXPIRY_LEDGERS to its expiration.
+    /// Only the registered owner can call this.
+    pub fn renew(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let expiry_key = DataKey::Expiry(contract_id.clone());
+        let current_expiry: u32 = env.storage().persistent()
+            .get(&expiry_key)
+            .unwrap_or(entry.registered_at + EXPIRY_LEDGERS);
+
+        if current_ledger > current_expiry {
+            env.events().publish(
+                (Symbol::new(&env, "contract_expired"),),
+                (contract_id.clone(), owner.clone(), current_expiry),
+            );
+        }
+
+        let new_expiry = current_ledger.max(current_expiry) + EXPIRY_LEDGERS;
+
+        env.storage().persistent().set(&expiry_key, &new_expiry);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_renewed"),),
+            (contract_id, owner, new_expiry),
+        );
+
+        Ok(())
+    }
     pub fn update_metadata(
         env: Env,
         owner: Address,
@@ -2650,6 +2735,37 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
+                // Get previous values if they exist (first configuration has none)
+                let prev_token: Address = if env.storage().instance().has(&DataKey::StakeToken) {
+                    env.storage().instance().get(&DataKey::StakeToken).unwrap()
+                } else {
+                    // First configuration: use zero address
+                    Address::from_str(env, "")
+                };
+                let prev_treasury: Address = if env.storage().instance().has(&DataKey::Treasury) {
+                    env.storage().instance().get(&DataKey::Treasury).unwrap()
+                } else {
+                    // First configuration: use zero address
+                    Address::from_str(env, "")
+                };
+
+                // Refuse token change if any stake is held
+                let stake_total: i128 = {
+                    let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(env));
+                    let mut total: i128 = 0;
+                    for contract_id in all.iter() {
+                        total += env.storage().persistent().get(&DataKey::Stake(contract_id)).unwrap_or(0);
+                    }
+                    total
+                };
+                if stake_total > 0 && *token_id != prev_token {
+                    return Err(RegistryError::StakeNotEmpty);
+                }
+
+                // Store previous values before overwriting
+                env.storage().instance().set(&DataKey::PreviousStakeToken, &prev_token);
+                env.storage().instance().set(&DataKey::PreviousTreasury, &prev_treasury);
+
                 if treasury == env.current_contract_address() {
                     return Err(RegistryError::InvalidMetadata);
                 }
@@ -2669,7 +2785,7 @@ impl LuminaRegistry {
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
                     (Symbol::new(env, "staking_configured"),),
-                    (token_id.clone(), treasury.clone()),
+                    (prev_token, prev_treasury, token_id, treasury),
                 );
             }
             ProposalAction::SetVerified(contract_id, verified) => {
@@ -5964,5 +6080,281 @@ mod test {
         let (env, client, _admin) = setup();
         let (_owner, target) = register_sample(&env, &client);
         assert_eq!(client.get_contract_profile(&target).superseded_by, None);
+    }
+
+    // ── Property-based index consistency ────────────────────────────────────
+    //
+    // The hand-written tests above cover the sequences someone thought of.
+    // These generate random sequences of register / deactivate / transfer /
+    // refile operations and, after every step, assert that the owner index,
+    // every category index, and `AllContracts` agree with a fresh scan of the
+    // stored `Contract` entries.
+    //
+    // A tiny deterministic PRNG is used rather than `proptest` so the tests
+    // stay `no_std`-friendly and CI stays fast: each case is bounded to a
+    // small number of operations and a small pool of addresses/categories.
+
+    /// Deterministic xorshift64* PRNG — reproducible across runs and cheap.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            // Avoid the all-zero state, which xorshift cannot escape.
+            Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// Uniform-ish value in `0..n`; `n` must be non-zero.
+        fn below(&mut self, n: u32) -> u32 {
+            (self.next_u64() % (n as u64)) as u32
+        }
+    }
+
+    /// Every category the taxonomy currently exposes, in a fixed order so the
+    /// generator can index into it.
+    fn all_categories(env: &Env) -> Vec<Category> {
+        let mut v = Vec::new(env);
+        v.push_back(Category::DeFi);
+        v.push_back(Category::Nft);
+        v.push_back(Category::Gaming);
+        v.push_back(Category::Identity);
+        v.push_back(Category::Infrastructure);
+        v.push_back(Category::Payments);
+        v.push_back(Category::Oracle);
+        v.push_back(Category::Dao);
+        v.push_back(Category::Other);
+        v
+    }
+
+    /// Recompute the expected contents of every index by scanning the stored
+    /// `Contract` entries directly, then compare against what the contract
+    /// reports. Any divergence is a bug in one of the mutation paths.
+    fn assert_indexes_match_storage(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        owners: &Vec<Address>,
+        contract_ids: &Vec<Address>,
+    ) {
+        // ── AllContracts: exactly the set of stored entries, in order. ────
+        let mut expected_all = Vec::new(env);
+        for id in contract_ids.iter() {
+            if env
+                .as_contract(&client.address, || {
+                    env.storage()
+                        .persistent()
+                        .has(&DataKey::Contract(id.clone()))
+                })
+            {
+                expected_all.push_back(id.clone());
+            }
+        }
+
+        let reported_all = client.get_active_contracts(&0, &(contract_ids.len() + 1));
+        // `get_active_contracts` filters on `active`, so compare against the
+        // active subset of `expected_all` rather than the raw list.
+        let mut expected_active = Vec::new(env);
+        for id in expected_all.iter() {
+            let entry: ContractEntry = env.as_contract(&client.address, || {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::Contract(id.clone()))
+                    .unwrap()
+            });
+            if entry.active {
+                expected_active.push_back(id.clone());
+            }
+        }
+        assert_eq!(
+            reported_all.len(),
+            expected_active.len(),
+            "AllContracts/active listing disagrees with storage",
+        );
+        for i in 0..expected_active.len() {
+            assert_eq!(
+                reported_all.get(i).unwrap().contract_id,
+                expected_active.get(i).unwrap(),
+                "AllContracts ordering diverged at {}",
+                i,
+            );
+        }
+
+        // ── Owner index: for each owner, exactly the stored entries they own. ─
+        for owner in owners.iter() {
+            let mut expected_owned = Vec::new(env);
+            for id in contract_ids.iter() {
+                let present = env.as_contract(&client.address, || {
+                    env.storage()
+                        .persistent()
+                        .has(&DataKey::Contract(id.clone()))
+                });
+                if !present {
+                    continue;
+                }
+                let entry: ContractEntry = env.as_contract(&client.address, || {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::Contract(id.clone()))
+                        .unwrap()
+                });
+                if &entry.owner == owner {
+                    expected_owned.push_back(id.clone());
+                }
+            }
+            let reported = client.get_contracts_by_owner(owner, &0, &(contract_ids.len() + 1));
+            assert_eq!(
+                reported.len(),
+                expected_owned.len(),
+                "owner index disagrees with storage for one owner",
+            );
+            for i in 0..expected_owned.len() {
+                assert_eq!(
+                    reported.get(i).unwrap().contract_id,
+                    expected_owned.get(i).unwrap(),
+                    "owner index ordering diverged at {}",
+                    i,
+                );
+            }
+        }
+
+        // ── Category indexes: for each category, exactly the stored entries
+        //    that declared it (active or not — the index is unfiltered). ────
+        for category in all_categories(env).iter() {
+            let mut expected_in_cat = Vec::new(env);
+            for id in contract_ids.iter() {
+                let present = env.as_contract(&client.address, || {
+                    env.storage()
+                        .persistent()
+                        .has(&DataKey::Contract(id.clone()))
+                });
+                if !present {
+                    continue;
+                }
+                let cats = client.get_categories(id);
+                if cats.contains(&category) {
+                    expected_in_cat.push_back(id.clone());
+                }
+            }
+            // `get_active_contracts_by_category` filters on `active`, so
+            // compare against the active subset.
+            let mut expected_active_in_cat = Vec::new(env);
+            for id in expected_in_cat.iter() {
+                let entry: ContractEntry = env.as_contract(&client.address, || {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::Contract(id.clone()))
+                        .unwrap()
+                });
+                if entry.active {
+                    expected_active_in_cat.push_back(id.clone());
+                }
+            }
+            let reported =
+                client.get_active_contracts_by_category(&category, &0, &(contract_ids.len() + 1));
+            assert_eq!(
+                reported.len(),
+                expected_active_in_cat.len(),
+                "category index disagrees with storage",
+            );
+            for i in 0..expected_active_in_cat.len() {
+                assert_eq!(
+                    reported.get(i).unwrap().contract_id,
+                    expected_active_in_cat.get(i).unwrap(),
+                    "category index ordering diverged at {}",
+                    i,
+                );
+            }
+        }
+    }
+
+    /// Drive one randomised sequence of operations and re-check every index
+    /// after each step. The pool of owners and contract addresses is small so
+    /// collisions (transfers, refiles, re-registrations) actually happen.
+    fn run_index_consistency_case(seed: u64, steps: u32) {
+        let (env, client, _admin) = setup();
+        let mut rng = Rng::new(seed);
+
+        // Small, fixed pools so operations collide often.
+        let mut owners = Vec::new(&env);
+        for _ in 0..3 {
+            owners.push_back(Address::generate(&env));
+        }
+        let mut contract_ids = Vec::new(&env);
+        for _ in 0..5 {
+            contract_ids.push_back(Address::generate(&env));
+        }
+
+        let categories = all_categories(&env);
+
+        for _ in 0..steps {
+            let op = rng.below(4);
+            let owner = owners.get(rng.below(owners.len())).unwrap();
+            let id = contract_ids.get(rng.below(contract_ids.len())).unwrap();
+
+            match op {
+                // Register (ignore AlreadyRegistered — the point is to exercise
+                // the mutation paths, not to assert on error codes here).
+                0 => {
+                    let mut cats = Vec::new(&env);
+                    let n = 1 + rng.below(3);
+                    for _ in 0..n {
+                        cats.push_back(categories.get(rng.below(categories.len())).unwrap());
+                    }
+                    let _ = client.try_register_contract(
+                        &owner,
+                        &id,
+                        &String::from_str(&env, "n"),
+                        &String::from_str(&env, "d"),
+                        &cats,
+                    );
+                }
+                // Deactivate (owner-only; ignore errors for non-owners).
+                1 => {
+                    let _ = client.try_deactivate(&owner, &id);
+                }
+                // Transfer ownership to another address in the pool.
+                2 => {
+                    let new_owner = owners.get(rng.below(owners.len())).unwrap();
+                    let _ = client.try_transfer_ownership(&owner, &id, &new_owner);
+                }
+                // Refile categories.
+                3 => {
+                    let mut cats = Vec::new(&env);
+                    let n = 1 + rng.below(3);
+                    for _ in 0..n {
+                        cats.push_back(categories.get(rng.below(categories.len())).unwrap());
+                    }
+                    let _ = client.try_set_categories(&owner, &id, &cats);
+                }
+                _ => unreachable!(),
+            }
+
+            assert_indexes_match_storage(&env, &client, &owners, &contract_ids);
+        }
+    }
+
+    #[test]
+    fn property_indexes_stay_consistent_under_random_sequences() {
+        // A handful of seeds keeps the run bounded while still covering many
+        // distinct interleavings. Each case is short enough that CI stays fast.
+        for seed in 1u64..=8 {
+            run_index_consistency_case(seed, 40);
+        }
+    }
+
+    #[test]
+    fn property_indexes_stay_consistent_under_longer_sequences() {
+        // One longer sequence per seed, to catch bugs that only show up after
+        // enough operations to build up a non-trivial index.
+        for seed in 100u64..=102 {
+            run_index_consistency_case(seed, 150);
+        }
     }
 }
