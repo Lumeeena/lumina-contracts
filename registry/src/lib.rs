@@ -735,9 +735,7 @@ impl LuminaRegistry {
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
         }
-        if amount <= 0 {
-            return Err(RegistryError::InvalidAmount);
-        }
+        Self::validate_positive_amount(amount)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -1448,9 +1446,7 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
-        if amount <= 0 {
-            return Err(RegistryError::InvalidAmount);
-        }
+        Self::validate_positive_amount(amount)?;
 
         let entry: ContractEntry = env.storage().persistent()
             .get(&DataKey::Contract(contract_id.clone()))
@@ -2237,9 +2233,7 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::Slash(contract_id, amount, reason) => {
-                if *amount <= 0 {
-                    return Err(RegistryError::InvalidAmount);
-                }
+                Self::validate_positive_amount(*amount)?;
 
                 let staked = Self::stake_of(env, contract_id);
                 if staked < *amount {
@@ -2331,6 +2325,13 @@ impl LuminaRegistry {
             .get(&DataKey::Treasury)
             .ok_or(RegistryError::StakingNotConfigured)?;
         Ok((token_id, treasury))
+    }
+
+    fn validate_positive_amount(amount: i128) -> Result<(), RegistryError> {
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        Ok(())
     }
 
     fn stake_of(env: &Env, contract_id: &Address) -> i128 {
