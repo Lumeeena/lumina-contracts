@@ -118,6 +118,9 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | The attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label within the length bound and stay under the attestation cap. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only revoke an attestation you previously added. |
+/// | 29 | `NotAContract` | The supplied `contract_id` is a `G…` account address rather than a `C…` contract address. | Pass the address of a deployed Soroban contract, not a Stellar account. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -180,6 +183,9 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The supplied `contract_id` is not a contract address (it is a `G…`
+    /// account address).
+    NotAContract = 29,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────

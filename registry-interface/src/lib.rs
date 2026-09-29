@@ -80,6 +80,12 @@ use soroban_sdk::{contractclient, contracterror, contracttype, Address, Env, Str
 /// ever needs to *read* the registry should depend on this trait rather than
 /// on the contract crate.
 ///
+/// Every `contract_id` parameter is a **contract** address (`C…`), never a
+/// wallet/account address (`G…`). Registration rejects `G…` addresses, so a
+/// `G…` passed to any of these reads is simply not registered. This is the
+/// invariant that lets a consumer build an indexer filter over the registered
+/// set without first filtering out accounts itself.
+///
 /// Methods are listed in the same order as the registry's own view section.
 /// Two of them carry paging semantics that are easy to get wrong, and they are
 /// called out on the methods themselves:
@@ -164,6 +170,13 @@ pub trait RegistryInterface {
     /// This is the cheapest question to ask the registry: one `has` against one
     /// persistent entry, no decoding. Prefer it whenever the answer is a
     /// yes/no gate and the details are not needed.
+    ///
+    /// `contract_id` is a contract address (`C…`); a `G…` account address is
+    /// never registered and returns `false`. Registration refuses `G…`
+    /// addresses, so a `G…` in the registry is not a state this read can
+    /// observe — the downstream `isContractAddress` filter that
+    /// `lumina-backend/indexer/src/index.ts` had to add is unnecessary against
+    /// a registry that enforces this.
     fn is_registered(env: Env, contract_id: Address) -> bool;
 
     /// Aggregate counters: lifetime, active and verified totals, plus the

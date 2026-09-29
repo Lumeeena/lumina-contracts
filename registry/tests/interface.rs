@@ -1,3 +1,7 @@
+//! NOTE: `lumina-backend/indexer/src/index.ts` carries an `isContractAddress`
+//! workaround for `G…` addresses that the registry should never have accepted.
+//! Registration now rejects non-contract addresses, so that filter is no longer
+//! needed.
 //! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
 //!
 //! The interface — every exported function signature and every type and error
