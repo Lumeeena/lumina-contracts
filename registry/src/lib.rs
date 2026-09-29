@@ -354,6 +354,10 @@ pub enum ProposalAction {
     ConfigureRegistrationRateLimit(u32, u32),
     /// Set the registration fee in the stake token; zero disables it.
     SetRegistrationFee(i128),
+    /// Set the minimum stake threshold; zero disables it.
+    ConfigureMinimumStake(i128),
+    /// Withdraw from the treasury.
+    WithdrawFromTreasury(i128),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -427,6 +431,8 @@ pub enum DataKey {
     Slashes(Address),
     /// u32 — ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),
+    /// i128 — minimum stake threshold; zero disables it.
+    MinimumStake,
 
     // ── Category taxonomy ───────────────────────────────────────────────────
     /// Vec<Category> — the categories a registration declared, deduplicated.
@@ -838,6 +844,52 @@ impl LuminaRegistry {
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (proposal_id, proposer, Symbol::new(&env, "set_registration_fee"), fee),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Set the minimum stake threshold. Zero disables it (no minimum).
+    pub fn propose_configure_minimum_stake(
+        env: Env,
+        proposer: Address,
+        minimum: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if minimum < 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::ConfigureMinimumStake(minimum),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "configure_minimum_stake"), minimum),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Propose withdrawing from the treasury.
+    pub fn propose_withdraw_from_treasury(
+        env: Env,
+        proposer: Address,
+        amount: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::WithdrawFromTreasury(amount),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "withdraw_from_treasury"), amount),
         );
         Ok(proposal_id)
     }
@@ -1471,11 +1523,20 @@ impl LuminaRegistry {
             &amount,
         );
 
-        let staked = Self::stake_of(&env, &contract_id) + amount;
+        let old_stake = Self::stake_of(&env, &contract_id);
+        let staked = old_stake + amount;
         env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &staked);
 
         let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalStaked, &(total_staked + amount));
+
+        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        if minimum > 0 && old_stake < minimum && staked >= minimum {
+            env.events().publish(
+                (Symbol::new(&env, "stake_crossed_minimum"),),
+                (contract_id.clone(), staked, minimum, Symbol::new(&env, "above")),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
@@ -1537,6 +1598,14 @@ impl LuminaRegistry {
 
         let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+
+        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        if minimum > 0 && staked >= minimum && 0 < minimum {
+            env.events().publish(
+                (Symbol::new(&env, "stake_crossed_minimum"),),
+                (contract_id.clone(), 0i128, minimum, Symbol::new(&env, "below")),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
@@ -1687,6 +1756,11 @@ impl LuminaRegistry {
     /// The current registration fee. Zero means registration is free.
     pub fn get_registration_fee(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0)
+    }
+
+    /// The current minimum stake threshold. Zero means no minimum.
+    pub fn get_minimum_stake(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0)
     }
 
     /// Currently staked balance. Zero for a registration that never staked.
@@ -2206,6 +2280,10 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
+                if treasury == env.current_contract_address() {
+                    return Err(RegistryError::InvalidMetadata);
+                }
+                let _ = token::Client::new(env, token_id).decimals();
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
@@ -2254,11 +2332,20 @@ impl LuminaRegistry {
                     amount,
                 );
 
+                let new_stake = staked - *amount;
                 env.storage().persistent()
-                    .set(&DataKey::Stake(contract_id.clone()), &(staked - *amount));
+                    .set(&DataKey::Stake(contract_id.clone()), &new_stake);
 
-                let total_staked: i128 = env.storage().persistent().get(&DataKey::TotalStaked).unwrap_or(0);
+                let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
                 env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - *amount));
+
+                let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+                if minimum > 0 && staked >= minimum && new_stake < minimum {
+                    env.events().publish(
+                        (Symbol::new(env, "stake_crossed_minimum"),),
+                        (contract_id.clone(), new_stake, minimum, Symbol::new(env, "below")),
+                    );
+                }
 
                 let slashed_at = env.ledger().sequence();
                 let mut history = Self::slash_history(env, contract_id);
@@ -2315,6 +2402,31 @@ impl LuminaRegistry {
                 env.events().publish(
                     (Symbol::new(env, "registration_fee_set"),),
                     (*fee,),
+                );
+            }
+            ProposalAction::ConfigureMinimumStake(minimum) => {
+                if *minimum < 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                env.storage().instance().set(&DataKey::MinimumStake, minimum);
+                env.events().publish(
+                    (Symbol::new(env, "minimum_stake_set"),),
+                    (*minimum,),
+                );
+            }
+            ProposalAction::WithdrawFromTreasury(amount) => {
+                if *amount <= 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                let (token_id, treasury) = Self::staking_config(env)?;
+                token::Client::new(env, &token_id).transfer(
+                    &treasury,
+                    &env.current_contract_address(),
+                    amount,
+                );
+                env.events().publish(
+                    (Symbol::new(env, "treasury_withdrawn"),),
+                    (*amount,),
                 );
             }
         }
@@ -4817,5 +4929,181 @@ mod test {
         assert_eq!(client.get_contract_count(), 1);
         assert_eq!(client.get_total_registered(), 2);
         assert_eq!(client.get_active_contract_count(), 1);
+    }
+
+    // ── Issue #50: Treasury withdrawal ──────────────────────────────────────
+
+    #[test]
+    fn configure_staking_rejects_contract_as_treasury() {
+        let (env, client, admin, token_id, _) = setup_staking();
+        let contract_addr = client.address.clone();
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &contract_addr);
+        let result = client.try_execute_proposal(&admin, &pid);
+
+        assert_eq!(result, Err(Ok(RegistryError::InvalidMetadata)));
+    }
+
+    #[test]
+    fn governance_can_withdraw_from_treasury() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+        mint(&env, &token_id, &treasury, 500);
+
+        let pid = client.propose_withdraw_from_treasury(&admin, &500);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let registry_balance: i128 = balance(&env, &token_id, &client.address);
+        assert_eq!(registry_balance, 1_500);
+    }
+
+    // ── Issue #51: Stake minimum crossing events ────────────────────────────
+
+    #[test]
+    fn emit_event_when_stake_rises_above_minimum() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
+
+        let pid = client.propose_configure_minimum_stake(&admin, &500);
+        pass_proposal(&env, &client, &admin, pid);
+        assert_eq!(client.get_minimum_stake(), 500);
+
+        client.stake(&owner, &target, &600);
+        let rep = client.get_reputation(&target);
+        assert_eq!(rep.stake, 600);
+    }
+
+    #[test]
+    fn emit_event_when_stake_falls_below_minimum() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let pid = client.propose_configure_minimum_stake(&admin, &800);
+        pass_proposal(&env, &client, &admin, pid);
+
+        client.deactivate(&owner, &target);
+        env.ledger().set_timestamp(env.ledger().timestamp() + SLASH_LOCK_LEDGERS as u64 * 6);
+
+        let withdrawn = client.withdraw_stake(&owner, &target);
+        assert_eq!(withdrawn, 1_000);
+    }
+
+    #[test]
+    fn no_minimum_crossing_event_when_minimum_is_zero() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
+
+        assert_eq!(client.get_minimum_stake(), 0);
+        client.stake(&owner, &target, &100);
+        let rep = client.get_reputation(&target);
+        assert_eq!(rep.stake, 100);
+    }
+
+    #[test]
+    fn slash_emits_minimum_crossing_event_when_stake_drops_below() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let pid = client.propose_configure_minimum_stake(&admin, &800);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let reason = String::from_str(&env, "bad behavior");
+        let pid = client.propose_slash(&admin, &target, &300, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let rep = client.get_reputation(&target);
+        assert_eq!(rep.stake, 700);
+    }
+
+    // ── Issue #53: SEP-41 token validation ──────────────────────────────────
+
+    #[test]
+    fn configure_staking_validates_token_is_sep41_compatible() {
+        let (env, client, admin) = setup();
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        let result = client.try_execute_proposal(&admin, &pid);
+        assert!(result.is_ok());
+        assert_eq!(client.get_staking_config().0, token_id);
+    }
+
+    #[test]
+    fn configure_staking_fails_for_non_sep41_token() {
+        let (env, client, admin) = setup();
+        let not_a_token = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &not_a_token, &treasury);
+        let result = client.try_execute_proposal(&admin, &pid);
+        assert!(result.is_err());
+    }
+
+    // ── Issue #54: Total stake tracking ────────────────────────────────────
+
+    #[test]
+    fn total_staked_matches_sum_of_individual_stakes() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner1, target1) = register_and_stake(&env, &client, &token_id, 100);
+        let (owner2, target2) = register_and_stake(&env, &client, &token_id, 200);
+        let (owner3, target3) = register_and_stake(&env, &client, &token_id, 300);
+
+        let total_staked = client.get_stats().total_staked;
+        assert_eq!(total_staked, 600);
+
+        let individual_sum = client.get_stake(&target1) + client.get_stake(&target2) + client.get_stake(&target3);
+        assert_eq!(total_staked, individual_sum);
+    }
+
+    #[test]
+    fn total_staked_decreases_on_withdrawal() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        assert_eq!(client.get_stats().total_staked, 500);
+
+        client.deactivate(&owner, &target);
+        env.ledger().set_timestamp(env.ledger().timestamp() + SLASH_LOCK_LEDGERS as u64 * 6);
+        client.withdraw_stake(&owner, &target);
+
+        assert_eq!(client.get_stats().total_staked, 0);
+    }
+
+    #[test]
+    fn total_staked_decreases_on_slash() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        assert_eq!(client.get_stats().total_staked, 1_000);
+
+        let reason = String::from_str(&env, "violation");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        assert_eq!(client.get_stats().total_staked, 600);
+        assert_eq!(client.get_stake(&target), 600);
+    }
+
+    #[test]
+    fn total_staked_mixed_operations() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner1, target1) = register_and_stake(&env, &client, &token_id, 300);
+        let (owner2, target2) = register_and_stake(&env, &client, &token_id, 200);
+
+        assert_eq!(client.get_stats().total_staked, 500);
+
+        client.stake(&owner1, &target1, &100);
+        assert_eq!(client.get_stats().total_staked, 600);
+
+        let reason = String::from_str(&env, "test slash");
+        let pid = client.propose_slash(&admin, &target2, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        assert_eq!(client.get_stats().total_staked, 500);
+        assert_eq!(client.get_stake(&target1), 400);
+        assert_eq!(client.get_stake(&target2), 100);
     }
 }
