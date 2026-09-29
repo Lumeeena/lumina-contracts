@@ -32,6 +32,30 @@
 //!    is emitted.
 //! 4. Proposals that are never executed do not expire automatically; they can
 //!    be superseded by a new proposal for the same action or simply ignored.
+//!
+//! ## Resource cost benchmarks
+//!
+//! Soroban meters execution: an entrypoint that grows past a resource limit
+//! simply stops working on-chain while passing every test in the local host.
+//! The scanning views (`get_active_contracts`, `get_contracts_by_category`,
+//! `get_contracts_by_tag`) are the obvious candidates because their cost grows
+//! with the size of the registry index.
+//!
+//! `registry/tests/bench.rs` uses the test host's budget instrumentation to
+//! record CPU instructions and memory per entrypoint and asserts a ceiling for
+//! the scanning views. The numbers below are the ceilings asserted in CI; a
+//! significant regression fails the build.
+//!
+//! | Entrypoint | Metric | Ceiling |
+//! |------------|--------|---------|
+//! | `register_contract` | CPU instructions | 5_000_000 |
+//! | `get_active_contracts` | CPU instructions | 20_000_000 |
+//! | `get_contracts_by_category` | CPU instructions | 20_000_000 |
+//! | `get_contracts_by_tag` | CPU instructions | 20_000_000 |
+//! | `get_active_contracts` | Memory bytes | 1_000_000 |
+//!
+//! When a ceiling is intentionally raised, update this table in the same
+//! commit so the regression stays visible in review.
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token,

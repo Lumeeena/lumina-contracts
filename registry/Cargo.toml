@@ -3,14 +3,22 @@ name = "lumina-registry"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [features]
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+
+this-size-of = "0.1.0"
+
+# Needed for the cost benchmark tests to read the contract's budget
+soroban-env = { version = "22.0.0", features = ["testutils"] }
+
+# Needed for the cost benchmark tests to read the contract's budget
+soroban-ledger = { version = "22.0.0", features = ["testutils"] }
+
+# Needed for the cost benchmark tests to read the contract's budget
+soroban-sdk-env = { version = "22.0.0", features = ["testutils"] }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
