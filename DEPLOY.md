@@ -103,7 +103,7 @@ Windows must fit within the network's maximum persistent-entry TTL so the
 counter cannot expire before its configured window.
 
 The governance entrypoints are `propose_set_allowlist_enabled`,
-`propose_set_allowlisted`, and `propose_configure_registration_rate_limit`.
+`propose_set_allowlisted`, and `propose_set_rate_limit`.
 
 ### Register a contract for indexing
 

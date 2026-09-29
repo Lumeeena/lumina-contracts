@@ -1,0 +1,19 @@
+[package]
+name = "lumina-registry-consumer-example"
+version = "0.1.0"
+edition = "2021"
+description = "Example Soroban contract that reads the Lumina Registry through the typed interface."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+lumina-registry-interface = { path = "../../registry-interface" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

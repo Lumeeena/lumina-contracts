@@ -1,3 +1,4 @@
+
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
@@ -34,7 +35,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token,
-    Address, BytesN, Env, Symbol, String, Vec,
+    Address, BytesN, Env, Symbol, SymbolStr, String, TryFromVal, Vec,
 };
 
 // ─── Version ───────────────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 4;
+pub const CONTRACT_VERSION: u32 = 6;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -80,6 +81,43 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 /// Errors returned by the Lumina Registry contract operations.
+///
+/// ## Error code reference
+///
+/// Error codes cross the contract boundary as bare `u32` values, so this
+/// table is the authoritative documentation for a consumer that only has a
+/// numeric code in hand. It is kept next to the enum so the two are updated
+/// together; if you add or renumber a variant, update this table in the same
+/// commit.
+///
+/// | Code | Name | Meaning | Usual remedy |
+/// |------|------|---------|--------------|
+/// | 1 | `AlreadyInitialized` | `initialize` was called on a deployment that already has an admin set. | Do not call `initialize` again; read `get_admins` / `get_threshold` to inspect the existing configuration. |
+/// | 2 | `Unauthorized` | The caller is not the registered owner and not permitted to perform this action. | Call from the registered owner's address, or route the action through the governance flow (`propose_*` → `approve_proposal` → `execute_proposal`). |
+/// | 3 | `AlreadyRegistered` | A `Contract` entry already exists for this `contract_id`. | Use `update_metadata` / `set_categories` to change the existing entry, or `deregister` it first if you intend to re-register. |
+/// | 4 | `ContractNotFound` | No `Contract` entry exists for the given `contract_id`. | Check `is_registered` before calling; register the contract first with `register_contract`. |
+/// | 5 | `InvalidMetadata` | The supplied metadata failed validation (e.g. empty batch, batch larger than 100 entries). | Pass a non-empty batch of at most 100 entries and ensure each entry has a name and description. |
+/// | 6 | `NotOwner` | The caller is not the `owner` recorded on the registration. | Call from the recorded owner's address, or have the current owner call `transfer_ownership` first. |
+/// | 7 | `NotInitialized` | The registry has no admin set because `initialize` was never called. | Deploy with the `__constructor` bootstrap admin, or call `initialize` once with a non-empty admin set. |
+/// | 8 | `ProposalNotFound` | No proposal exists for the given `proposal_id`. | Read `get_proposal` for a valid ID; IDs are assigned sequentially starting at 0. |
+/// | 9 | `ThresholdNotMet` | The proposal has not collected enough approvals, or has not yet become ready. | Have additional admins call `approve_proposal` until `approvals.len()` reaches `get_threshold`. |
+/// | 10 | `TimelockNotElapsed` | Fewer than `TIMELOCK_LEDGERS` ledgers have passed since the proposal became ready. | Wait until `ready_at + TIMELOCK_LEDGERS` and retry `execute_proposal`. |
+/// | 11 | `AlreadyApproved` | This admin address has already approved this proposal. | Do not re-approve; have a different admin approve instead. |
+/// | 12 | `NotAdmin` | The caller is not a member of the current admin set. | Call from an address returned by `get_admins`, or propose adding the caller via `propose_add_admin`. |
+/// | 13 | `InvalidThreshold` | The admin set would be empty, or the threshold is zero or exceeds the set size. | Pass a non-empty admin set with `1 <= threshold <= admins.len()`. |
+/// | 14 | `AlreadyExecuted` | The proposal has already been executed. | Do not retry; create a new proposal if further action is needed. |
+/// | 15 | `StakingNotConfigured` | No stake token / treasury has been set, so staking is not open. | Have governance pass `propose_configure_staking` and execute it before staking. |
+/// | 16 | `InvalidAmount` | A stake, slash, or fee amount was zero or negative. | Pass a strictly positive amount for `stake` / `propose_slash`, and a non-negative fee for `propose_set_registration_fee`. |
+/// | 17 | `InsufficientStake` | The registration's staked balance is smaller than the requested amount. | Stake more first with `stake`, or reduce the requested amount to at most `get_stake`. |
+/// | 18 | `StakeLocked` | The stake is still inside the post-slash lock window. | Wait until `get_reputation(...).withdraw_locked_until` and retry `withdraw_stake`. |
+/// | 19 | `RegistrationActive` | The registration is still active, so it cannot be withdrawn or deregistered. | Call `deactivate` first, then retry `withdraw_stake` or `deregister`. |
+/// | 20 | `NoCategories` | A registration or category query declared no categories. | Pass at least one `Category` (use `Category::Other` if none of the vocabulary fits). |
+/// | 21 | `StakeNotEmpty` | The registration still holds stake, so it cannot be deregistered. | Call `withdraw_stake` until `get_stake` returns zero, then retry `deregister`. |
+/// | 22 | `InvalidRateLimit` | The rate limit configuration is invalid (zero window with a non-zero limit, or a window larger than `max_ttl`). | Pass `window_ledgers` in `1..=max_ttl` when `limit > 0`, or set `limit = 0` to disable limiting. |
+/// | 23 | `NotAllowlisted` | The owner is not allowlisted while permissioned registration is enabled. | Have governance execute `propose_set_allowlisted(owner, true)`, or disable the allowlist with `propose_set_allowlist_enabled(false)`. |
+/// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
+/// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
+/// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -133,6 +171,15 @@ pub enum RegistryError {
     NotAllowlisted      = 23,
     /// The registration rate limit has been exceeded.
     RegistrationRateLimited = 24,
+    /// Registration fee was not paid.
+    InsufficientFee = 25,
+    /// Tag count or length exceeds bounds.
+    InvalidTags = 26,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -267,6 +314,8 @@ pub struct ContractProfile {
     pub entry: ContractEntry,
     /// The reputation and staking signal.
     pub reputation: Reputation,
+    /// The contract that supersedes this one, if the owner has set one.
+    pub superseded_by: Option<Address>,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -287,6 +336,89 @@ pub struct ContractProfilePage {
     pub entries: Vec<ContractProfile>,
     /// True if more results are available after this page.
     pub has_more: bool,
+}
+
+// ─── Third-party attestations ──────────────────────────────────────────────
+//
+// ## Why this is not `Verified`
+//
+// `Verified` is the governance signal: only the admin set, through a
+// threshold-and-timelocked proposal, can set it, and a registrant cannot
+// vouch for themselves. That is exactly the property that makes it worth
+// anything, so this feature deliberately does not touch it — there is no
+// `attest`-driven path to `Verified` and no counter that aggregates
+// attestations into it.
+//
+// An attestation is a weaker, explicitly *named* claim. "Account X says this
+// contract is audited" is a different and more modest statement than
+// "the registry vouches for this contract", and conflating them would let
+// anyone inflate the verified signal by attaching cheap labels to a
+// registration. Keeping them separate means a consumer can weight them
+// differently, and can show the attester's address either way.
+//
+// What an attestation *is* good for is the transparency property: the
+// attester's address is recorded on-chain, so a claim cannot be anonymous,
+// and the attester can withdraw it themselves. A wrong attestation is
+// therefore contestable by the party it misleads, without needing governance
+// to act.
+//
+// Labels are bounded in both count and length (see
+// [`MAX_ATTESTATIONS_PER_CONTRACT`] and [`MAX_ATTESTATION_LABEL_LEN`]) so one
+// party cannot inflate a registration's state with unbounded storage at a
+// cost imposed on every future reader of that list.
+
+/// One third party's claim about a registration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attestation {
+    /// Who made the attestation. Recorded so the claim is attributable rather
+    /// than anonymous, and so the attester can revoke it.
+    pub attester: Address,
+    /// Short, bounded free-text label describing the basis of the claim
+    /// (e.g. "audited", "used in production"). Bounded by
+    /// [`MAX_ATTESTATION_LABEL_LEN`].
+    pub label: String,
+    /// Ledger at which the attestation was made.
+    pub created_at: u32,
+}
+
+/// Maximum attestations a single registration may accumulate.
+///
+/// Bounded so the cost of listing a registration's attestations is a property
+/// of the contract rather than of how many parties choose to speak up.
+pub const MAX_ATTESTATIONS_PER_CONTRACT: u32 = 20;
+
+/// Maximum length of an attestation label, in bytes.
+pub const MAX_ATTESTATION_LABEL_LEN: u32 = 64;
+
+/// Entry for batch registration.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RegistrationEntry {
+    /// Contract to register.
+    pub contract_id: Address,
+    /// Human-readable name.
+    pub name: String,
+    /// Short description.
+    pub description: String,
+    /// Categories for browsing.
+    pub categories: Vec<Category>,
+}
+
+/// Registry statistics aggregating key metrics.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RegistryStats {
+    /// Total number of registrations ever made.
+    pub total_registered: u32,
+    /// Number of currently active registrations.
+    pub active_count: u32,
+    /// Number of verified registrations.
+    pub verified_count: u32,
+    /// Number of registrations with non-zero stake.
+    pub staked_count: u32,
+    /// Total staked amount across all registrations.
+    pub total_staked: i128,
 }
 
 // ─── Proposal types ────────────────────────────────────────────────────────
@@ -318,6 +450,12 @@ pub enum ProposalAction {
     SetAllowlisted(Address, bool),
     /// Set the per-owner limit and ledger window; a zero limit disables it.
     ConfigureRegistrationRateLimit(u32, u32),
+    /// Set the registration fee in the stake token; zero disables it.
+    SetRegistrationFee(i128),
+    /// Set the minimum stake threshold; zero disables it.
+    ConfigureMinimumStake(i128),
+    /// Withdraw from the treasury.
+    WithdrawFromTreasury(i128),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -395,6 +533,8 @@ pub enum DataKey {
     Slashes(Address),
     /// u32 — ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),
+    /// i128 — minimum stake threshold; zero disables it.
+    MinimumStake,
 
     // ── Category taxonomy ───────────────────────────────────────────────────
     /// Vec<Category> — the categories a registration declared, deduplicated.
@@ -417,6 +557,28 @@ pub enum DataKey {
     RegistrationRateWindow,
     /// RegistrationWindow — the current fixed-window counter for one owner.
     RegistrationWindow(Address),
+
+    // ── Registration fee ────────────────────────────────────────────────────
+    /// i128 — governance-set registration fee in the stake token; zero disables it.
+    RegistrationFee,
+
+    // ── Tags ────────────────────────────────────────────────────────────────
+    /// Vec<String> — owner-set normalized tags for a registration.
+    Tags(Address),
+
+    // ── Third-party attestations ────────────────────────────────────────────
+    /// Vec<Attestation> — third-party attestations on a registration, oldest
+    /// first. Kept beside `ContractEntry` rather than inside it, for the same
+    /// reason as `Reputation`: a new field on `ContractEntry` would break every
+    /// entry already written (see the upgrade-compatibility rules above),
+    /// whereas a new `DataKey` variant is safe.
+    Attestations(Address),
+
+    // ── Registry statistics ────────────────────────────────────────────────
+    /// i128 — total staked across all registrations.
+    TotalStaked,
+    /// u32 — count of verified registrations.
+    VerifiedCount,
 
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 initialize.  Retained so
@@ -495,7 +657,8 @@ impl LuminaRegistry {
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         // Make sure the target actually exists.
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
@@ -523,7 +686,8 @@ impl LuminaRegistry {
         new_admin: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -546,7 +710,8 @@ impl LuminaRegistry {
         admin_to_remove: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -569,7 +734,8 @@ impl LuminaRegistry {
         new_threshold: u32,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -592,7 +758,8 @@ impl LuminaRegistry {
         new_wasm_hash: BytesN<32>,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -616,6 +783,14 @@ impl LuminaRegistry {
     /// registry was already initialized under the old signature — routing this
     /// through governance lets a deployed registry adopt staking after an
     /// upgrade instead of needing to be redeployed.
+    ///
+    /// Both `token` and `treasury` must not be addresses already registered in
+    /// the registry.  Permitting an overlap would create a confusing state: a
+    /// `ContractEntry` whose owner could receive its own slashes, making the
+    /// slash semantics circular.  The validation is intentionally placed here —
+    /// at proposal time — so an obviously-invalid configuration is rejected
+    /// immediately rather than sitting through the timelock only to revert on
+    /// execution.
     pub fn propose_configure_staking(
         env: Env,
         proposer: Address,
@@ -623,7 +798,17 @@ impl LuminaRegistry {
         treasury: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+
+        // Reject if either address is already a registered contract.
+        // See `RegistryError::OverlappingAddress` for the full rationale.
+        if env.storage().persistent().has(&DataKey::Contract(token.clone())) {
+            return Err(RegistryError::OverlappingAddress);
+        }
+        if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+            return Err(RegistryError::OverlappingAddress);
+        }
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -650,7 +835,8 @@ impl LuminaRegistry {
         verified: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
@@ -684,14 +870,13 @@ impl LuminaRegistry {
         reason: String,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
         }
-        if amount <= 0 {
-            return Err(RegistryError::InvalidAmount);
-        }
+        Self::validate_positive_amount(amount)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -715,7 +900,8 @@ impl LuminaRegistry {
         enabled: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -736,7 +922,8 @@ impl LuminaRegistry {
         allowed: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -750,14 +937,20 @@ impl LuminaRegistry {
     }
 
     /// Govern a fixed-window per-owner registration limit. Zero disables it.
-    pub fn propose_configure_registration_rate_limit(
+    ///
+    /// Named `propose_set_rate_limit` rather than the longer
+    /// `propose_configure_registration_rate_limit`: Soroban caps exported
+    /// contract function names at 32 characters, and the descriptive spelling
+    /// overflows that (41 chars), which the SDK rejects at compile time.
+    pub fn propose_set_rate_limit(
         env: Env,
         proposer: Address,
         limit: u32,
         window_ledgers: u32,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
             return Err(RegistryError::InvalidRateLimit);
         }
@@ -773,6 +966,76 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// Set the registration fee. Zero disables it (registration becomes free).
+    pub fn propose_set_registration_fee(
+        env: Env,
+        proposer: Address,
+        fee: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+        if fee < 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetRegistrationFee(fee),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "set_registration_fee"), fee),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Set the minimum stake threshold. Zero disables it (no minimum).
+    pub fn propose_configure_minimum_stake(
+        env: Env,
+        proposer: Address,
+        minimum: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if minimum < 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::ConfigureMinimumStake(minimum),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "configure_minimum_stake"), minimum),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Propose withdrawing from the treasury.
+    pub fn propose_withdraw_from_treasury(
+        env: Env,
+        proposer: Address,
+        amount: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::WithdrawFromTreasury(amount),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "withdraw_from_treasury"), amount),
+        );
+        Ok(proposal_id)
+    }
+
     // ── Governance: approval ────────────────────────────────────────────────
 
     /// Record an admin's approval of a proposal.  When the number of unique
@@ -784,7 +1047,8 @@ impl LuminaRegistry {
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
         admin.require_auth();
-        Self::assert_is_admin(&env, &admin)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &admin)?;
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -958,10 +1222,30 @@ impl LuminaRegistry {
 
         // Delete the entry and its live reputation state. Slashes are kept
         // for auditability (see docstring above).
+        let was_verified = env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+            .unwrap_or(false);
+        let staked = Self::stake_of(&env, &contract_id);
+
         env.storage().persistent().remove(&DataKey::Contract(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Stake(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Tags(contract_id.clone()));
+        // Attestations are opinions about a live registration; once the entry
+        // is gone they have nothing left to refer to. Slashes, by contrast,
+        // are kept above, because those stay auditable after the fact.
+        env.storage().persistent().remove(&DataKey::Attestations(contract_id.clone()));
+
+        if was_verified {
+            let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(1);
+            env.storage().instance().set(&DataKey::VerifiedCount, &count.saturating_sub(1));
+        }
+
+        if staked > 0 {
+            let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+            env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+        }
 
         // Live total goes down; lifetime total does not (see #141).
         let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(1);
@@ -1115,6 +1399,16 @@ impl LuminaRegistry {
 
         Self::consume_registration_rate(&env, &owner)?;
 
+        let fee: i128 = env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0);
+        if fee > 0 {
+            let (token_id, treasury) = Self::staking_config(&env)?;
+            token::Client::new(&env, &token_id).transfer(
+                &owner,
+                &treasury,
+                &fee,
+            );
+        }
+
         let entry = ContractEntry {
             contract_id: contract_id.clone(),
             owner: owner.clone(),
@@ -1147,6 +1441,89 @@ impl LuminaRegistry {
             (Symbol::new(&env, "contract_registered"),),
             (contract_id, owner, name, categories),
         );
+
+        Ok(())
+    }
+
+    /// Register multiple contracts in a single atomic transaction.
+    /// Fails and registers nothing if any entry is invalid or already registered.
+    /// The combined count of new registrations is subject to the per-owner cap
+    /// if registration rate limiting is enabled.
+    pub fn register_contracts(
+        env: Env,
+        owner: Address,
+        entries: Vec<RegistrationEntry>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        if entries.is_empty() {
+            return Err(RegistryError::InvalidMetadata);
+        }
+
+        let max_batch: u32 = 100;
+        if entries.len() > max_batch {
+            return Err(RegistryError::InvalidMetadata);
+        }
+
+        if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
+            && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
+        {
+            return Err(RegistryError::NotAllowlisted);
+        }
+
+        for entry in entries.iter() {
+            if env.storage().persistent().has(&DataKey::Contract(entry.contract_id.clone())) {
+                return Err(RegistryError::AlreadyRegistered);
+            }
+            Self::dedup_categories(&env, &entry.categories)?;
+        }
+
+        let fee: i128 = env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0);
+        if fee > 0 {
+            let total_fee = fee * (entries.len() as i128);
+            let (token_id, treasury) = Self::staking_config(&env)?;
+            token::Client::new(&env, &token_id).transfer(
+                &owner,
+                &treasury,
+                &total_fee,
+            );
+        }
+
+        for entry in entries.iter() {
+            Self::consume_registration_rate(&env, &owner)?;
+
+            let contract_entry = ContractEntry {
+                contract_id: entry.contract_id.clone(),
+                owner: owner.clone(),
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                registered_at: env.ledger().sequence(),
+                active: true,
+            };
+
+            env.storage().persistent().set(&DataKey::Contract(entry.contract_id.clone()), &contract_entry);
+
+            let mut owned = Self::owner_index(&env, &owner);
+            owned.push_back(entry.contract_id.clone());
+            Self::set_owner_index(&env, &owner, &owned);
+
+            let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+            all.push_back(entry.contract_id.clone());
+            env.storage().instance().set(&DataKey::AllContracts, &all);
+
+            let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
+            env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
+            let total: u32 = env.storage().instance().get(&DataKey::TotalRegistered).unwrap_or(count);
+            env.storage().instance().set(&DataKey::TotalRegistered, &(total + 1));
+
+            let categories = Self::dedup_categories(&env, &entry.categories)?;
+            Self::index_categories(&env, &entry.contract_id, &categories);
+
+            env.events().publish(
+                (Symbol::new(&env, "contract_registered"),),
+                (entry.contract_id.clone(), owner.clone(), entry.name.clone(), categories),
+            );
+        }
 
         Ok(())
     }
@@ -1201,6 +1578,198 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    /// Set normalized, owner-defined tags for a registration.
+    /// Tags complement categories (which are fixed and for browsing) and provide
+    /// owner-set search metadata. Max 10 tags, each max 16 characters.
+    ///
+    /// Tags are [`String`] rather than `Symbol` because the per-tag length cap
+    /// is only measurable on-chain for a `String`: `soroban-sdk` 22 exposes no
+    /// wasm-side way to ask a `Symbol` how long it is (`ToString for Symbol` is
+    /// `#[cfg(not(target_family = "wasm"))]`), so a `Vec<Symbol>` signature
+    /// could not enforce the 16-character bound it documents.
+    pub fn set_tags(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        tags: Vec<String>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        const MAX_TAG_COUNT: u32 = 10;
+        const MAX_TAG_LEN: u32 = 16;
+
+        if tags.len() > MAX_TAG_COUNT {
+            return Err(RegistryError::InvalidTags);
+        }
+
+        for tag in tags.iter() {
+            // `Symbol::to_string` only exists for non-wasm targets, so measure
+            // the symbol through its XDR form, which is available in both.
+            if Self::symbol_len(&env, &tag) > MAX_TAG_LEN {
+                return Err(RegistryError::InvalidTags);
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::Tags(contract_id.clone()), &tags);
+
+        env.events().publish(
+            (Symbol::new(&env, "tags_updated"),),
+            (contract_id, owner, tags.len()),
+        );
+
+        Ok(())
+    }
+
+    /// Get tags for a registration.
+    pub fn get_tags(env: Env, contract_id: Address) -> Vec<String> {
+        env.storage().persistent()
+            .get(&DataKey::Tags(contract_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // ── Third-party attestations ────────────────────────────────────────────
+
+    /// Vouch for a registration with a short, bounded label.
+    ///
+    /// Permissionless by design: any address may attest, including the
+    /// registration's own owner. This is a transparency feature, not a trust
+    /// signal — it grants nothing, changes no counter that feeds
+    /// [`LuminaRegistry::is_verified`], and confers no privilege. What it does
+    /// is record *who* is vouching, so the claim is attributable and the
+    /// attester can take it back via
+    /// [`LuminaRegistry::revoke_attestation`].
+    ///
+    /// Governance-only verification is deliberately untouched: there is no
+    /// path from an attestation to `Verified`, so attaching many of them can
+    /// never substitute for the multi-sig proposal.
+    ///
+    /// One attestation per attester per registration. Re-attesting updates the
+    /// existing record's label and timestamp rather than adding a second entry,
+    /// so a party cannot pad the list or leave a stale label behind that they
+    /// no longer stand behind.
+    ///
+    /// Rejects an empty or over-long label, and a registration that has
+    /// already reached [`MAX_ATTESTATIONS_PER_CONTRACT`].
+    pub fn attest(
+        env: Env,
+        attester: Address,
+        contract_id: Address,
+        label: String,
+    ) -> Result<(), RegistryError> {
+        attester.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        // Bounded in length, and non-empty: an empty label carries no claim
+        // but still costs a list entry and an address.
+        if label.is_empty() || label.len() > MAX_ATTESTATION_LABEL_LEN {
+            return Err(RegistryError::InvalidAttestation);
+        }
+
+        let mut attestations = Self::attestations_of(&env, &contract_id);
+        let created_at = env.ledger().sequence();
+
+        // Replace this attester's existing record rather than appending, so
+        // the list stays one-per-attester and the label is always current.
+        for i in 0..attestations.len() {
+            if let Some(existing) = attestations.get(i) {
+                if existing.attester == attester {
+                    let recorded = label.clone();
+                    attestations.set(i, Attestation {
+                        attester: attester.clone(),
+                        label,
+                        created_at,
+                    });
+                    env.storage().persistent()
+                        .set(&DataKey::Attestations(contract_id.clone()), &attestations);
+                    env.events().publish(
+                        (Symbol::new(&env, "attestation_updated"),),
+                        (contract_id, attester, recorded),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        if attestations.len() >= MAX_ATTESTATIONS_PER_CONTRACT {
+            return Err(RegistryError::InvalidAttestation);
+        }
+
+        attestations.push_back(Attestation {
+            attester: attester.clone(),
+            label,
+            created_at,
+        });
+        env.storage().persistent()
+            .set(&DataKey::Attestations(contract_id.clone()), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "attestation_added"),),
+            (contract_id, attester, attestations.len()),
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw your own attestation from a registration.
+    ///
+    /// Scoped to the caller's own record: it removes the single attestation
+    /// whose `attester` equals `attester`, and errors if the caller has none.
+    /// No caller can remove anyone else's attestation — not a registry admin,
+    /// not the registration's owner, not a third party. That is the point:
+    /// a claim stays exactly as long as the party making it stands behind it,
+    /// and nobody else gets to decide that for them.
+    ///
+    /// Returns the number of attestations remaining.
+    pub fn revoke_attestation(
+        env: Env,
+        attester: Address,
+        contract_id: Address,
+    ) -> Result<u32, RegistryError> {
+        attester.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        let mut attestations = Self::attestations_of(&env, &contract_id);
+
+        // Match on the recorded attester, not on any caller-supplied address,
+        // so there is no argument through which one party can target another's
+        // attestation.
+        let index = (0..attestations.len())
+            .find(|i| attestations.get(*i).map(|a| a.attester == attester).unwrap_or(false))
+            .ok_or(RegistryError::AttestationNotFound)?;
+
+        attestations.remove(index);
+        let remaining = attestations.len();
+        env.storage().persistent()
+            .set(&DataKey::Attestations(contract_id), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "attestation_revoked"),),
+            (attester, remaining),
+        );
+
+        Ok(remaining)
+    }
+
+    /// Every third-party attestation on a registration, oldest first.
+    /// Returns an empty list for a registration that has none.
+    pub fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation> {
+        Self::attestations_of(&env, &contract_id)
+    }
+
     // ── Staking ─────────────────────────────────────────────────────────────
 
     /// Post collateral against a registration you own.
@@ -1220,9 +1789,7 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
-        if amount <= 0 {
-            return Err(RegistryError::InvalidAmount);
-        }
+        Self::validate_positive_amount(amount)?;
 
         let entry: ContractEntry = env.storage().persistent()
             .get(&DataKey::Contract(contract_id.clone()))
@@ -1243,8 +1810,20 @@ impl LuminaRegistry {
             &amount,
         );
 
-        let staked = Self::stake_of(&env, &contract_id) + amount;
+        let old_stake = Self::stake_of(&env, &contract_id);
+        let staked = old_stake + amount;
         env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &staked);
+
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked + amount));
+
+        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        if minimum > 0 && old_stake < minimum && staked >= minimum {
+            env.events().publish(
+                (Symbol::new(&env, "stake_crossed_minimum"),),
+                (contract_id.clone(), staked, minimum, Symbol::new(&env, "above")),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
@@ -1303,6 +1882,17 @@ impl LuminaRegistry {
         );
 
         env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &0i128);
+
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+
+        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        if minimum > 0 && staked >= minimum && 0 < minimum {
+            env.events().publish(
+                (Symbol::new(&env, "stake_crossed_minimum"),),
+                (contract_id.clone(), 0i128, minimum, Symbol::new(&env, "below")),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
@@ -1403,7 +1993,11 @@ impl LuminaRegistry {
     /// iterating the combined indices).
     ///
     /// `categories` may not be empty; an empty selection returns a validation error.
-    pub fn get_active_contracts_by_categories(
+    ///
+    /// Named `get_contracts_by_categories` because Soroban caps exported
+    /// contract function names at 32 characters and the longer spelling
+    /// (34) is rejected at compile time.
+    pub fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
         offset: u32,
@@ -1450,6 +2044,16 @@ impl LuminaRegistry {
         Self::staking_config(&env)
     }
 
+    /// The current registration fee. Zero means registration is free.
+    pub fn get_registration_fee(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0)
+    }
+
+    /// The current minimum stake threshold. Zero means no minimum.
+    pub fn get_minimum_stake(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0)
+    }
+
     /// Currently staked balance. Zero for a registration that never staked.
     pub fn get_stake(env: Env, contract_id: Address) -> i128 {
         Self::stake_of(&env, &contract_id)
@@ -1460,6 +2064,37 @@ impl LuminaRegistry {
         env.storage().persistent()
             .get(&DataKey::Verified(contract_id))
             .unwrap_or(false)
+    }
+
+    /// Aggregate registry statistics: total, active, verified, staked counts and total staked.
+    /// This is a constant-cost view built on maintained counters.
+    pub fn get_registry_stats(env: Env) -> RegistryStats {
+        let total_registered = env.storage().instance()
+            .get::<DataKey, u32>(&DataKey::TotalRegistered)
+            .unwrap_or(0);
+        let active_count = Self::get_active_contract_count(env.clone());
+        let verified_count = env.storage().instance()
+            .get::<DataKey, u32>(&DataKey::VerifiedCount)
+            .unwrap_or(0);
+        let total_staked = env.storage().instance()
+            .get::<DataKey, i128>(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        let mut staked_count: u32 = 0;
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        for contract_id in all.iter() {
+            if Self::stake_of(&env, &contract_id) > 0 {
+                staked_count += 1;
+            }
+        }
+
+        RegistryStats {
+            total_registered,
+            active_count,
+            verified_count,
+            staked_count,
+            total_staked,
+        }
     }
 
     /// Every slash levied against a registration, oldest first.
@@ -1508,6 +2143,8 @@ impl LuminaRegistry {
         Ok(ContractProfile {
             reputation,
             entry,
+            superseded_by: env.storage().persistent()
+                .get(&DataKey::SupersededBy(contract_id)),
         })
     }
 
@@ -1524,6 +2161,8 @@ impl LuminaRegistry {
                     if entry.active {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            superseded_by: env.storage().persistent()
+                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
                         });
                     }
@@ -1658,6 +2297,8 @@ impl LuminaRegistry {
                     if entry.active {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            superseded_by: env.storage().persistent()
+                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
                         });
                     }
@@ -1738,7 +2379,8 @@ impl LuminaRegistry {
 
         // Require caller to be the owner OR a member of the admin set.
         let is_owner = caller == entry.owner;
-        let is_admin = Self::is_admin_member(&env, &caller);
+        let admins = Self::admin_index(&env);
+        let is_admin = admins.contains(&caller);
 
         // Fall back to the legacy single-admin check for the upgrade tests.
         let is_legacy_admin = env.storage()
@@ -1824,18 +2466,14 @@ impl LuminaRegistry {
     }
 
     /// Return `NotAdmin` if `addr` is not in the current admin set.
-    fn assert_is_admin(env: &Env, addr: &Address) -> Result<(), RegistryError> {
-        if !env.storage().instance().has(&DataKey::Admins) {
+    fn assert_is_admin(admins: &Vec<Address>, addr: &Address) -> Result<(), RegistryError> {
+        if admins.is_empty() {
             return Err(RegistryError::NotInitialized);
         }
-        if !Self::is_admin_member(env, addr) {
+        if !admins.contains(addr) {
             return Err(RegistryError::NotAdmin);
         }
         Ok(())
-    }
-
-    fn is_admin_member(env: &Env, addr: &Address) -> bool {
-        Self::admin_index(env).contains(addr)
     }
 
     /// Allocate a new proposal ID, store the proposal, and return the ID.
@@ -1967,6 +2605,21 @@ impl LuminaRegistry {
                 env.storage().instance().set(&DataKey::PreviousStakeToken, &prev_token);
                 env.storage().instance().set(&DataKey::PreviousTreasury, &prev_treasury);
 
+                if treasury == env.current_contract_address() {
+                    return Err(RegistryError::InvalidMetadata);
+                }
+                let _ = token::Client::new(env, token_id).decimals();
+                // Guard at execution time as well as proposal time: the
+                // registration state may have changed between the two, and an
+                // overlap that slipped through (e.g. a pre-existing proposal
+                // created before the contract was registered) must still be
+                // caught before the config is written.
+                if env.storage().persistent().has(&DataKey::Contract(token_id.clone())) {
+                    return Err(RegistryError::OverlappingAddress);
+                }
+                if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+                    return Err(RegistryError::OverlappingAddress);
+                }
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
@@ -1978,17 +2631,27 @@ impl LuminaRegistry {
                 if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
                     return Err(RegistryError::ContractNotFound);
                 }
+                let was_verified = env.storage().persistent()
+                    .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+                    .unwrap_or(false);
                 env.storage().persistent()
                     .set(&DataKey::Verified(contract_id.clone()), verified);
+
+                if *verified && !was_verified {
+                    let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(0);
+                    env.storage().instance().set(&DataKey::VerifiedCount, &(count + 1));
+                } else if !*verified && was_verified {
+                    let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(1);
+                    env.storage().instance().set(&DataKey::VerifiedCount, &count.saturating_sub(1));
+                }
+
                 env.events().publish(
                     (Symbol::new(env, "verification_set"),),
                     (contract_id.clone(), *verified),
                 );
             }
             ProposalAction::Slash(contract_id, amount, reason) => {
-                if *amount <= 0 {
-                    return Err(RegistryError::InvalidAmount);
-                }
+                Self::validate_positive_amount(*amount)?;
 
                 let staked = Self::stake_of(env, contract_id);
                 if staked < *amount {
@@ -2003,8 +2666,20 @@ impl LuminaRegistry {
                     amount,
                 );
 
+                let new_stake = staked - *amount;
                 env.storage().persistent()
-                    .set(&DataKey::Stake(contract_id.clone()), &(staked - *amount));
+                    .set(&DataKey::Stake(contract_id.clone()), &new_stake);
+
+                let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+                env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - *amount));
+
+                let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+                if minimum > 0 && staked >= minimum && new_stake < minimum {
+                    env.events().publish(
+                        (Symbol::new(env, "stake_crossed_minimum"),),
+                        (contract_id.clone(), new_stake, minimum, Symbol::new(env, "below")),
+                    );
+                }
 
                 let slashed_at = env.ledger().sequence();
                 let mut history = Self::slash_history(env, contract_id);
@@ -2053,6 +2728,41 @@ impl LuminaRegistry {
                     (*limit, *window),
                 );
             }
+            ProposalAction::SetRegistrationFee(fee) => {
+                if *fee < 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                env.storage().instance().set(&DataKey::RegistrationFee, fee);
+                env.events().publish(
+                    (Symbol::new(env, "registration_fee_set"),),
+                    (*fee,),
+                );
+            }
+            ProposalAction::ConfigureMinimumStake(minimum) => {
+                if *minimum < 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                env.storage().instance().set(&DataKey::MinimumStake, minimum);
+                env.events().publish(
+                    (Symbol::new(env, "minimum_stake_set"),),
+                    (*minimum,),
+                );
+            }
+            ProposalAction::WithdrawFromTreasury(amount) => {
+                if *amount <= 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                let (token_id, treasury) = Self::staking_config(env)?;
+                token::Client::new(env, &token_id).transfer(
+                    &treasury,
+                    &env.current_contract_address(),
+                    amount,
+                );
+                env.events().publish(
+                    (Symbol::new(env, "treasury_withdrawn"),),
+                    (*amount,),
+                );
+            }
         }
         Ok(())
     }
@@ -2069,10 +2779,36 @@ impl LuminaRegistry {
         Ok((token_id, treasury))
     }
 
+    fn validate_positive_amount(amount: i128) -> Result<(), RegistryError> {
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        Ok(())
+    }
+
     fn stake_of(env: &Env, contract_id: &Address) -> i128 {
         env.storage().persistent()
             .get(&DataKey::Stake(contract_id.clone()))
             .unwrap_or(0)
+    }
+
+    /// Character length of a `Symbol`.
+    ///
+    /// `Symbol::to_string` is gated behind `not(target_family = "wasm")` and so
+    /// does not exist in the contract build. `SymbolStr` is the one conversion
+    /// available to both targets, and it exposes a length directly — so no
+    /// `String` is allocated just to measure it.
+    fn symbol_len(env: &Env, symbol: &Symbol) -> u32 {
+        match SymbolStr::try_from_val(env, &symbol.to_symbol_val()) {
+            Ok(s) => s.len() as u32,
+            Err(_) => u32::MAX,
+        }
+    }
+
+    fn attestations_of(env: &Env, contract_id: &Address) -> Vec<Attestation> {
+        env.storage().persistent()
+            .get(&DataKey::Attestations(contract_id.clone()))
+            .unwrap_or(Vec::new(env))
     }
 
     fn slash_history(env: &Env, contract_id: &Address) -> Vec<SlashRecord> {
@@ -2168,6 +2904,8 @@ impl LuminaRegistry {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::{IntoVal, TryFromVal};
@@ -2443,6 +3181,34 @@ mod test {
     }
 
     #[test]
+    fn admin_membership_cache_cost_benchmark() {
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().instance().has(&DataKey::Admins));
+            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            assert!(admins.contains(&admin));
+        });
+        let uncached_cpu = env.budget().cpu_instruction_cost();
+        let uncached_memory = env.budget().memory_bytes_cost();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            let admins = LuminaRegistry::admin_index(&env);
+            LuminaRegistry::assert_is_admin(&admins, &admin).unwrap();
+        });
+        let cached_cpu = env.budget().cpu_instruction_cost();
+        let cached_memory = env.budget().memory_bytes_cost();
+
+        std::println!(
+            "admin membership cost: cpu {uncached_cpu} -> {cached_cpu}, memory {uncached_memory} -> {cached_memory}"
+        );
+        assert!(cached_cpu < uncached_cpu);
+    }
+
+    #[test]
     fn non_admin_cannot_approve() {
         let (env, client, a1, _a2, _a3) = setup_multisig();
         let (_owner, target) = register_sample(&env, &client);
@@ -2664,7 +3430,7 @@ mod test {
     fn registration_rate_limit_resets_after_governed_window() {
         let (env, client, admin) = setup();
         let owner = Address::generate(&env);
-        let configure = client.propose_configure_registration_rate_limit(&admin, &1, &3);
+        let configure = client.propose_set_rate_limit(&admin, &1, &3);
         pass_proposal(&env, &client, &admin, configure);
         let first = Address::generate(&env);
         client.register_contract(
@@ -2887,6 +3653,13 @@ mod test {
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
         let admin = Address::generate(env);
+        // `__constructor` calls `require_auth()`, and deploying *from wasm*
+        // runs it as a sub-invocation of the `CreateContractV2` host function
+        // rather than as the root invocation. `mock_all_auths` rejects a
+        // `require_auth` that is not tied to the root frame, so the upgrade
+        // tests need the non-root variant. (Native `env.register(LuminaRegistry,
+        // ..)` in `setup` needs no such allowance and keeps plain mocking.)
+        env.mock_all_auths_allowing_non_root_auth();
         let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
         let client = registry_v1_wasm::Client::new(env, &contract_id);
         (client, admin, contract_id)
@@ -4374,6 +5147,37 @@ mod test {
     }
 
     #[test]
+    fn ownership_transfer_preserves_stake_and_verification() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let new_owner = Address::generate(&env);
+
+        mint(&env, &token_id, &owner, 500);
+        client.stake(&owner, &target, &500);
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        client.transfer_ownership(&owner, &target, &new_owner);
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.entry.owner, new_owner);
+        assert_eq!(profile.reputation.stake, 500);
+        assert!(profile.reputation.verified);
+        assert_eq!(client.get_stake(&target), 500);
+
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        client.deactivate(&new_owner, &target);
+        assert_eq!(client.withdraw_stake(&new_owner, &target), 500);
+        assert_eq!(client.get_stake(&target), 0);
+        assert!(client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
     fn categories_and_reputation_are_independent() {
         let (env, client, admin, token_id, _treasury) = setup_staking();
         let owner = Address::generate(&env);
@@ -4395,6 +5199,371 @@ mod test {
             1,
         );
         assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Third-party attestations ────────────────────────────────────────────
+
+    #[test]
+    fn multiple_parties_can_attest_to_the_same_registration() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "used in production"));
+        client.attest(&carol, &target, &String::from_str(&env, "independent review"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 3);
+
+        // Every attester's identity is recorded — the claim is attributable,
+        // not anonymous.
+        assert!(attestations.iter().any(|a| a.attester == alice));
+        assert!(attestations.iter().any(|a| a.attester == bob));
+        assert!(attestations.iter().any(|a| a.attester == carol));
+    }
+
+    #[test]
+    fn attestation_records_the_attester_label_and_ledger() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        let before = env.ledger().sequence();
+        client.attest(&alice, &target, &String::from_str(&env, "audited by acme"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        let attestation = attestations.get(0).unwrap();
+        assert_eq!(attestation.attester, alice);
+        assert_eq!(attestation.label, String::from_str(&env, "audited by acme"));
+        assert_eq!(attestation.created_at, before);
+    }
+
+    #[test]
+    fn attestations_are_kept_in_the_order_they_were_made() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "first"));
+        advance_ledger(&env, 5);
+        client.attest(&bob, &target, &String::from_str(&env, "second"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+        assert_eq!(attestations.get(1).unwrap().attester, bob);
+    }
+
+    #[test]
+    fn attesting_twice_updates_rather_than_duplicating() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "preliminary"));
+        advance_ledger(&env, 100);
+        client.attest(&alice, &target, &String::from_str(&env, "final audit"));
+
+        // One entry, not two, and the stale label is gone.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().label, String::from_str(&env, "final audit"));
+    }
+
+    #[test]
+    fn an_attester_can_revoke_their_own_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "audited too"));
+
+        // Returns the number remaining.
+        assert_eq!(client.revoke_attestation(&alice, &target), 1);
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        // Only Alice's is gone; Bob's is untouched.
+        assert_eq!(attestations.get(0).unwrap().attester, bob);
+    }
+
+    #[test]
+    fn revoking_removes_only_the_callers_own_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "a"));
+        client.attest(&bob, &target, &String::from_str(&env, "b"));
+        client.attest(&carol, &target, &String::from_str(&env, "c"));
+
+        // Bob revokes; Alice's and Carol's must both survive.
+        assert_eq!(client.revoke_attestation(&bob, &target), 2);
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 2);
+        assert!(attestations.iter().any(|a| a.attester == alice));
+        assert!(attestations.iter().any(|a| a.attester == carol));
+        assert!(!attestations.iter().any(|a| a.attester == bob));
+    }
+
+    #[test]
+    fn a_caller_cannot_revoke_someone_elses_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let mallory = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // Mallory has no attestation of her own to revoke.
+        assert_eq!(
+            client.try_revoke_attestation(&mallory, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+
+        // Alice's attestation is untouched by the attempt.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn neither_an_admin_nor_the_owner_can_revoke_another_partys_attestation() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // Privilege confers no standing here: the governance admin set and the
+        // registration's owner are both refused, because the record is keyed
+        // to the attester and only the attester can withdraw it.
+        assert_eq!(
+            client.try_revoke_attestation(&admin, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+        assert_eq!(
+            client.try_revoke_attestation(&owner, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+
+        assert_eq!(client.get_attestations(&target).len(), 1);
+        assert_eq!(client.get_attestations(&target).get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn revoking_twice_fails_on_the_second_call() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.revoke_attestation(&alice, &target), 0);
+
+        // Idempotence is not offered here: a second revoke is an error rather
+        // than a silent no-op, so a caller cannot mistake it for success.
+        assert_eq!(
+            client.try_revoke_attestation(&alice, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+    }
+
+    #[test]
+    fn attesting_is_rejected_for_an_unregistered_contract() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_attest(&alice, &unregistered, &String::from_str(&env, "audited")),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_eq!(
+            client.try_revoke_attestation(&alice, &unregistered),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn attestation_labels_are_length_bounded() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        // Empty labels carry no claim but still cost storage.
+        assert_eq!(
+            client.try_attest(&alice, &target, &String::from_str(&env, "")),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+
+        // At the limit: accepted.
+        let at_limit = "a".repeat(MAX_ATTESTATION_LABEL_LEN as usize);
+        client.attest(&alice, &target, &String::from_str(&env, &at_limit));
+        assert_eq!(client.get_attestations(&target).len(), 1);
+
+        // One byte over: rejected.
+        let over_limit = "a".repeat(MAX_ATTESTATION_LABEL_LEN as usize + 1);
+        let bob = Address::generate(&env);
+        assert_eq!(
+            client.try_attest(&bob, &target, &String::from_str(&env, &over_limit)),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+
+        // The rejected attestation left nothing behind.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn the_number_of_attestations_per_registration_is_bounded() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+
+        for i in 0..MAX_ATTESTATIONS_PER_CONTRACT {
+            client.attest(
+                &Address::generate(&env),
+                &target,
+                &String::from_str(&env, "audited"),
+            );
+            // Keep labels distinct from the counter for clarity if it ever fails.
+            let _ = i;
+        }
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // The next distinct attester is refused: the list cannot grow without
+        // bound, so a reader's cost stays fixed.
+        let overflow = Address::generate(&env);
+        assert_eq!(
+            client.try_attest(&overflow, &target, &String::from_str(&env, "audited")),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // An existing attester can still revise their own label at the cap,
+        // since that replaces rather than appends.
+        let first = client.get_attestations(&target).get(0).unwrap().attester;
+        client.attest(&first, &target, &String::from_str(&env, "revised"));
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // And revoking frees a slot again.
+        client.revoke_attestation(&first, &target);
+        client.attest(&overflow, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+    }
+
+    #[test]
+    fn attestations_are_scoped_to_one_registration() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let first = register_for(&env, &client, &alice);
+        let second = register_for(&env, &client, &alice);
+
+        client.attest(&alice, &first, &String::from_str(&env, "audited"));
+        client.attest(&alice, &second, &String::from_str(&env, "audited"));
+
+        // Same attester, two registrations, one entry each.
+        assert_eq!(client.get_attestations(&first).len(), 1);
+        assert_eq!(client.get_attestations(&second).len(), 1);
+
+        client.revoke_attestation(&alice, &first);
+        assert_eq!(client.get_attestations(&first).len(), 0);
+        // Revoking on one registration leaves the other alone.
+        assert_eq!(client.get_attestations(&second).len(), 1);
+    }
+
+    #[test]
+    fn a_registration_with_no_attestations_reports_an_empty_list() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_attestations(&target).len(), 0);
+
+        // Unregistered addresses read as empty too, mirroring `get_tags`.
+        assert_eq!(client.get_attestations(&Address::generate(&env)).len(), 0);
+    }
+
+    #[test]
+    fn attesting_does_not_affect_governance_only_verification() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Attestation is not verification, in either direction.
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "audited"));
+        assert!(!client.is_verified(&target));
+        assert_eq!(client.get_reputation(&target).verified, false);
+
+        // Verified statistics do not move either: attestations are not an
+        // input to the verified signal.
+        let stats = client.get_registry_stats();
+        assert_eq!(stats.verified_count, 0);
+
+        // Only governance can set it, and it still goes through the proposal
+        // flow rather than being implied by the attestations.
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.is_verified(&target));
+        assert_eq!(client.get_registry_stats().verified_count, 1);
+        assert_eq!(client.get_attestations(&target).len(), 2);
+    }
+
+    #[test]
+    fn attesting_does_not_grant_verification_or_privilege_to_the_attester() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // The attester gained nothing: still not verified, and still not an
+        // admin, so it cannot propose governance actions.
+        assert!(!client.is_verified(&target));
+        assert!(!client.get_admins().contains(&alice));
+        assert_eq!(
+            client.try_propose_set_verified(&alice, &target, &true),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+
+        // And it is not the registration's owner, so owner-gated actions
+        // remain closed to it.
+        assert_ne!(alice, owner);
+        assert_eq!(
+            client.try_update_metadata(&alice, &target, &String::from_str(&env, "x"), &String::from_str(&env, "y")),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+    }
+
+    #[test]
+    fn deregistering_removes_the_registrations_attestations() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.get_attestations(&target).len(), 1);
+
+        client.deactivate(&owner, &target);
+        client.deregister(&owner, &target);
+
+        // Opinions about a registration that no longer exists are cleared, so
+        // a later re-registration does not inherit them.
+        assert!(!client.is_registered(&target));
+        assert_eq!(client.get_attestations(&target).len(), 0);
+
+        let fresh = register_for(&env, &client, &owner);
+        assert_eq!(client.get_attestations(&fresh).len(), 0);
     }
 
     // ── Deregistration, pruning & counters ──────────────────────────────────
@@ -4522,5 +5691,51 @@ mod test {
         assert_eq!(client.get_contract_count(), 1);
         assert_eq!(client.get_total_registered(), 2);
         assert_eq!(client.get_active_contract_count(), 1);
+    }
+
+    // ── set_superseded_by ───────────────────────────────────────────────────
+
+    #[test]
+    fn owner_can_set_superseded_by_and_profile_surfaces_it() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+
+        client.set_superseded_by(&owner, &old, &new_contract);
+
+        let profile = client.get_contract_profile(&old);
+        assert_eq!(profile.superseded_by, Some(new_contract));
+    }
+
+    #[test]
+    fn set_superseded_by_rejects_unregistered_replacement() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let ghost = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&owner, &old, &ghost),
+            Err(Ok(RegistryError::ContractNotFound))
+        );
+    }
+
+    #[test]
+    fn set_superseded_by_is_owner_only() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&stranger, &old, &new_contract),
+            Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn superseded_by_is_none_by_default() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_contract_profile(&target).superseded_by, None);
     }
 }
