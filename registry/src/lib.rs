@@ -541,7 +541,8 @@ impl LuminaRegistry {
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         // Make sure the target actually exists.
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
@@ -569,7 +570,8 @@ impl LuminaRegistry {
         new_admin: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -592,7 +594,8 @@ impl LuminaRegistry {
         admin_to_remove: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -615,7 +618,8 @@ impl LuminaRegistry {
         new_threshold: u32,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -638,7 +642,8 @@ impl LuminaRegistry {
         new_wasm_hash: BytesN<32>,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -669,7 +674,8 @@ impl LuminaRegistry {
         treasury: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -696,7 +702,8 @@ impl LuminaRegistry {
         verified: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
@@ -730,7 +737,8 @@ impl LuminaRegistry {
         reason: String,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
@@ -759,7 +767,8 @@ impl LuminaRegistry {
         enabled: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -780,7 +789,8 @@ impl LuminaRegistry {
         allowed: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -801,7 +811,8 @@ impl LuminaRegistry {
         window_ledgers: u32,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
             return Err(RegistryError::InvalidRateLimit);
         }
@@ -824,7 +835,8 @@ impl LuminaRegistry {
         fee: i128,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if fee < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -851,7 +863,8 @@ impl LuminaRegistry {
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
         admin.require_auth();
-        Self::assert_is_admin(&env, &admin)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &admin)?;
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -2004,7 +2017,8 @@ impl LuminaRegistry {
 
         // Require caller to be the owner OR a member of the admin set.
         let is_owner = caller == entry.owner;
-        let is_admin = Self::is_admin_member(&env, &caller);
+        let admins = Self::admin_index(&env);
+        let is_admin = admins.contains(&caller);
 
         // Fall back to the legacy single-admin check for the upgrade tests.
         let is_legacy_admin = env.storage()
@@ -2090,18 +2104,14 @@ impl LuminaRegistry {
     }
 
     /// Return `NotAdmin` if `addr` is not in the current admin set.
-    fn assert_is_admin(env: &Env, addr: &Address) -> Result<(), RegistryError> {
-        if !env.storage().instance().has(&DataKey::Admins) {
+    fn assert_is_admin(admins: &Vec<Address>, addr: &Address) -> Result<(), RegistryError> {
+        if admins.is_empty() {
             return Err(RegistryError::NotInitialized);
         }
-        if !Self::is_admin_member(env, addr) {
+        if !admins.contains(addr) {
             return Err(RegistryError::NotAdmin);
         }
         Ok(())
-    }
-
-    fn is_admin_member(env: &Env, addr: &Address) -> bool {
-        Self::admin_index(env).contains(addr)
     }
 
     /// Allocate a new proposal ID, store the proposal, and return the ID.
@@ -2433,6 +2443,8 @@ impl LuminaRegistry {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::{IntoVal, TryFromVal};
@@ -2705,6 +2717,34 @@ mod test {
             client.try_propose_deactivate(&stranger, &target),
             Err(Ok(RegistryError::NotAdmin))
         );
+    }
+
+    #[test]
+    fn admin_membership_cache_cost_benchmark() {
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().instance().has(&DataKey::Admins));
+            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            assert!(admins.contains(&admin));
+        });
+        let uncached_cpu = env.budget().cpu_instruction_cost();
+        let uncached_memory = env.budget().memory_bytes_cost();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            let admins = LuminaRegistry::admin_index(&env);
+            LuminaRegistry::assert_is_admin(&admins, &admin).unwrap();
+        });
+        let cached_cpu = env.budget().cpu_instruction_cost();
+        let cached_memory = env.budget().memory_bytes_cost();
+
+        std::println!(
+            "admin membership cost: cpu {uncached_cpu} -> {cached_cpu}, memory {uncached_memory} -> {cached_memory}"
+        );
+        assert!(cached_cpu < uncached_cpu);
     }
 
     #[test]
