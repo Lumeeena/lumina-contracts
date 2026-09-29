@@ -8,6 +8,7 @@ fn execute_proposal(proposal_id: U32) -> Result<(), RegistryError>
 fn get_active_contract_count() -> U32
 fn get_active_contract_ids(offset: U32, limit: U32) -> Vec<Address>
 fn get_active_contracts(offset: U32, limit: U32) -> Vec<ContractEntry>
+fn get_active_contracts_by_categories(categories: Vec<Category>, offset: U32, limit: U32) -> Result<Vec<ContractEntry>, RegistryError>
 fn get_active_contracts_by_category(category: Category, offset: U32, limit: U32) -> Vec<ContractEntry>
 fn get_active_contracts_page(offset: U32, limit: U32) -> ContractPage
 fn get_active_profiles(offset: U32, limit: U32) -> Vec<ContractProfile>
@@ -37,6 +38,7 @@ fn is_registered(contract_id: Address) -> Bool
 fn is_verified(contract_id: Address) -> Bool
 fn propose_add_admin(proposer: Address, new_admin: Address) -> Result<U32, RegistryError>
 fn propose_change_threshold(proposer: Address, new_threshold: U32) -> Result<U32, RegistryError>
+fn propose_configure_registration_rate_limit(proposer: Address, limit: U32, window_ledgers: U32) -> Result<U32, RegistryError>
 fn propose_configure_staking(proposer: Address, token: Address, treasury: Address) -> Result<U32, RegistryError>
 fn propose_deactivate(proposer: Address, contract_id: Address) -> Result<U32, RegistryError>
 fn propose_remove_admin(proposer: Address, admin_to_remove: Address) -> Result<U32, RegistryError>

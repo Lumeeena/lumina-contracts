@@ -276,6 +276,8 @@ pub struct ContractProfile {
     pub entry: ContractEntry,
     /// The reputation and staking signal.
     pub reputation: Reputation,
+    /// The contract that supersedes this one, if the owner has set one.
+    pub superseded_by: Option<Address>,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -412,6 +414,10 @@ pub enum ProposalAction {
     ConfigureRegistrationRateLimit(u32, u32),
     /// Set the registration fee in the stake token; zero disables it.
     SetRegistrationFee(i128),
+    /// Set the minimum stake threshold; zero disables it.
+    ConfigureMinimumStake(i128),
+    /// Withdraw from the treasury.
+    WithdrawFromTreasury(i128),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -485,6 +491,8 @@ pub enum DataKey {
     Slashes(Address),
     /// u32 — ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),
+    /// i128 — minimum stake threshold; zero disables it.
+    MinimumStake,
 
     // ── Category taxonomy ───────────────────────────────────────────────────
     /// Vec<Category> — the categories a registration declared, deduplicated.
@@ -513,7 +521,7 @@ pub enum DataKey {
     RegistrationFee,
 
     // ── Tags ────────────────────────────────────────────────────────────────
-    /// Vec<Symbol> — owner-set normalized tags for a registration.
+    /// Vec<String> — owner-set normalized tags for a registration.
     Tags(Address),
 
     // ── Third-party attestations ────────────────────────────────────────────
@@ -607,7 +615,8 @@ impl LuminaRegistry {
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         // Make sure the target actually exists.
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
@@ -635,7 +644,8 @@ impl LuminaRegistry {
         new_admin: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -658,7 +668,8 @@ impl LuminaRegistry {
         admin_to_remove: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -681,7 +692,8 @@ impl LuminaRegistry {
         new_threshold: u32,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -704,7 +716,8 @@ impl LuminaRegistry {
         new_wasm_hash: BytesN<32>,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -728,6 +741,14 @@ impl LuminaRegistry {
     /// registry was already initialized under the old signature — routing this
     /// through governance lets a deployed registry adopt staking after an
     /// upgrade instead of needing to be redeployed.
+    ///
+    /// Both `token` and `treasury` must not be addresses already registered in
+    /// the registry.  Permitting an overlap would create a confusing state: a
+    /// `ContractEntry` whose owner could receive its own slashes, making the
+    /// slash semantics circular.  The validation is intentionally placed here —
+    /// at proposal time — so an obviously-invalid configuration is rejected
+    /// immediately rather than sitting through the timelock only to revert on
+    /// execution.
     pub fn propose_configure_staking(
         env: Env,
         proposer: Address,
@@ -735,7 +756,17 @@ impl LuminaRegistry {
         treasury: Address,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+
+        // Reject if either address is already a registered contract.
+        // See `RegistryError::OverlappingAddress` for the full rationale.
+        if env.storage().persistent().has(&DataKey::Contract(token.clone())) {
+            return Err(RegistryError::OverlappingAddress);
+        }
+        if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+            return Err(RegistryError::OverlappingAddress);
+        }
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -762,7 +793,8 @@ impl LuminaRegistry {
         verified: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
@@ -796,14 +828,13 @@ impl LuminaRegistry {
         reason: String,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
 
         if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
             return Err(RegistryError::ContractNotFound);
         }
-        if amount <= 0 {
-            return Err(RegistryError::InvalidAmount);
-        }
+        Self::validate_positive_amount(amount)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -827,7 +858,8 @@ impl LuminaRegistry {
         enabled: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -848,7 +880,8 @@ impl LuminaRegistry {
         allowed: bool,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -874,7 +907,8 @@ impl LuminaRegistry {
         window_ledgers: u32,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
             return Err(RegistryError::InvalidRateLimit);
         }
@@ -897,7 +931,8 @@ impl LuminaRegistry {
         fee: i128,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if fee < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -913,6 +948,52 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// Set the minimum stake threshold. Zero disables it (no minimum).
+    pub fn propose_configure_minimum_stake(
+        env: Env,
+        proposer: Address,
+        minimum: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if minimum < 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::ConfigureMinimumStake(minimum),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "configure_minimum_stake"), minimum),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Propose withdrawing from the treasury.
+    pub fn propose_withdraw_from_treasury(
+        env: Env,
+        proposer: Address,
+        amount: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&env, &proposer)?;
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::WithdrawFromTreasury(amount),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "withdraw_from_treasury"), amount),
+        );
+        Ok(proposal_id)
+    }
+
     // ── Governance: approval ────────────────────────────────────────────────
 
     /// Record an admin's approval of a proposal.  When the number of unique
@@ -924,7 +1005,8 @@ impl LuminaRegistry {
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
         admin.require_auth();
-        Self::assert_is_admin(&env, &admin)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &admin)?;
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -1457,11 +1539,17 @@ impl LuminaRegistry {
     /// Set normalized, owner-defined tags for a registration.
     /// Tags complement categories (which are fixed and for browsing) and provide
     /// owner-set search metadata. Max 10 tags, each max 16 characters.
+    ///
+    /// Tags are [`String`] rather than `Symbol` because the per-tag length cap
+    /// is only measurable on-chain for a `String`: `soroban-sdk` 22 exposes no
+    /// wasm-side way to ask a `Symbol` how long it is (`ToString for Symbol` is
+    /// `#[cfg(not(target_family = "wasm"))]`), so a `Vec<Symbol>` signature
+    /// could not enforce the 16-character bound it documents.
     pub fn set_tags(
         env: Env,
         owner: Address,
         contract_id: Address,
-        tags: Vec<Symbol>,
+        tags: Vec<String>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
@@ -1499,7 +1587,7 @@ impl LuminaRegistry {
     }
 
     /// Get tags for a registration.
-    pub fn get_tags(env: Env, contract_id: Address) -> Vec<Symbol> {
+    pub fn get_tags(env: Env, contract_id: Address) -> Vec<String> {
         env.storage().persistent()
             .get(&DataKey::Tags(contract_id))
             .unwrap_or(Vec::new(&env))
@@ -1659,9 +1747,7 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
-        if amount <= 0 {
-            return Err(RegistryError::InvalidAmount);
-        }
+        Self::validate_positive_amount(amount)?;
 
         let entry: ContractEntry = env.storage().persistent()
             .get(&DataKey::Contract(contract_id.clone()))
@@ -1682,11 +1768,20 @@ impl LuminaRegistry {
             &amount,
         );
 
-        let staked = Self::stake_of(&env, &contract_id) + amount;
+        let old_stake = Self::stake_of(&env, &contract_id);
+        let staked = old_stake + amount;
         env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &staked);
 
         let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalStaked, &(total_staked + amount));
+
+        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        if minimum > 0 && old_stake < minimum && staked >= minimum {
+            env.events().publish(
+                (Symbol::new(&env, "stake_crossed_minimum"),),
+                (contract_id.clone(), staked, minimum, Symbol::new(&env, "above")),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
@@ -1748,6 +1843,14 @@ impl LuminaRegistry {
 
         let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+
+        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        if minimum > 0 && staked >= minimum && 0 < minimum {
+            env.events().publish(
+                (Symbol::new(&env, "stake_crossed_minimum"),),
+                (contract_id.clone(), 0i128, minimum, Symbol::new(&env, "below")),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
@@ -1904,6 +2007,11 @@ impl LuminaRegistry {
         env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0)
     }
 
+    /// The current minimum stake threshold. Zero means no minimum.
+    pub fn get_minimum_stake(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0)
+    }
+
     /// Currently staked balance. Zero for a registration that never staked.
     pub fn get_stake(env: Env, contract_id: Address) -> i128 {
         Self::stake_of(&env, &contract_id)
@@ -1993,6 +2101,8 @@ impl LuminaRegistry {
         Ok(ContractProfile {
             reputation,
             entry,
+            superseded_by: env.storage().persistent()
+                .get(&DataKey::SupersededBy(contract_id)),
         })
     }
 
@@ -2009,6 +2119,8 @@ impl LuminaRegistry {
                     if entry.active {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            superseded_by: env.storage().persistent()
+                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
                         });
                     }
@@ -2143,6 +2255,8 @@ impl LuminaRegistry {
                     if entry.active {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            superseded_by: env.storage().persistent()
+                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
                         });
                     }
@@ -2223,7 +2337,8 @@ impl LuminaRegistry {
 
         // Require caller to be the owner OR a member of the admin set.
         let is_owner = caller == entry.owner;
-        let is_admin = Self::is_admin_member(&env, &caller);
+        let admins = Self::admin_index(&env);
+        let is_admin = admins.contains(&caller);
 
         // Fall back to the legacy single-admin check for the upgrade tests.
         let is_legacy_admin = env.storage()
@@ -2309,18 +2424,14 @@ impl LuminaRegistry {
     }
 
     /// Return `NotAdmin` if `addr` is not in the current admin set.
-    fn assert_is_admin(env: &Env, addr: &Address) -> Result<(), RegistryError> {
-        if !env.storage().instance().has(&DataKey::Admins) {
+    fn assert_is_admin(admins: &Vec<Address>, addr: &Address) -> Result<(), RegistryError> {
+        if admins.is_empty() {
             return Err(RegistryError::NotInitialized);
         }
-        if !Self::is_admin_member(env, addr) {
+        if !admins.contains(addr) {
             return Err(RegistryError::NotAdmin);
         }
         Ok(())
-    }
-
-    fn is_admin_member(env: &Env, addr: &Address) -> bool {
-        Self::admin_index(env).contains(addr)
     }
 
     /// Allocate a new proposal ID, store the proposal, and return the ID.
@@ -2421,6 +2532,21 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
+                if treasury == env.current_contract_address() {
+                    return Err(RegistryError::InvalidMetadata);
+                }
+                let _ = token::Client::new(env, token_id).decimals();
+                // Guard at execution time as well as proposal time: the
+                // registration state may have changed between the two, and an
+                // overlap that slipped through (e.g. a pre-existing proposal
+                // created before the contract was registered) must still be
+                // caught before the config is written.
+                if env.storage().persistent().has(&DataKey::Contract(token_id.clone())) {
+                    return Err(RegistryError::OverlappingAddress);
+                }
+                if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+                    return Err(RegistryError::OverlappingAddress);
+                }
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
@@ -2452,9 +2578,7 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::Slash(contract_id, amount, reason) => {
-                if *amount <= 0 {
-                    return Err(RegistryError::InvalidAmount);
-                }
+                Self::validate_positive_amount(*amount)?;
 
                 let staked = Self::stake_of(env, contract_id);
                 if staked < *amount {
@@ -2469,11 +2593,20 @@ impl LuminaRegistry {
                     amount,
                 );
 
+                let new_stake = staked - *amount;
                 env.storage().persistent()
-                    .set(&DataKey::Stake(contract_id.clone()), &(staked - *amount));
+                    .set(&DataKey::Stake(contract_id.clone()), &new_stake);
 
-                let total_staked: i128 = env.storage().persistent().get(&DataKey::TotalStaked).unwrap_or(0);
+                let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
                 env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - *amount));
+
+                let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+                if minimum > 0 && staked >= minimum && new_stake < minimum {
+                    env.events().publish(
+                        (Symbol::new(env, "stake_crossed_minimum"),),
+                        (contract_id.clone(), new_stake, minimum, Symbol::new(env, "below")),
+                    );
+                }
 
                 let slashed_at = env.ledger().sequence();
                 let mut history = Self::slash_history(env, contract_id);
@@ -2532,6 +2665,31 @@ impl LuminaRegistry {
                     (*fee,),
                 );
             }
+            ProposalAction::ConfigureMinimumStake(minimum) => {
+                if *minimum < 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                env.storage().instance().set(&DataKey::MinimumStake, minimum);
+                env.events().publish(
+                    (Symbol::new(env, "minimum_stake_set"),),
+                    (*minimum,),
+                );
+            }
+            ProposalAction::WithdrawFromTreasury(amount) => {
+                if *amount <= 0 {
+                    return Err(RegistryError::InvalidAmount);
+                }
+                let (token_id, treasury) = Self::staking_config(env)?;
+                token::Client::new(env, &token_id).transfer(
+                    &treasury,
+                    &env.current_contract_address(),
+                    amount,
+                );
+                env.events().publish(
+                    (Symbol::new(env, "treasury_withdrawn"),),
+                    (*amount,),
+                );
+            }
         }
         Ok(())
     }
@@ -2546,6 +2704,13 @@ impl LuminaRegistry {
             .get(&DataKey::Treasury)
             .ok_or(RegistryError::StakingNotConfigured)?;
         Ok((token_id, treasury))
+    }
+
+    fn validate_positive_amount(amount: i128) -> Result<(), RegistryError> {
+        if amount <= 0 {
+            return Err(RegistryError::InvalidAmount);
+        }
+        Ok(())
     }
 
     fn stake_of(env: &Env, contract_id: &Address) -> i128 {
@@ -2666,6 +2831,8 @@ impl LuminaRegistry {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::{IntoVal, TryFromVal};
@@ -2938,6 +3105,34 @@ mod test {
             client.try_propose_deactivate(&stranger, &target),
             Err(Ok(RegistryError::NotAdmin))
         );
+    }
+
+    #[test]
+    fn admin_membership_cache_cost_benchmark() {
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().instance().has(&DataKey::Admins));
+            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            assert!(admins.contains(&admin));
+        });
+        let uncached_cpu = env.budget().cpu_instruction_cost();
+        let uncached_memory = env.budget().memory_bytes_cost();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            let admins = LuminaRegistry::admin_index(&env);
+            LuminaRegistry::assert_is_admin(&admins, &admin).unwrap();
+        });
+        let cached_cpu = env.budget().cpu_instruction_cost();
+        let cached_memory = env.budget().memory_bytes_cost();
+
+        std::println!(
+            "admin membership cost: cpu {uncached_cpu} -> {cached_cpu}, memory {uncached_memory} -> {cached_memory}"
+        );
+        assert!(cached_cpu < uncached_cpu);
     }
 
     #[test]
@@ -5423,5 +5618,51 @@ mod test {
         assert_eq!(client.get_contract_count(), 1);
         assert_eq!(client.get_total_registered(), 2);
         assert_eq!(client.get_active_contract_count(), 1);
+    }
+
+    // ── set_superseded_by ───────────────────────────────────────────────────
+
+    #[test]
+    fn owner_can_set_superseded_by_and_profile_surfaces_it() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+
+        client.set_superseded_by(&owner, &old, &new_contract);
+
+        let profile = client.get_contract_profile(&old);
+        assert_eq!(profile.superseded_by, Some(new_contract));
+    }
+
+    #[test]
+    fn set_superseded_by_rejects_unregistered_replacement() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let ghost = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&owner, &old, &ghost),
+            Err(Ok(RegistryError::ContractNotFound))
+        );
+    }
+
+    #[test]
+    fn set_superseded_by_is_owner_only() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&stranger, &old, &new_contract),
+            Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn superseded_by_is_none_by_default() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_contract_profile(&target).superseded_by, None);
     }
 }
