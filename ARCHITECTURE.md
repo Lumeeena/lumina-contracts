@@ -83,13 +83,16 @@ name, description, registration ledger, and active flag. Reputation is joined
 at read time by `get_contract_profile` and `get_active_profiles`. This avoids a
 storage migration whenever reputation gains a new field.
 
-The indexes contain addresses rather than copies of `ContractEntry`. Global,
-category, and profile listing reads resolve each address and return only active
-entries. Their `offset` is a position in the underlying ordered index; inactive
-or missing entries are skipped without consuming the result `limit`, so the
-scan continues until it fills the result or reaches the end of the raw index.
-`get_contracts_by_owner` is different: it resolves the owner's ordered index
-without filtering and therefore includes inactive registrations.
+The indexes contain addresses rather than copies of `ContractEntry`.
+`get_active_contracts`, `get_active_contract_ids`, the active contract/profile
+page methods, `get_active_profiles`, and `get_active_contracts_by_category`
+apply `offset` to their underlying global or category index. They skip inactive
+or missing entries without consuming the result `limit`, continuing until the
+result is full or the raw index ends. `get_contracts_by_categories` differs: it
+first builds a deduplicated union of active entries and then applies `offset`
+and `limit` to that filtered union. `get_contracts_by_owner` also differs: it
+resolves the owner's ordered index without active filtering and therefore
+includes inactive registrations.
 
 ## Registration lifecycle
 
@@ -163,15 +166,20 @@ if an action or token transfer fails, the executed flag and every other write
 from that invocation roll back. Admin-removal and threshold actions also
 validate that the resulting threshold remains satisfiable.
 
-The production timelock is 17,280 ledgers (approximately 24 hours at six
+The production timelock is 17,280 ledgers (approximately 28.8 hours at six
 seconds per ledger). Tests use 10 ledgers so they can exercise boundaries
 without archiving fixture storage.
 
 ## Staking, verification, and slashing
 
 Staking is unavailable until governance configures a SEP-41 token and a
-treasury. It is an optional reputation layer: registration itself does not
-require collateral unless governance separately enables a fee or policy.
+treasury. It is an optional reputation layer: registration never requires
+staked collateral. Governance can separately gate registration with the
+allowlist or rate limit, and can charge a registration fee in the configured
+token; that fee goes to the treasury and is not credited as stake. The governed
+`MinimumStake` value likewise does not gate registration: it only causes
+threshold-crossing events when stake, slash, or withdrawal changes a recorded
+stake balance.
 
 ```text
 owner -- stake --> registry token balance
