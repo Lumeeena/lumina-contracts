@@ -27,7 +27,7 @@
 //! ```
 
 use lumina_registry_interface::{
-    Category, ContractEntry, ContractPage, ContractProfile, ContractProfilePage, RegistryError,
+    Attestation, Category, ContractEntry, ContractPage, ContractProfile, ContractProfilePage, RegistryError,
     RegistryInterfaceClient, RegistryStats, Reputation, SlashRecord,
 };
 use soroban_sdk::testutils::Address as _;
@@ -170,7 +170,7 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 31] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
@@ -178,18 +178,20 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
     ("get_proposal", "proposal_id: U32", "Result<Proposal, RegistryError>"),
     ("get_categories", "contract_id: Address", "Vec<Category>"),
     ("get_tags", "contract_id: Address", "Vec<String>"),
+    ("get_attestations", "contract_id: Address", "Vec<Attestation>"),
     (
         "get_active_contracts_by_category",
         "category: Category, offset: U32, limit: U32",
         "Vec<ContractEntry>",
     ),
     (
-        "get_active_by_categories",
+        "get_contracts_by_categories",
         "categories: Vec<Category>, offset: U32, limit: U32",
         "Result<Vec<ContractEntry>, RegistryError>",
     ),
     ("get_staking_config", "", "Result<(Address, Address), RegistryError>"),
     ("get_registration_fee", "", "I128"),
+    ("get_minimum_stake", "", "I128"),
     ("get_stake", "contract_id: Address", "I128"),
     ("is_verified", "contract_id: Address", "Bool"),
     ("is_registered", "contract_id: Address", "Bool"),
@@ -223,6 +225,7 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 28] = [
         "owner: Address, offset: U32, limit: U32",
         "Vec<ContractEntry>",
     ),
+    ("get_pending_owner", "contract_id: Address", "Option<Address>"),
 ];
 
 /// The signature a spec entry must have, spelled the way `load_spec` spells it.
@@ -443,6 +446,11 @@ fn interface_types_match_the_registry() {
     // *not* get sorted — the ones below keep declaration order.
     assert_struct(
         &spec,
+        "Attestation",
+        "{attester: Address, created_at: U32, label: String}",
+    );
+    assert_struct(
+        &spec,
         "ContractEntry",
         "{active: Bool, contract_id: Address, description: String, name: String, \
          owner: Address, registered_at: U32}",
@@ -450,7 +458,7 @@ fn interface_types_match_the_registry() {
     assert_struct(
         &spec,
         "ContractProfile",
-        "{entry: ContractEntry, reputation: Reputation}",
+        "{entry: ContractEntry, reputation: Reputation, superseded_by: Option<Address>}",
     );
     assert_struct(
         &spec,
@@ -500,7 +508,8 @@ fn interface_types_match_the_registry() {
         "Deactivate(Address),Upgrade(BytesN<32>),AddAdmin(Address),RemoveAdmin(Address),\
          ChangeThreshold(U32),ConfigureStaking(Address,Address),SetVerified(Address,Bool),\
          Slash(Address,I128,String),SetAllowlistEnabled(Bool),SetAllowlisted(Address,Bool),\
-         ConfigureRegistrationRateLimit(U32,U32),SetRegistrationFee(I128)",
+         ConfigureRegistrationRateLimit(U32,U32),SetRegistrationFee(I128),\
+         ConfigureMinimumStake(I128),WithdrawFromTreasury(I128)",
     );
 }
 
@@ -547,6 +556,10 @@ fn interface_error_codes_match_the_registry() {
         (RegistryError::RegistrationRateLimited as u32, "RegistrationRateLimited"),
         (RegistryError::InsufficientFee as u32, "InsufficientFee"),
         (RegistryError::InvalidTags as u32, "InvalidTags"),
+        (RegistryError::InvalidAttestation as u32, "InvalidAttestation"),
+        (RegistryError::AttestationNotFound as u32, "AttestationNotFound"),
+        (RegistryError::OverlappingAddress as u32, "OverlappingAddress"),
+        (RegistryError::NoPendingTransfer as u32, "NoPendingTransfer"),
     ];
 
     for (code, name) in declared {
@@ -576,6 +589,7 @@ fn the_client_is_constructible_and_typed() {
     let _: Option<ContractProfile> = None;
     let _: Option<Reputation> = None;
     let _: Option<SlashRecord> = None;
+    let _: Option<Attestation> = None;
     let _: Option<ContractPage> = None;
     let _: Option<ContractProfilePage> = None;
     let _: Option<RegistryStats> = None;
@@ -583,3 +597,116 @@ fn the_client_is_constructible_and_typed() {
     let _: Option<soroban_sdk::String> = None;
     let _: Option<soroban_sdk::Vec<u32>> = None;
 }
+
+fn render_interface(entries: &[ScSpecEntry]) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry {
+            ScSpecEntry::FunctionV0(f) => {
+                let args = f
+                    .inputs
+                    .iter()
+                    .map(|i| format!("{}: {}", i.name.to_utf8_string_lossy(), render_type(&i.type_)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = match f.outputs.first() {
+                    Some(out) => format!(" -> {}", render_type(out)),
+                    None => String::new(),
+                };
+                format!("fn {}({}){}", f.name.0.to_utf8_string_lossy(), args, ret)
+            }
+            ScSpecEntry::UdtStructV0(s) => {
+                let fields = s
+                    .fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name.to_utf8_string_lossy(), render_type(&f.type_)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("struct {} {{ {} }}", s.name.to_utf8_string_lossy(), fields)
+            }
+            ScSpecEntry::UdtUnionV0(u) => {
+                let cases = u
+                    .cases
+                    .iter()
+                    .map(|c| match c {
+                        ScSpecUdtUnionCaseV0::VoidV0(v) => v.name.to_utf8_string_lossy(),
+                        ScSpecUdtUnionCaseV0::TupleV0(t) => format!(
+                            "{}({})",
+                            t.name.to_utf8_string_lossy(),
+                            t.type_.iter().map(render_type).collect::<Vec<_>>().join(", ")
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("union {} {{ {} }}", u.name.to_utf8_string_lossy(), cases)
+            }
+            ScSpecEntry::UdtEnumV0(e) => {
+                let cases = e
+                    .cases
+                    .iter()
+                    .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("enum {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+            }
+            ScSpecEntry::UdtErrorEnumV0(e) => {
+                let cases = e
+                    .cases
+                    .iter()
+                    .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("error {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+            }
+        })
+        .collect();
+    lines.sort();
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+#[test]
+fn exported_interface_matches_snapshot() {
+    let wasm_path = registry_wasm();
+    let wasm = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {} ({e}). Run `cargo build --target wasm32v1-none --release` first.",
+            wasm_path.display()
+        )
+    });
+    let entries = soroban_spec::read::from_wasm(&wasm).expect("wasm has no readable contract spec");
+    let actual = render_interface(&entries);
+
+    let mut snap_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    snap_path.pop();
+    snap_path.push("registry/interface.snap");
+
+    if std::env::var_os("UPDATE_INTERFACE_SNAPSHOT").is_some() {
+        std::fs::write(&snap_path, &actual).expect("write interface snapshot");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(&snap_path).unwrap_or_default();
+    if actual == expected {
+        return;
+    }
+
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let mut diff = String::new();
+    for line in &expected_lines {
+        if !actual_lines.contains(line) {
+            diff.push_str(&format!("- {line}\n"));
+        }
+    }
+    for line in &actual_lines {
+        if !expected_lines.contains(line) {
+            diff.push_str(&format!("+ {line}\n"));
+        }
+    }
+    panic!(
+        "\nThe registry's exported interface changed:\n\n{diff}\n"
+    );
+}
+

@@ -118,6 +118,10 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or maximum reached. | Pass a non-empty label of at most 64 bytes. |
+/// | 28 | `AttestationNotFound` | Caller has no attestation to revoke on this registration. | Only revoke attestations you created. |
+/// | 29 | `OverlappingAddress` | Token or treasury address overlaps with a registered contract. | Use distinct addresses for staking config. |
+/// | 30 | `NoPendingTransfer` | No ownership transfer is currently pending for this contract. | Propose a transfer first with `propose_ownership_transfer`. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -180,6 +184,10 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The token or treasury address overlaps with an already registered contract.
+    OverlappingAddress = 29,
+    /// No ownership transfer is currently proposed for this contract.
+    NoPendingTransfer = 30,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -569,6 +577,14 @@ pub enum DataKey {
     /// entry already written (see the upgrade-compatibility rules above),
     /// whereas a new `DataKey` variant is safe.
     Attestations(Address),
+
+    // ── Ownership transfer ──────────────────────────────────────────────────
+    /// Address — pending owner proposed for a two-step ownership transfer.
+    PendingOwner(Address),
+
+    // ── Contract succession ─────────────────────────────────────────────────
+    /// Address — the contract that supersedes this one.
+    SupersededBy(Address),
 
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
@@ -993,7 +1009,8 @@ impl LuminaRegistry {
         minimum: i128,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if minimum < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1016,7 +1033,8 @@ impl LuminaRegistry {
         amount: i128,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if amount <= 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1228,6 +1246,8 @@ impl LuminaRegistry {
         env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Tags(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::SupersededBy(contract_id.clone()));
         // Attestations are opinions about a live registration; once the entry
         // is gone they have nothing left to refer to. Slashes, by contrast,
         // are kept above, because those stay auditable after the fact.
@@ -1607,9 +1627,7 @@ impl LuminaRegistry {
         }
 
         for tag in tags.iter() {
-            // `Symbol::to_string` only exists for non-wasm targets, so measure
-            // the symbol through its XDR form, which is available in both.
-            if Self::symbol_len(&env, &tag) > MAX_TAG_LEN {
+            if tag.len() > MAX_TAG_LEN {
                 return Err(RegistryError::InvalidTags);
             }
         }
@@ -2358,9 +2376,159 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    /// Hand a registration over to a new owner.
-    /// Only the current owner can call this (admin override removed — ownership
-    /// transfer should be driven by the owner themselves).
+    /// Point a registration at another contract that replaces it.
+    ///
+    /// Only the registered owner can call this. Both contracts must already exist.
+    pub fn set_superseded_by(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        superseded_by: Address,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        if !env.storage().persistent().has(&DataKey::Contract(superseded_by.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        env.storage().persistent().set(&DataKey::SupersededBy(contract_id.clone()), &superseded_by);
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_superseded"),),
+            (contract_id, owner, superseded_by),
+        );
+
+        Ok(())
+    }
+
+    /// Propose transferring ownership of a registration to `new_owner`.
+    ///
+    /// The transfer remains pending until `new_owner` calls `accept_ownership`.
+    /// Until then, the current owner retains full ownership and rights.
+    /// May be cancelled by the owner at any time before acceptance via
+    /// `cancel_ownership_transfer`.
+    pub fn propose_ownership_transfer(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+        new_owner: Address,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if caller != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        env.storage().persistent().set(&DataKey::PendingOwner(contract_id.clone()), &new_owner);
+
+        env.events().publish(
+            (Symbol::new(&env, "ownership_transfer_proposed"),),
+            (contract_id, caller, new_owner),
+        );
+
+        Ok(())
+    }
+
+    /// Accept a proposed ownership transfer and become the new registered owner.
+    ///
+    /// Caller must be the address designated as `new_owner` in
+    /// `propose_ownership_transfer`.
+    pub fn accept_ownership(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let mut entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        let pending_owner: Address = env.storage().persistent()
+            .get(&DataKey::PendingOwner(contract_id.clone()))
+            .ok_or(RegistryError::NoPendingTransfer)?;
+
+        if caller != pending_owner {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        let previous_owner = entry.owner.clone();
+        if previous_owner != caller {
+            let mut previous_owned = Self::owner_index(&env, &previous_owner);
+            if let Some(i) = previous_owned.first_index_of(&contract_id) {
+                previous_owned.remove(i);
+                Self::set_owner_index(&env, &previous_owner, &previous_owned);
+            }
+
+            let mut new_owned = Self::owner_index(&env, &caller);
+            new_owned.push_back(contract_id.clone());
+            Self::set_owner_index(&env, &caller, &new_owned);
+
+            entry.owner = caller.clone();
+            env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
+        }
+
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "ownership_transferred"),),
+            (contract_id, previous_owner, caller),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending ownership transfer for a registration.
+    ///
+    /// Callable only by the current registered owner.
+    pub fn cancel_ownership_transfer(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if caller != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        if !env.storage().persistent().has(&DataKey::PendingOwner(contract_id.clone())) {
+            return Err(RegistryError::NoPendingTransfer);
+        }
+
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "ownership_transfer_canceled"),),
+            (contract_id, caller),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the pending owner for a registration, if an ownership transfer is in flight.
+    pub fn get_pending_owner(env: Env, contract_id: Address) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PendingOwner(contract_id))
+    }
+
+    /// Single-step ownership transfer behind governance for emergency recovery
+    /// when an owner key is genuinely lost. Restricted to admins only.
     pub fn transfer_ownership(
         env: Env,
         caller: Address,
@@ -2373,8 +2541,6 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        // Require caller to be the owner OR a member of the admin set.
-        let is_owner = caller == entry.owner;
         let admins = Self::admin_index(&env);
         let is_admin = admins.contains(&caller);
 
@@ -2385,9 +2551,9 @@ impl LuminaRegistry {
             .map(|a| a == caller)
             .unwrap_or(false);
 
-        if !is_owner && !is_admin && !is_legacy_admin {
-            // Neither the new multi-sig admins nor the legacy admin nor the
-            // owner — check whether we're initialized at all so the error
+        if !is_admin && !is_legacy_admin {
+            // Neither the new multi-sig admins nor the legacy admin —
+            // check whether we're initialized at all so the error
             // message stays informative.
             if !env.storage().instance().has(&DataKey::Admins)
                 && !env.storage().instance().has(&DataKey::Admin)
@@ -2399,6 +2565,7 @@ impl LuminaRegistry {
 
         let previous_owner = entry.owner.clone();
         if previous_owner == new_owner {
+            env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
             return Ok(());
         }
 
@@ -2414,6 +2581,7 @@ impl LuminaRegistry {
 
         entry.owner = new_owner.clone();
         env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "ownership_transferred"),),
@@ -2570,7 +2738,7 @@ impl LuminaRegistry {
                 );
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
-                if treasury == env.current_contract_address() {
+                if *treasury == env.current_contract_address() {
                     return Err(RegistryError::InvalidMetadata);
                 }
                 let _ = token::Client::new(env, token_id).decimals();
@@ -3538,7 +3706,10 @@ mod test {
         let kept = register_for(&env, &client, &owner);
         let new_owner = Address::generate(&env);
 
-        client.transfer_ownership(&owner, &target, &new_owner);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        assert_eq!(client.get_pending_owner(&target), Some(new_owner.clone()));
+        client.accept_ownership(&new_owner, &target);
+        assert_eq!(client.get_pending_owner(&target), None);
 
         let old_entries = client.get_contracts_by_owner(&owner, &0, &10);
         assert_eq!(old_entries.len(), 1);
@@ -3578,11 +3749,153 @@ mod test {
 
     #[test]
     fn transfer_ownership_to_current_owner_is_noop() {
-        let (env, client, _admin) = setup();
+        let (env, client, admin) = setup();
         let (owner, target) = register_sample(&env, &client);
-        client.transfer_ownership(&owner, &target, &owner);
+        client.transfer_ownership(&admin, &target, &owner);
         let entries = client.get_contracts_by_owner(&owner, &0, &10);
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn propose_transfer_unaccepted_leaves_original_owner_in_place() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+
+        // The original owner remains the owner with full rights.
+        let entry = client.get_contract(&target);
+        assert_eq!(entry.owner, owner);
+
+        let new_name = String::from_str(&env, "Still My Contract");
+        let new_desc = String::from_str(&env, "Owner retains full control");
+        client.update_metadata(&owner, &target, &new_name, &new_desc);
+        assert_eq!(client.get_contract(&target).name, new_name);
+    }
+
+    #[test]
+    fn cancel_ownership_transfer_removes_pending_and_blocks_accept() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+
+        // Non-owner cannot cancel.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_cancel_ownership_transfer(&stranger, &target),
+            Err(Ok(RegistryError::NotOwner))
+        );
+
+        // Owner cancels pending transfer.
+        client.cancel_ownership_transfer(&owner, &target);
+        assert_eq!(client.get_pending_owner(&target), None);
+
+        // Subsequent accept fails.
+        assert_eq!(
+            client.try_accept_ownership(&pending, &target),
+            Err(Ok(RegistryError::NoPendingTransfer))
+        );
+
+        // Cancelling when there is no pending transfer fails.
+        assert_eq!(
+            client.try_cancel_ownership_transfer(&owner, &target),
+            Err(Ok(RegistryError::NoPendingTransfer))
+        );
+    }
+
+    #[test]
+    fn accept_ownership_by_unauthorized_fails() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+
+        // Stranger cannot accept.
+        assert_eq!(
+            client.try_accept_ownership(&stranger, &target),
+            Err(Ok(RegistryError::Unauthorized))
+        );
+
+        // Original owner is still owner.
+        assert_eq!(client.get_contract(&target).owner, owner);
+    }
+
+    #[test]
+    fn propose_ownership_transfer_non_owner_fails() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_ownership_transfer(&stranger, &target, &new_owner),
+            Err(Ok(RegistryError::NotOwner))
+        );
+        assert_eq!(client.get_pending_owner(&target), None);
+    }
+
+    #[test]
+    fn pending_transfer_does_not_block_deactivation_or_metadata_updates() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+
+        // Owner updates metadata.
+        let name = String::from_str(&env, "Updated While Pending");
+        let desc = String::from_str(&env, "Description update");
+        client.update_metadata(&owner, &target, &name, &desc);
+        assert_eq!(client.get_contract(&target).name, name);
+
+        // Owner sets categories and tags.
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::Payments]));
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "payments"));
+        client.set_tags(&owner, &target, &tags);
+        assert_eq!(client.get_tags(&target), tags);
+
+        // Owner deactivates.
+        client.deactivate(&owner, &target);
+        assert!(!client.get_contract(&target).active);
+
+        // Pending transfer is still intact and can be accepted.
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+        client.accept_ownership(&pending, &target);
+        assert_eq!(client.get_contract(&target).owner, pending);
+        assert_eq!(client.get_pending_owner(&target), None);
+    }
+
+    #[test]
+    fn admin_recovery_transfer_clears_pending_transfer() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+        let recovered_owner = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+
+        // Admin recovery one-step transfer.
+        client.transfer_ownership(&admin, &target, &recovered_owner);
+
+        assert_eq!(client.get_contract(&target).owner, recovered_owner);
+        assert_eq!(client.get_pending_owner(&target), None);
+
+        // Pending owner can no longer accept.
+        assert_eq!(
+            client.try_accept_ownership(&pending, &target),
+            Err(Ok(RegistryError::NoPendingTransfer))
+        );
     }
 
     #[test]
@@ -3875,7 +4188,8 @@ mod test {
         let (owner, target) = register_sample(&env, &client);
         let new_owner = Address::generate(&env);
 
-        client.transfer_ownership(&owner, &target, &new_owner);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        client.accept_ownership(&new_owner, &target);
 
         // Admin deactivation goes through governance.
         let pid = client.propose_deactivate(&a1, &target);
@@ -3888,7 +4202,7 @@ mod test {
     }
 
     #[test]
-    fn transfer_ownership_succeeds_with_real_owner_signature() {
+    fn propose_and_accept_ownership_transfer_succeeds_with_real_signatures() {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
         let new_owner = Address::generate(&env);
@@ -3897,18 +4211,31 @@ mod test {
             address: &owner,
             invoke: &MockAuthInvoke {
                 contract: &client.address,
-                fn_name: "transfer_ownership",
+                fn_name: "propose_ownership_transfer",
                 args: (owner.clone(), target.clone(), new_owner.clone()).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        client.transfer_ownership(&owner, &target, &new_owner);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        assert_eq!(client.get_pending_owner(&target), Some(new_owner.clone()));
+
+        env.mock_auths(&[MockAuth {
+            address: &new_owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_ownership",
+                args: (new_owner.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_ownership(&new_owner, &target);
         assert_eq!(client.get_contract(&target).owner, new_owner);
+        assert_eq!(client.get_pending_owner(&target), None);
     }
 
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
-    fn transfer_ownership_without_caller_signature_panics() {
+    fn propose_ownership_transfer_without_caller_signature_panics() {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
         let new_owner = Address::generate(&env);
@@ -3917,12 +4244,12 @@ mod test {
             address: &new_owner,
             invoke: &MockAuthInvoke {
                 contract: &client.address,
-                fn_name: "transfer_ownership",
+                fn_name: "propose_ownership_transfer",
                 args: (owner.clone(), target.clone(), new_owner.clone()).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        client.transfer_ownership(&owner, &target, &new_owner);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
     }
 
     #[test]
@@ -4630,6 +4957,10 @@ mod test {
             env.storage().persistent().get(&FailingTokenKey::Balance(id)).unwrap_or(0)
         }
 
+        pub fn decimals(_env: Env) -> u32 {
+            7
+        }
+
         pub fn set_failing(env: Env, failing: bool) {
             env.storage().instance().set(&FailingTokenKey::Failing, &failing);
         }
@@ -5100,7 +5431,8 @@ mod test {
         let target = register_in(&env, &client, &owner, &[Category::DeFi]);
         let new_owner = Address::generate(&env);
 
-        client.transfer_ownership(&owner, &target, &new_owner);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        client.accept_ownership(&new_owner, &target);
 
         // The old owner has lost the right to refile it; the new one has it.
         assert_eq!(
@@ -5123,7 +5455,8 @@ mod test {
         let pid = client.propose_set_verified(&admin, &target, &true);
         pass_proposal(&env, &client, &admin, pid);
 
-        client.transfer_ownership(&owner, &target, &new_owner);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        client.accept_ownership(&new_owner, &target);
 
         let profile = client.get_contract_profile(&target);
         assert_eq!(profile.entry.owner, new_owner);

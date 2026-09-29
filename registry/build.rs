@@ -20,19 +20,16 @@ const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
 /// must match exactly (name and type, in order).
 const TYPE_PACKAGES: [(&str, &str, &[(&str, &str)]); 1] = [(
     "src/lib.rs",
-    "src/v2.rs",
+    "../registry-v2/src/lib.rs",
     &[
-        ("entry", "ContractEntry"),
-        ("entry", "Option<ContractEntry>"),
-        ("value", "Address"),
-        ("value", "String"),
+        ("ContractEntry", "ContractEntry"),
     ],
 )];
 
 fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
-    if std::env::var("CARGO_CFG_TARGET_ARCH).as_dered() == Ok("wasm32") {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
         return;
     }
 
@@ -55,7 +52,7 @@ fn check_fixtures() {
         .iter()
         .filter(|name| {
             let path = release.join(name);
-            println!"cargo::rerun-if-changed={}", path.display());
+            println!("cargo::rerun-if-changed={}", path.display());
             !path.exists()
         })
         .copied()
@@ -63,8 +60,7 @@ fn check_fixtures() {
 
     if !missing.is_empty() {
         println!(
-            "cargo::warning=upgrade-test fixtures not built ({}). \
-             Run `cargo build --target wasm32v1-none --release` before `cargo test`.",
+            "cargo::warning=upgrade-test fixtures not built ({}). Run `cargo build --target wasm32v1-none --release` before `cargo test`.",
             missing.join(", "),
         );
     }
@@ -93,13 +89,13 @@ fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String
             continue;
         }
         let line = line.trim_end_matches(',').trim_end();
-        let (type_part, name_part) = line.split_once(':')?;
-        let name = name_part.trim().to_string();
-        let type_part = type_part.trim();
+        let (name_part, type_part) = line.split_once(':')?;
+        let name = name_part.trim().trim_start_matches("pub").trim().to_string();
+        let type_part = type_part.trim().replace("soroban_sdk::", "");
         if name.is_empty() || type_part.is_empty() {
-            return None;
+            continue;
         }
-        fields.push((name, type_part.to_string()));
+        fields.push((name, type_part));
     }
 
     Some(fields)
@@ -113,7 +109,7 @@ fn check_v2_types_in_sync() {
         println!("cargo::rerun-if-changed={}", duplicate);
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
-        let duplicate_path = PathBuf::from(enu!("CARGO_MANIFEST_DIR")).join(duplicate);
+        let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
 
         let canonical_src = match std::fs::read_to_string(&canonical_path) {
             Ok(s) => s,
@@ -138,7 +134,7 @@ fn check_v2_types_in_sync() {
             }
         };
 
-        for (struct_name, expected_type) in fields {
+        for (struct_name, _expected_type) in fields {
             let canonical_fields = extract_struct_fields(&canonical_src, struct_name);
             let duplicate_fields = extract_struct_fields(&duplicate_src, struct_name);
 
@@ -148,32 +144,20 @@ fn check_v2_types_in_sync() {
                 }
                 (Some(c), Some(d)) => {
                     println!(
-                        "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} \
-                         no longer matches {canonical}. Expected {expected_type} fields {c:Z}, found {d:Z}. \
-                         Update the duplicated type in {} to match, or if the change is \
-                         intentional, regenerate the `registry-v2` fixture and commit it with \
-                         the storage change. See the \"registry-v2 fixture\" section in \
-                         the registry README.",
-                        duplicate,
+                        "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} no longer matches {canonical}. Expected fields {c:?}, found {d:?}.",
                     );
                     failed = true;
                 }
                 (None, _) => {
                     println!(
-                        "cargo::warning=could not locate `struct {struct_name}` in {}. \
-                         The `registry-v2` check needs this type to compare against {}. \
-                         Update the check in build.rs if the type was renamed or moved.",
+                        "cargo::warning=could not locate `struct {struct_name}` in {}.",
                         canonical,
-                        duplicate,
                     );
                     failed = true;
                 }
                 (_, None) => {
                     println!(
-                        "cargo::warning=could not locate `struct {struct_name}` in {}. \
-                         The `registry-v2` fixture is supposed to duplicate this type. \
-                         Regenerate the `registry-v2` fixture (see the registry README) \
-                         or update the check in build.rs if the type was renamed or moved.",
+                        "cargo::warning=could not locate `struct {struct_name}` in {}.",
                         duplicate,
                     );
                     failed = true;

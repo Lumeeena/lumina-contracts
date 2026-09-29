@@ -119,6 +119,10 @@ pub trait RegistryInterface {
     /// or that was never registered.
     fn get_tags(env: Env, contract_id: Address) -> Vec<String>;
 
+    /// Third-party attestations on a registered contract. Empty for one that has none,
+    /// or that was never registered.
+    fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation>;
+
     /// One page of active registrations filed under `category`, in
     /// registration order.
     ///
@@ -137,7 +141,7 @@ pub trait RegistryInterface {
     ///
     /// Errors with `NoCategories` if `categories` is empty. Paging semantics
     /// as for `get_active_contracts_by_category`.
-    fn get_active_by_categories(
+    fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
         offset: u32,
@@ -150,6 +154,9 @@ pub trait RegistryInterface {
 
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
+
+    /// Minimum stake threshold. Zero means no minimum.
+    fn get_minimum_stake(env: Env) -> i128;
 
     /// Currently staked balance. Zero for a registration that never staked,
     /// and zero — not an error — for an address that was never registered.
@@ -228,6 +235,9 @@ pub trait RegistryInterface {
 
     /// Every contract registered by `owner`, **including** deactivated ones.
     fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry>;
+
+    /// Retrieve the pending owner for a registration, if an ownership transfer is in flight.
+    fn get_pending_owner(env: Env, contract_id: Address) -> Option<Address>;
 }
 
 /// Errors the registry's read-only surface can return.
@@ -295,6 +305,15 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
+    /// The token or treasury address overlaps with an already registered contract.
+    OverlappingAddress = 29,
+    /// No ownership transfer is currently proposed for this contract.
+    NoPendingTransfer = 30,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -369,6 +388,18 @@ pub struct Reputation {
     pub withdraw_locked_until: u32,
 }
 
+/// Byte-compatible with `lumina_registry::Attestation`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attestation {
+    /// The account that made the attestation.
+    pub attester: Address,
+    /// Human-readable label.
+    pub label: String,
+    /// Ledger at which the attestation was recorded.
+    pub created_at: u32,
+}
+
 /// Byte-compatible with `lumina_registry::ContractProfile`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -377,6 +408,8 @@ pub struct ContractProfile {
     pub entry: ContractEntry,
     /// The reputation and staking signal.
     pub reputation: Reputation,
+    /// The contract that supersedes this one, if the owner has set one.
+    pub superseded_by: Option<Address>,
 }
 
 /// Byte-compatible with `lumina_registry::ContractPage`.
@@ -466,4 +499,8 @@ pub enum ProposalAction {
     ConfigureRegistrationRateLimit(u32, u32),
     /// Set the registration fee in the stake token; zero disables it.
     SetRegistrationFee(i128),
+    /// Set the minimum stake threshold; zero disables it.
+    ConfigureMinimumStake(i128),
+    /// Withdraw from the treasury.
+    WithdrawFromTreasury(i128),
 }
