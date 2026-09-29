@@ -455,7 +455,7 @@ fn interface_types_match_the_registry() {
     assert_struct(
         &spec,
         "Reputation",
-        "{slashed_total: I128, stake: I128, verified: Bool, withdraw_locked_until: U32}",
+        "{slashed_total: I128, stake: I128, verified: Bool, withdraw_locked: Bool, withdraw_locked_until: U32}",
     );
     assert_struct(
         &spec,
