@@ -180,14 +180,14 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
-    /// The stake accounting arithmetic would overflow `i128`.
+    /// The stake arithmetic would overflow `i128`.
     ///
     /// Note: the workspace profile enables `overflow-checks`, so an unchecked
-    /// `+`/`-` would trap rather than wrap. That profile setting is a backstop,
-    /// not the mechanism — the stake and slash paths use explicit checked
-    /// arithmetic and return this error instead, so the behaviour holds
-    /// regardless of the profile setting.
-    StakeOverflow = 29,
+    /// `+`/`-` would trap rather than wrap. That profile setting is a backstop
+    /// for arithmetic we have not audited, not the mechanism that protects
+    /// stake accounting — the stake and slash paths use explicit checked
+    /// arithmetic and return this error instead.
+    StakeOverflow       = 29,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────

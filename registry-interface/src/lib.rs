@@ -295,6 +295,9 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// A stake or slash would push the registration's balance outside the
+    /// `i128` range. Returned instead of trapping on overflow.
+    StakeOverflow = 27,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.

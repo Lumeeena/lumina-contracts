@@ -57,6 +57,8 @@ pub enum RegistryError {
     ContractNotFound = 4,
     /// The registry has no admin set.
     NotInitialized   = 7,
+    /// Stake accounting would overflow i128.
+    StakeOverflow    = 8,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
