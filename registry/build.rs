@@ -15,17 +15,12 @@ use std::path::PathBuf;
 const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
 
 /// Storage types that the `registry-v2` fixture duplicates. Each entry lists
-/// the canonical source and the hand-maintained copy, and the fields that
-/// must match exactly (name and type, in order).
-const TYPE_PACKAGES: [(&str, &str, &[(&str, &str)]); 1] = [(
+/// the canonical source, the hand-maintained copy, and the type names that
+/// must stay byte-compatible between the two.
+const TYPE_PACKAGES: [(&str, &str, &[&str]); 1] = [(
     "src/lib.rs",
-    "src/v2.rs",
-    &[
-        ("entry", "ContractEntry"),
-        ("entry", "Option<ContractEntry>"),
-        ("value", "Address"),
-        ("value", "String"),
-    ],
+    "../registry-v2/src/lib.rs",
+    &["ContractEntry", "DataKey"],
 )];
 
 fn main() {
@@ -69,21 +64,31 @@ fn check_fixtures() {
     }
 }
 
-/// Extracts the field names and types of a `struct` definition from source.
-/// Returns `None` when the struct is not found or is not a plain field list
-/// (e.g. it has attributes or generics that this check cannot handle).
-fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String)>> {
-    let needle = format!("struct {name}");
-    let start = source.find(&needle)?;
+/// Strips the SDK path prefix so `soroban_sdk::String` and `String` compare
+/// as the same storage type. The fixture writes the long form because it does
+/// not import `String`.
+fn normalize_type(ty: &str) -> String {
+    ty.replace("soroban_sdk::", "")
+}
+
+/// Locates the body of a `pub struct`/`pub enum` definition, rejecting
+/// generics or attributes between the name and the brace.
+fn type_body<'a>(source: &'a str, needle: &str) -> Option<&'a str> {
+    let start = source.find(needle)?;
     let after = &source[start + needle.len()..];
     let open = after.find('{')?;
-    // Reject attributes/generics between the name and the brace.
     if !after[..open].trim().is_empty() {
         return None;
     }
     let body = &after[open + 1..];
     let close = body.find('}')?;
-    let body = &body[..close];
+    Some(&body[..close])
+}
+
+/// Extracts the field names and types of a `struct` definition from source.
+/// Returns `None` when the struct is not found or is not a plain field list.
+fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String)>> {
+    let body = type_body(source, &format!("pub struct {name}"))?;
 
     let mut fields = Vec::new();
     for line in body.lines() {
@@ -92,27 +97,71 @@ fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String
             continue;
         }
         let line = line.trim_end_matches(',').trim_end();
-        let (type_part, name_part) = line.split_once(':')?;
-        let name = name_part.trim().to_string();
+        let (name_part, type_part) = line.split_once(':')?;
+        let name = name_part.trim();
+        // Drop the visibility: the canonical type writes `pub field`, the
+        // fixture does too, but only the name and type are being compared.
+        let name = name.trim_start_matches("pub ").trim();
         let type_part = type_part.trim();
         if name.is_empty() || type_part.is_empty() {
             return None;
         }
-        fields.push((name, type_part.to_string()));
+        fields.push((name.to_string(), normalize_type(type_part)));
     }
 
     Some(fields)
 }
 
+/// Extracts the variant names and payloads of an `enum` definition from
+/// source. A unit variant has an empty payload.
+fn extract_enum_variants(source: &str, name: &str) -> Option<Vec<(String, String)>> {
+    let body = type_body(source, &format!("pub enum {name}"))?;
+
+    let mut variants = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let line = line.trim_end_matches(',').trim_end();
+        // Drop a trailing discriminant (`= 2`) if the enum has one.
+        let line = line.split('=').next().unwrap_or(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (variant, payload) = match line.split_once('(') {
+            Some((variant, rest)) => (
+                variant.trim().to_string(),
+                normalize_type(rest.trim_end_matches(')').trim()),
+            ),
+            None => (line.to_string(), String::new()),
+        };
+        variants.push((variant, payload));
+    }
+
+    Some(variants)
+}
+
+/// Reports a struct or enum in the fixture that no longer matches the real one.
+fn drift(kind: &str, name: &str, duplicate: &str, canonical: &str) {
+    println!(
+        "cargo::warning=`registry-v2` fixture drifted: `{name}` in {duplicate} \
+         no longer matches the {kind} in {canonical}. Update the duplicated \
+         definition in {duplicate} to match, or if the change is intentional, \
+         regenerate the `registry-v2` fixture and commit it with the storage \
+         change. See the \"Upgrade fixture\" section in the README.",
+    );
+}
+
 fn check_v2_types_in_sync() {
     let mut failed = false;
 
-    for (canonical, duplicate, fields) in TYPE_PACKAGES {
+    for (canonical, duplicate, type_names) in TYPE_PACKAGES {
         println!("cargo::rerun-if-changed={}", canonical);
         println!("cargo::rerun-if-changed={}", duplicate);
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
-        let duplicate_path = PathBuf::from(enu!("CARGO_MANIFEST_DIR")).join(duplicate);
+        let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
 
         let canonical_src = match std::fs::read_to_string(&canonical_path) {
             Ok(s) => s,
@@ -137,42 +186,83 @@ fn check_v2_types_in_sync() {
             }
         };
 
-        for (struct_name, expected_type) in fields {
-            let canonical_fields = extract_struct_fields(&canonical_src, struct_name);
-            let duplicate_fields = extract_struct_fields(&duplicate_src, struct_name);
+        for type_name in type_names {
+            let canonical_fields = extract_struct_fields(&canonical_src, type_name);
+            let duplicate_fields = extract_struct_fields(&duplicate_src, type_name);
 
             match (canonical_fields, duplicate_fields) {
-                (Some(c), Some(d)) if c == d => {
-                    // Match. Nothing to do.
-                }
                 (Some(c), Some(d)) => {
+                    if c != d {
+                        drift("struct", type_name, duplicate, canonical);
+                        println!("cargo::warning=expected fields {c:?}, found {d:?}");
+                        failed = true;
+                    }
+                    continue;
+                }
+                (None, None) => {}
+                (Some(_), None) => {
                     println!(
-                        "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} \
-                         no longer matches {canonical}. Expected {expected_type} fields {c:Z}, found {d:Z}. \
-                         Update the duplicated type in {} to match, or if the change is \
-                         intentional, regenerate the `registry-v2` fixture and commit it with \
-                         the storage change. See the \"registry-v2 fixture\" section in \
-                         the registry README.",
+                        "cargo::warning=could not locate `struct {type_name}` in {}. \
+                         The `registry-v2` fixture is supposed to duplicate this type. \
+                         Update it (see the \"Upgrade fixture\" section in the README) \
+                         or update TYPE_PACKAGES in build.rs if it was renamed.",
                         duplicate,
                     );
                     failed = true;
+                    continue;
                 }
-                (None, _) => {
+                (None, _) => {}
+            }
+
+            // Not a struct: the other duplicated storage type is an enum.
+            let canonical_variants = extract_enum_variants(&canonical_src, type_name);
+            let duplicate_variants = extract_enum_variants(&duplicate_src, type_name);
+            match (canonical_variants, duplicate_variants) {
+                (Some(c), Some(d)) => {
+                    // The fixture only declares the variants it reads, so it
+                    // may be a subset — but every variant it does declare must
+                    // encode exactly as the real one does.
+                    let mut missing = false;
+                    for variant in &d {
+                        if !c.contains(variant) {
+                            missing = true;
+                            println!(
+                                "cargo::warning=`registry-v2` fixture drifted: {type_name}::{} \
+                                 is declared as {variant:?} in {duplicate} but not in {canonical}.",
+                                variant.0,
+                            );
+                        }
+                    }
+                    if missing {
+                        drift("enum", type_name, duplicate, canonical);
+                        failed = true;
+                    }
+                }
+                (None, None) => {
                     println!(
-                        "cargo::warning=could not locate `struct {struct_name}` in {}. \
+                        "cargo::warning=could not locate `{type_name}` in {}. \
                          The `registry-v2` check needs this type to compare against {}. \
                          Update the check in build.rs if the type was renamed or moved.",
                         canonical, duplicate,
                     );
                     failed = true;
                 }
-                (_, None) => {
+                (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `struct {struct_name}` in {}. \
+                        "cargo::warning=could not locate `pub enum {type_name}` in {}. \
                          The `registry-v2` fixture is supposed to duplicate this type. \
-                         Regenerate the `registry-v2` fixture (see the registry README) \
-                         or update the check in build.rs if the type was renamed or moved.",
+                         Update it (see the \"Upgrade fixture\" section in the README) \
+                         or update TYPE_PACKAGES in build.rs if it was renamed.",
                         duplicate,
+                    );
+                    failed = true;
+                }
+                (None, Some(_)) => {
+                    println!(
+                        "cargo::warning=could not locate `{type_name}` in {}. \
+                         The `registry-v2` check needs this type to compare against {}. \
+                         Update TYPE_PACKAGES in build.rs if it was renamed or moved.",
+                        canonical, duplicate,
                     );
                     failed = true;
                 }
@@ -183,7 +273,7 @@ fn check_v2_types_in_sync() {
     if failed {
         panic!(
             "`registry-v2` fixture is out of sync with the real storage types. \
-             Regenerate the fixture and commit it together with the storage change."
+             Update the fixture and commit it together with the storage change."
         );
     }
 }
