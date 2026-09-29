@@ -5,3 +5,9 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# Deployment history (contains wasm files and per-network logs)
+.deployment-history/
+
+# Generated TypeScript bindings
+bindings/

@@ -8,6 +8,10 @@ Part of the Lumina project, split across three repos:
 - [lumina-backend](https://github.com/Lumeeena/lumina-backend) — indexer + GraphQL API + PostgreSQL schema
 - [lumina-contracts](https://github.com/Lumeeena/lumina-contracts) — this repo
 
+For a contributor-oriented map of storage, governance, registration, staking,
+slashing, and the invariants protected by the test suite, see
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ## Where the registry fits
 
 Lumina indexes Soroban contract events, but an indexer has to know *which*
@@ -107,6 +111,8 @@ registry.register_contract(owner, contract_id, "My Protocol", "A DeFi protocol o
 ```
 
 `get_active_contracts(offset, limit)` returns a paginated list of active registrations for discovery.
+
+**Example**: See [examples/registry-registrant](./examples/registry-registrant/) for a complete working contract that registers itself during deployment. The example demonstrates integration patterns and includes tests you can copy to your own project.
 
 ### Categories
 
@@ -294,10 +300,10 @@ of the contract rather than of how many parties choose to speak up.
 
 ## Build & Test
 
-Install GNU Make, the Rust stable toolchain, and the Soroban wasm target:
+Install GNU Make, the Rust stable toolchain, and the wasm targets:
 
 ```bash
-rustup target add wasm32v1-none
+rustup target add wasm32v1-none wasm32-unknown-unknown
 rustup component add rustfmt clippy
 ```
 
@@ -309,6 +315,7 @@ make build
 make test
 make fmt
 make clippy
+make wasm-both
 ```
 
 `make test` builds the release wasm for the workspace before running tests. The
@@ -318,8 +325,14 @@ deliberately minimal second version that exists only as that test's upgrade
 target and is never deployed. `make check` runs formatting and clippy checks
 before the build-and-test sequence.
 
-Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
+Ship `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
+Both targets are built anyway — `make wasm-both`, which `make test` runs — so
+that the host-compatibility test in
+[registry/tests/wasm_targets.rs](./registry/tests/wasm_targets.rs) has the
+artifacts of both to load: the ones we ship have to be accepted, and the other
+ones have to be refused for the documented reason, so that neither claim can go
+stale unnoticed. CI builds both targets before running the suite.
 
 ### Upgrading the Rust Toolchain
 
@@ -327,8 +340,8 @@ The project pins its Rust compiler version using a `rust-toolchain.toml` file to
 
 To upgrade the compiler version:
 1. Update the `channel` value in `rust-toolchain.toml` to the new stable version.
-2. Ensure `targets = ["wasm32v1-none"]` remains present in the file.
-3. Re-run `cargo build --target wasm32v1-none --release` and `cargo test` locally to verify the new compiler version doesn't introduce any new build errors or warnings.
+2. Ensure `targets = ["wasm32v1-none", "wasm32-unknown-unknown"]` remains present in the file: the first is what ships, the second is what CI checks the host's verdict on.
+3. Re-run `make check` locally to verify the new compiler version doesn't introduce any new build errors, warnings or wasm the Soroban host refuses to load.
 4. Commit the updated `rust-toolchain.toml` file and open a PR. CI will automatically honor the newly pinned version instead of defaulting to `stable`.
 
 ### Interface snapshot
@@ -366,6 +379,10 @@ Deployed on **testnet** at:
 CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ
 ```
 
+**Automated deployment**: Use [scripts/deploy.sh](./scripts/deploy.sh) to deploy or upgrade the registry with automatic wasm hash tracking and rollback capability. See [scripts/README.md](./scripts/README.md) for usage.
+
+**TypeScript bindings**: Generate type-safe client bindings with [scripts/generate-bindings.sh](./scripts/generate-bindings.sh) to eliminate hand-written clients and prevent silent breakage when the interface changes.
+
 When a storage type changes, update `registry-v2/` in the same PR so the fixture
 keeps mirroring the real types, then re-run `cargo test`. If you changed
 `ContractEntry` without updating the fixture, CI fails and the message names the
@@ -392,4 +409,3 @@ This repository maintains a minimal dependency surface to minimize attack vector
 ## License
 
 MIT
-
