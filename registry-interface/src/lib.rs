@@ -295,6 +295,12 @@ pub enum RegistryError {
     InsufficientFee = 25,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
+    /// The specified slash record does not exist (invalid index).
+    SlashNotFound = 29,
+    /// This slash already has a response attached.
+    ResponseAlreadyExists = 30,
+    /// Input validation failed (e.g., empty response).
+    InvalidInput = 31,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -353,6 +359,8 @@ pub struct SlashRecord {
     pub reason: String,
     /// Ledger at which the slash executed.
     pub slashed_at: u32,
+    /// Owner's optional response to the slash.
+    pub response: Option<String>,
 }
 
 /// Byte-compatible with `lumina_registry::Reputation`.

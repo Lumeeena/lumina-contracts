@@ -460,7 +460,7 @@ fn interface_types_match_the_registry() {
     assert_struct(
         &spec,
         "SlashRecord",
-        "{amount: I128, reason: String, slashed_at: U32}",
+        "{amount: I128, reason: String, response: Option<String>, slashed_at: U32}",
     );
     assert_struct(
         &spec,

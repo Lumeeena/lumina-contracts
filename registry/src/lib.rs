@@ -180,6 +180,12 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The specified slash record does not exist (invalid index).
+    SlashNotFound = 29,
+    /// This slash already has a response attached.
+    ResponseAlreadyExists = 30,
+    /// Input validation failed (e.g., empty response).
+    InvalidInput = 31,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -290,6 +296,8 @@ pub struct SlashRecord {
     pub reason: String,
     /// Ledger at which the slash executed.
     pub slashed_at: u32,
+    /// Owner's optional response to the slash.
+    pub response: Option<String>,
 }
 
 /// The reputation signal attached to a registration.
@@ -2098,6 +2106,78 @@ impl LuminaRegistry {
         Self::slash_history(&env, &contract_id)
     }
 
+    /// Attach a response to a slash record. Owner-only, one response per slash.
+    ///
+    /// This allows the contract owner to provide their side of the story for
+    /// any slash, creating a two-sided record rather than governance's unilateral
+    /// view. The response is stored alongside the slash and returned whenever
+    /// slashes are queried.
+    ///
+    /// Requirements:
+    /// - Caller must be the registered owner of the contract
+    /// - The slash index must be valid (0-based index into the slash history)
+    /// - The slash must not already have a response (responses are immutable once set)
+    /// - Response must not be empty
+    ///
+    /// Returns `Ok(())` on success, or an error if authorization or validation fails.
+    pub fn respond_to_slash(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        slash_index: u32,
+        response: String,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        // Validate response is not empty
+        if response.is_empty() {
+            return Err(RegistryError::InvalidInput);
+        }
+
+        // Validate the contract exists and caller is the owner
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        // Load slash history
+        let mut history = Self::slash_history(&env, &contract_id);
+
+        // Validate slash_index
+        if slash_index >= history.len() {
+            return Err(RegistryError::SlashNotFound);
+        }
+
+        // Get the slash record (unwrap is safe after bounds check)
+        let mut record = history.get(slash_index).unwrap();
+
+        // Check if response already exists
+        if record.response.is_some() {
+            return Err(RegistryError::ResponseAlreadyExists);
+        }
+
+        // Set the response
+        record.response = Some(response.clone());
+
+        // Update the record in the history
+        history.set(slash_index, record);
+
+        // Save updated history
+        env.storage().persistent()
+            .set(&DataKey::Slashes(contract_id.clone()), &history);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "slash_response_added"),),
+            (contract_id, slash_index, owner),
+        );
+
+        Ok(())
+    }
+
     /// The full reputation signal for a registration. Returns zeroed values
     /// rather than erroring for an unregistered address, mirroring
     /// `is_registered`'s tolerance.
@@ -2652,6 +2732,7 @@ impl LuminaRegistry {
                     amount: *amount,
                     reason: reason.clone(),
                     slashed_at,
+                    response: None,
                 });
                 env.storage().persistent()
                     .set(&DataKey::Slashes(contract_id.clone()), &history);
@@ -5605,6 +5686,187 @@ mod test {
         assert_eq!(client.get_slashes(&target).len(), 1);
         assert_solvency(&env, &client, &token_id);
     }
+
+    // ── respond_to_slash ───────────────────────────────────────────────────
+
+    #[test]
+    fn owner_can_respond_to_slash() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "malicious behavior");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let response = String::from_str(&env, "This was a false accusation");
+        client.respond_to_slash(&owner, &target, &0, &response);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 1);
+        let record = slashes.get(0).unwrap();
+        assert_eq!(record.response, Some(response));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn respond_to_slash_requires_owner() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "policy violation");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let stranger = Address::generate(&env);
+        let response = String::from_str(&env, "Not my contract");
+
+        assert_eq!(
+            client.try_respond_to_slash(&stranger, &target, &0, &response),
+            Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn respond_to_slash_rejects_invalid_index() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "policy violation");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let response = String::from_str(&env, "This index doesn't exist");
+
+        assert_eq!(
+            client.try_respond_to_slash(&owner, &target, &999, &response),
+            Err(Ok(RegistryError::SlashNotFound))
+        );
+    }
+
+    #[test]
+    fn respond_to_slash_rejects_empty_response() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "policy violation");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let empty_response = String::from_str(&env, "");
+
+        assert_eq!(
+            client.try_respond_to_slash(&owner, &target, &0, &empty_response),
+            Err(Ok(RegistryError::InvalidInput))
+        );
+    }
+
+    #[test]
+    fn respond_to_slash_rejects_duplicate_response() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "malicious behavior");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let first_response = String::from_str(&env, "First response");
+        client.respond_to_slash(&owner, &target, &0, &first_response);
+
+        let second_response = String::from_str(&env, "Trying to change response");
+        assert_eq!(
+            client.try_respond_to_slash(&owner, &target, &0, &second_response),
+            Err(Ok(RegistryError::ResponseAlreadyExists))
+        );
+    }
+
+    #[test]
+    fn owner_can_respond_to_multiple_slashes() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let first_reason = String::from_str(&env, "first offence");
+        let pid = client.propose_slash(&admin, &target, &100, &first_reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let second_reason = String::from_str(&env, "second offence");
+        let pid = client.propose_slash(&admin, &target, &100, &second_reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let first_response = String::from_str(&env, "Response to first");
+        client.respond_to_slash(&owner, &target, &0, &first_response);
+
+        let second_response = String::from_str(&env, "Response to second");
+        client.respond_to_slash(&owner, &target, &1, &second_response);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 2);
+        assert_eq!(slashes.get(0).unwrap().response, Some(first_response));
+        assert_eq!(slashes.get(1).unwrap().response, Some(second_response));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn slash_response_is_visible_in_get_slashes() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "governance reason");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Initially no response
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.get(0).unwrap().response, None);
+
+        // After adding response
+        let response = String::from_str(&env, "owner explanation");
+        client.respond_to_slash(&owner, &target, &0, &response);
+
+        let slashes = client.get_slashes(&target);
+        let record = slashes.get(0).unwrap();
+        assert_eq!(record.amount, 100);
+        assert_eq!(record.reason, reason);
+        assert_eq!(record.response, Some(response));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn respond_to_slash_requires_registered_contract() {
+        let (env, client, _admin, _token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let response = String::from_str(&env, "No such contract");
+
+        assert_eq!(
+            client.try_respond_to_slash(&owner, &unregistered, &0, &response),
+            Err(Ok(RegistryError::ContractNotFound))
+        );
+    }
+
+    #[test]
+    fn slash_response_persists_after_deregistration() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        let reason = String::from_str(&env, "for audit");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let response = String::from_str(&env, "owner's side of story");
+        client.respond_to_slash(&owner, &target, &0, &response);
+
+        client.deactivate(&owner, &target);
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        client.withdraw_stake(&owner, &target);
+        client.deregister(&owner, &target);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 1);
+        assert_eq!(slashes.get(0).unwrap().response, Some(response));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Category pruning ────────────────────────────────────────────────────
 
     #[test]
     fn prune_category_drops_dead_references_and_is_safe_to_repeat() {
