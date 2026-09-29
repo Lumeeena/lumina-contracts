@@ -10,7 +10,6 @@
 /// It also guards the hand-maintained `registry-v2` upgrade fixture: the
 /// duplicated v2 storage types must match the real ones field-for-field,
 /// otherwise the fixture silently stops testing anything.
-
 use std::path::PathBuf;
 
 const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
@@ -32,7 +31,7 @@ const TYPE_PACKAGES: [(&str, &str, &[(&str, &str)]); 1] = [(
 fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
-    if std::env::var("CARGO_CFG_TARGET_ARCH).as_dered() == Ok("wasm32") {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
         return;
     }
 
@@ -55,7 +54,7 @@ fn check_fixtures() {
         .iter()
         .filter(|name| {
             let path = release.join(name);
-            println!"cargo::rerun-if-changed={}", path.display());
+            println!("cargo::rerun-if-changed={}", path.display());
             !path.exists()
         })
         .copied()
@@ -163,8 +162,7 @@ fn check_v2_types_in_sync() {
                         "cargo::warning=could not locate `struct {struct_name}` in {}. \
                          The `registry-v2` check needs this type to compare against {}. \
                          Update the check in build.rs if the type was renamed or moved.",
-                        canonical,
-                        duplicate,
+                        canonical, duplicate,
                     );
                     failed = true;
                 }

@@ -108,6 +108,8 @@ registry.register_contract(owner, contract_id, "My Protocol", "A DeFi protocol o
 
 `get_active_contracts(offset, limit)` returns a paginated list of active registrations for discovery.
 
+**Example**: See [examples/registry-registrant](./examples/registry-registrant/) for a complete working contract that registers itself during deployment. The example demonstrates integration patterns and includes tests you can copy to your own project.
+
 ### Categories
 
 Every registration declares at least one category, so the Registry supports
@@ -352,6 +354,10 @@ Deployed on **testnet** at:
 ```
 CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ
 ```
+
+**Automated deployment**: Use [scripts/deploy.sh](./scripts/deploy.sh) to deploy or upgrade the registry with automatic wasm hash tracking and rollback capability. See [scripts/README.md](./scripts/README.md) for usage.
+
+**TypeScript bindings**: Generate type-safe client bindings with [scripts/generate-bindings.sh](./scripts/generate-bindings.sh) to eliminate hand-written clients and prevent silent breakage when the interface changes.
 
 When a storage type changes, update `registry-v2/` in the same PR so the fixture
 keeps mirroring the real types, then re-run `cargo test`. If you changed
