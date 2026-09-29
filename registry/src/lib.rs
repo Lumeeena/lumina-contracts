@@ -180,6 +180,8 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The caller is neither the owner nor the owner-appointed manager.
+    NotManager          = 29,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────

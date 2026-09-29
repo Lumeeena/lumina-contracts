@@ -151,6 +151,7 @@ Registrations are also manageable after the fact:
 | --- | --- |
 | `get_contracts_by_owner(owner, offset, limit)` | anyone — paginated, includes the owner's deactivated entries |
 | `update_metadata(owner, contract_id, name, description)` | the registered owner only |
+| `set_manager(owner, contract_id, manager)` | the registered owner only — grants the manager a subset of rights |
 | `transfer_ownership(caller, contract_id, new_owner)` | the current owner or the admin |
 | `deactivate(caller, contract_id)` | the current owner or the admin |
 | `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and unstaked |
@@ -159,6 +160,30 @@ Counters: `get_contract_count` is the live total (deactivated included,
 deregistered excluded), `get_total_registered` is the lifetime total
 (never decremented), and `get_active_contract_count` is the currently listed
 figure. The frontend stats page should read `get_active_contract_count`.
+
+### Delegated management
+
+Teams often operate from a multisig or a deliberately cold deployer key.
+Requiring that key for routine metadata edits means either using it too often
+or not editing at all. An owner can therefore delegate registration management
+to a manager address:
+
+| Method | Who can call it |
+| --- | --- |
+| `set_manager(owner, contract_id, manager)` | the registered owner only — sets or replaces the manager |
+| `clear_manager(owner, contract_id)` | the registered owner only — revokes immediately |
+| `get_manager(contract_id)` | anyone — the current manager, if any |
+
+A manager may:
+
+- `update_metadata(manager, contract_id, name, description)`
+- `set_categories(manager, contract_id, categories)`
+- `deactivate(manager, contract_id)`
+
+A manager may **not** transfer ownership or withdraw stake — the two actions
+that move value. Those remain owner-only (or admin, for `transfer_ownership`
+and `deactivate`). Revocation via `clear_manager` is immediate: the next call
+from the former manager fails with `Unauthorized`.
 
 ### Upgrades
 
@@ -170,6 +195,7 @@ orphan existing registrations at a new address:
 | `get_version()` | anyone — which build is live at this address |
 | `get_admin()` | anyone |
 | `upgrade(admin, new_wasm_hash)` | the admin only |
+| `get_manager(contract_id)` | anyone — the delegated manager for a registration, if set |
 
 `upgrade` swaps the contract's code and keeps its address and storage, so a new
 version must stay compatible with the storage shapes documented on `DataKey` and
