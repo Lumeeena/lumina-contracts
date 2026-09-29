@@ -1,14 +1,14 @@
 # Deploying the Lumina Registry
 
 Deploying the registry is optional — the rest of Lumina (indexer/GraphQL/frontend)
-works without it. Deploy (or reuse the existing testnet deployment below) when
+works without it. Deploy (or reuse the existing testnet deployment below] when
 you want the indexer to discover contracts from a live on-chain manifest
 instead of (or in addition to) a static `INDEXED_CONTRACT_IDS` list.
 
 ## Already deployed on testnet
 
 ```
-Contract ID: CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ
+Contract ID: CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRINYKXK3WFAZ
 Admin:       GBWKFFXZ5CJESIHP2EOID5IOXMF472RO5XOJ36X475D5LJGI3AF5R5KY
 ```
 
@@ -86,6 +86,9 @@ stellar contract invoke --id lumina-registry --source lumina-deployer \
   --proposer <current-admin-G...> --new_threshold <threshold>
 ```
 
+`lumina-registry-cli` wraps this flow as `governance propose-add-admin`,
+`governance approve`, and `governance execute` — see [CLI commands](#cli-commands).
+
 `initialize` remains in the interface for an already-deployed pre-constructor
 instance that has not yet been initialized. New deployments use the constructor
 flow above; calling `initialize` on them returns `AlreadyInitialized`.
@@ -120,11 +123,22 @@ stellar contract invoke \
   --categories '["DeFi","Payments"]'
 ```
 
-`categories` takes at least one of `DeFi`, `Nft`, `Gaming`, `Identity`,
+categories` takes at least one of `DeFi`, `Nft`, `Gaming`, `Identity`,
 `Infrastructure`, `Payments`, `Oracle`, `Dao`, `Other`. An empty list is
 rejected with `NoCategories`; use `Other` if none of them fit. Duplicates are
 collapsed, and a contract filed under several categories is discoverable under
 each of them.
+
+With the CLI:
+
+```bash
+lumina-registry-cli register \
+  --owner <owner-address-G...> \
+  --contract-id <target-contract-C...> \
+  --name "My Protocol" \
+  --description "A DeFi protocol on Stellar" \
+  --categories DeFi,Payments
+```
 
 ### Verify discovery works
 
@@ -250,6 +264,15 @@ stellar contract invoke \
 Amounts are in the token's own stroops-equivalent base units (7 decimals for
 XLM, so `1000000000` is 100 XLM). Calling it again tops the stake up.
 
+With the CLI:
+
+```bash
+lumina-registry-cli stake \
+  --owner <owner-G...> \
+  --contract-id <target-contract-C...> \
+  --amount 1000000000
+```
+
 ### Attesting or revoking verified status (governance)
 
 ```bash
@@ -300,6 +323,13 @@ It returns the full remaining balance in one go. `RegistrationActive` means you
 have not deactivated; `StakeLocked` means a slash is still inside its window —
 check `get_reputation`'s `withdraw_locked_until` against the current ledger.
 
+With the CLI:
+
+```bash
+lumina-registry-cli deactivate --caller <owner-G...> --contract-id <C...>
+lumina-registry-cli withdraw --owner <owner-G...> --contract-id <C...>
+```
+
 ### Reading reputation
 
 ```bash
@@ -343,7 +373,7 @@ stellar contract fetch --id lumina-registry --network testnet \
 sha256sum rollback.wasm   # macOS: shasum -a 256 rollback.wasm
 ```
 
-Save that hash (and the wasm) somewhere durable *before* upgrading. Rolling back
+Save that hash (and the wasm) somewhere durable *bufore* upgrading. Rolling back
 is just another `upgrade` to that hash, but only if you still have it.
 
 ### 3. Build and upload the new wasm
@@ -356,84 +386,111 @@ stellar contract upload \
   --network testnet
 ```
 
-`upload` prints the new wasm hash. Verify it before submitting the upgrade —
-the hash is over the exact bytes, so rebuild locally from the commit you intend
-to ship and confirm the two agree:
+`upload` prints the new wasm hash. Verify it matches the hash of the built
+wasm before proposing the upgrade:
 
 ```bash
-stellar contract build
-sha256sum target/wasm32v1-none/release/lumina_registry.wasm  # macOS: shasum -a 256
+sha256sum target/wasm32v1-none/release/lumina_registry.wasm
 ```
 
-Build with `wasm32v1-none` (what `stellar contract build` uses). A
-`wasm32-unknown-unknown` build of the same source produces different bytes and,
-on current Rust, a module the Soroban host refuses to load — an upgrade to that
-hash bricks the contract with no way to call `upgrade` again.
+### 4. Propose the upgrade
 
-### 4. Submit the upgrade
+The upgrade is a governance action like any other — propose, approve to the
+threshold, wait out the timelock, then execute. The proposal carries the new
+wasm hash:
 
 ```bash
 stellar contract invoke \
-  --id lumina-registry \
-  --source lumina-deployer \
-  --network testnet \
-  -- upgrade \
-  --admin <admin-address-G...> \
-  --new_wasm_hash <hash-from-upload>
+  --id lumina-registry --source lumina-deployer --network testnet \
+  -- propose_upgrade \
+  --proposer <admin-G...> \
+  --new_wasm_hash <new-wasm-hash>
 ```
 
-The swap takes effect for the *next* invocation; the call that performs it runs
-to completion under the old code and emits a `registry_upgraded` event carrying
-the admin, the new hash, and the version being replaced.
-
-### 5. Verify
+Then approve and execute as above. With the CLI:
 
 ```bash
-stellar contract invoke --id lumina-registry --source lumina-deployer \
-  --network testnet -- get_version
-stellar contract invoke --id lumina-registry --source lumina-deployer \
-  --network testnet -- get_active_contracts --offset 0 --limit 10
+lumina-registry-cli governance propose-upgrade \
+  --proposer <admin-G...> \
+  --new-wasm-hash <new-wasm-hash>
+lumina-registry-cli governance approve --admin <admin-G...> --proposal-id <id>
+lumina-registry-cli governance execute --proposal-id <id>
 ```
 
-`get_version` should report the new value and the registrations should come back
-unchanged.
+### 5. Confirm the upgrade
 
-### Storage compatibility
-
-Because storage survives the swap, the new code has to decode entries the old
-code wrote:
-
-- Adding a `DataKey` variant is safe. Renaming or repurposing one is not —
-  `#[contracttype]` enums are keyed by variant name, so a rename orphans every
-  entry stored under the old name.
-- Adding, removing, renaming or retyping a `ContractEntry` field breaks every
-  entry already stored. The struct is encoded as a map keyed by field name, so
-  old entries fail to decode rather than picking up defaults.
-- A release that must change `ContractEntry` needs a migration: read the old
-  shape into a retained `EntryV1`-style type and write the new shape back,
-  lazily on first access or through a batched admin-gated `migrate()` — do not
-  assume one transaction can touch every entry.
-- Bump `CONTRACT_VERSION` in `registry/src/lib.rs` with any such change so
-  downstream callers can branch on `get_version()`.
-
-`registry/src/lib.rs`'s test suite deploys the registry from wasm, registers
-contracts, upgrades to `registry-v2/`, and asserts the registrations are still
-readable by the new code — including a rollback back to the previous wasm hash.
-
-### Rollback
+After execution, get_version should report the new version and the contract
+address is unchanged.
 
 ```bash
-stellar contract invoke \
-  --id lumina-registry \
-  --source lumina-deployer \
-  --network testnet \
-  -- upgrade \
-  --admin <admin-address-G...> \
-  --new_wasm_hash <hash-recorded-in-step-2>
+lumina-registry-cli get-version
 ```
 
-Two caveats. Rolling back restores the old *code* only — any storage the new
-version wrote stays, so a rollback across a migration needs its own reverse
-migration. And rollback runs through the same `upgrade` entrypoint, so it is
-only available while the deployed code still exports one: a version that drops
-`upgrade` is permanent.
+## CLI commands
+
+`lumina-registry-cli` is a thin wrapper around the invocations above. It reads
+the network and contract ID from config so you do not repeat them per command, and
+it prints the resulting transaction hash and decoded result.
+
+### Configuration
+
+Config is read from `~/.lumina/registry.toml` by default, or from the path in
+`VUMINA_REGISTRY_CLI_CONFIG`. Environment variables override the file:
+
+```toml
+network = "testnet"
+contract_id = "CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRINYKXK3WFAz"
+source = "lumina-deployer"
+```
+
+| Key           | Env var                       | Default             |
+| ------------- | ------------------------------ | -------------------- |
+| `network`     | `LUMINA_REGISTRY_NETWORK`      | `testnet`           |
+| `contract_id` | `LUMINA_REGISTRY_CONTRACT_ID` | none (required)     |
+| `source`      | `LUMINA_REGISTRY_SOURCE`       | none (required)     |
+
+Any command accepts `--network`, `--contract-id`, and `--source` to override the
+configured values for a single invocation.
+
+### Commands
+
+Each documented operation has a single-command equivalent:
+
+| Operation                       | CLI command                                                              |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| Register a contract              | `lumina-registry-cli register --owner <G> --contract-id <C> --name <N> --description <D> --categories DeFi,Payments` |
+| Deactivate                       | `lumina-registry-cli deactivate --caller <G> --contract-id <C>`                            |
+| Stake                            | `lumina-registry-cli stake --owner <G> --contract-id <C> --amount <A>`                         |
+| Withdraw stake                  | `lumina-registry-cli withdraw --owner <G> --contract-id <C>`                             |
+| Propose governance action        | `lumina-registry-cli governance propose <kind> --proposer <G> [args...]`                 |
+| Approve a proposal               | `lumina-registry-cli governance approve --admin <G> --proposal-id <id>`                   |
+| Execute a proposal               | `lumina-registry-cli governance execute --proposal-id <id>`                          |
+| Read admin/version/reputation  | `lumina-registry-cli get-admin` / `get-version` / `get-reputation --contract-id <C>`    |
+
+The governance kinds are `add-admin`, `change-threshold`, `configure-staking`,
+`set-verified`, `slash`, `set-allowlist-enabled`, `set-allowlisted`,
+set-rate-limit`, and `upgrade`. The CLI prints the proposal ID for a propose
+command so it can be fed straight into `approve` and `execute`.
+
+For example, the add-admin flow becomes:
+
+```bash
+lumina-registry-cli governance propose add-admin \
+  --proposer <current-admin-G...> \
+  --new-admin <new-admin-G...>
+lumina-registry-cli governance approve --admin <current-admin-G...> --proposal-id <id>
+lumina-registry-cli governance execute --proposal-id <id>
+```
+
+The upgrade flow becomes:
+
+```bash
+lumina-registry-cli governance propose upgrade \
+  --proposer <admin-G...> \
+  --new-wasm-hash <new-wasm-hash>
+lumina-registry-cli governance approve --admin <admin-G...> --proposal-id <id>
+lumina-registry-cli governance execute --proposal-id <id>
+```
+
+Read-only commands do not sign a transaction and so do not print a transaction
+hash; they print the decoded result only.

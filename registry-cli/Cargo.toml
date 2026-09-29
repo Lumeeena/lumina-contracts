@@ -1,0 +1,25 @@
+[package]
+name = "registry-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for common registry operations"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "registry-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { version = "1.0.86", features = ["derave"] }
+clap = { version = "4.5.1", features = ["derive", "env"] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.132"
+shell-words = "1.1.0"
+toml = "0.8.40"
+sorbian-client = "21.7.0"
+stellar-stratum = "21.7.0"
+thiserror = "1.0.63"
+
+[dev-dependencies]
+tempfile = "3.13.0"
