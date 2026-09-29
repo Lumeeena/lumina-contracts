@@ -486,6 +486,51 @@ pub struct Proposal {
 }
 
 /// Storage keys used by the Lumina Registry contract.
+///
+/// ## Storage keys, storage types and lifetimes
+///
+/// Every key the contract writes is listed below with the storage it lives in
+/// and how long it is expected to survive. This matters operationally because
+/// Soroban archives instance and persistent entries independently: an entry
+/// whose TTL lapses becomes unloadable, and any index that still names it
+/// becomes stale (see `prune_category` / `prune_all_contracts`).
+///
+/// | Key | Storage | Holds | Lifetime / TTL behaviour |
+/// |-----|---------|-------|--------------------------|
+/// | `Admins` | instance | `Vec<Address>` — current admin set | Lives as long as the contract instance; refreshed by `initialize` / admin-set proposals. |
+/// | `Threshold` | instance | `u32` — approvals required to pass | Same as the instance; changed only by `ChangeThreshold` proposals. |
+/// | `ProposalCount` | instance | `u32` — monotonic proposal counter | Never expires while the instance lives; never decremented. |
+/// | `ProposalData(u32)` | persistent | `Proposal` — full proposal record | Persistent; survives until its TTL lapses. Never deleted, so executed proposals remain readable. |
+/// | `ContractCount` | instance | `u32` — live registrations | Instance lifetime; decremented on `deregister`. |
+/// | `TotalRegistered` | instance | `u32` — lifetime registrations | Instance lifetime; never decremented. Missing on pre-existing deployments — `get_total_registered` falls back to `ContractCount`. |
+/// | `Contract(Address)` | persistent | `ContractEntry` — registration metadata | Persistent; the authoritative entry. Removed by `deregister`; may be archived by TTL, which is what the prune entrypoints clean up after. |
+/// | `OwnerContracts(Address)` | persistent | `Vec<Address>` — per-owner index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, pruned via `prune_all_contracts` for archival. |
+/// | `AllContracts` | instance | `Vec<Address>` — global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, `prune_all_contracts` for archival. |
+/// | `StakeToken` | instance | `Address` — SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Treasury` | instance | `Address` — slash destination | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
+/// | `Verified(Address)` | persistent | `bool` — governance-attested status | Persistent; removed by `deregister`. |
+/// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
+/// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
+/// | `MinimumStake` | instance | `i128` — minimum stake threshold | Instance lifetime; zero disables it. |
+/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
+/// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
+/// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
+/// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
+/// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
+/// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
+/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
+/// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
+/// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
+/// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
+/// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
+/// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
+/// | `Admin` | instance | `Address` — legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
+///
+/// Indexes that must stay consistent with their entries: `OwnerContracts`,
+/// `AllContracts`, and `ByCategory`. Each names `Contract` entries, so a
+/// removed or archived entry leaves a dead reference behind until the eager
+/// cleanup paths or the prune entrypoints run.
 #[contracttype]
 pub enum DataKey {
     // ── Governance ──────────────────────────────────────────────────────────

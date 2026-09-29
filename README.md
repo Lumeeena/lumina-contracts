@@ -176,6 +176,43 @@ version must stay compatible with the storage shapes documented on `DataKey` and
 `ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
+### Storage keys and their lifetimes
+
+Every key the registry writes is a `DataKey` variant. The table below lists each
+one with its storage type, what it holds, and its expected lifetime, so an
+operator can reason about archival without reading the enum plus every call
+site.
+
+| Key | Storage | Holds | Lifetime / TTL behaviour |
+| --- | --- | --- | --- |
+| `Admin` | instance | The registry admin `Address`. | Lives as long as the contract instance; set once by `initialize`, replaced only by `upgrade`-adjacent admin flows. |
+| `Version` | instance | The live build's version `u32`. | Lives as long as the contract instance; rewritten on each `upgrade`. |
+| `Contract(contract_id)` | persistent | The `ContractEntry` for a registration (owner, name, description, categories, `active`, verified, stake, etc.). | Lives until `deregister` deletes it. `deactivate` keeps the entry, so a deactivated registration still occupies this key. |
+| `AllContracts` | persistent | Index `Vec<Address>` of every registered `contract_id` in registration order. | Lives as long as the registry; entries are appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
+| `OwnerContracts(owner)` | persistent | Index `Vec<Address>` of the `contract_id`s owned by `owner`, deactivated included. | Lives as long as the registry; appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
+| `CategoryContracts(category)` | persistent | Index `Vec<Address>` of `contract_id`s filed under `category`. | Lives as long as the registry; appended on register and removed eagerly on `deregister`. `deactivate` does not rewrite it. Index — must stay consistent with `Contract` entries. |
+| `ContractCount` | instance | Live total of registrations (deactivated included, deregistered excluded). | Lives as long as the contract instance; incremented on register, decremented on `deregister`. |
+| `TotalRegistered` | instance | Lifetime total of registrations ever made; never decremented. | Lives as long as the contract instance; monotonically increasing. |
+| `ActiveContractCount` | instance | Currently listed (active) registration count. | Lives as long as the contract instance; adjusted on register, `deactivate`, reactivation and `deregister`. |
+| `Stake(contract_id)` | persistent | The staked amount for a registration. | Lives until the entry is deregistered or the stake is fully withdrawn; slash and withdraw mutate it in place. |
+| `StakeLock(contract_id)` | persistent | Ledger at which the slash lock expires for a registration. | Lives until the entry is deregistered; refreshed by each slash. |
+| `Verified(contract_id)` | persistent | Whether the registration is governance-verified. | Lives until the entry is deregistered; set only through a timelocked proposal. |
+| `Slashes(contract_id)` | persistent | Append-only `Vec` of slash records (amount, reason, ledger). | Kept for auditability even after `deregister`; not removed by eager cleanup. |
+| `Attestations(contract_id)` | persistent | Bounded `Vec` of `(attester, label, created_at)` records. | Lives until the entry is deregistered; one per attester, revised in place on re-attest. |
+| `StakingConfig` | instance | The SEP-41 token and treasury `Address` used for staking. | Lives as long as the contract instance; set by `propose_configure_staking` after the timelock. |
+| `AllowlistEnabled` | instance | Whether the allowlist gate is on. | Lives as long as the contract instance; toggled through governance. |
+| `Allowlisted(owner)` | persistent | Whether `owner` is on the allowlist. | Lives as long as the registry; toggled through governance. |
+| `RateLimit` | instance | Per-owner registration limit and window in ledgers. | Lives as long as the contract instance; set through governance; zero limit disables it. |
+| `Proposal(id)` | persistent | A governance proposal (kind, payload, execution ledger, state). | Lives until the proposal is executed or cancelled; read for the timelock check. |
+| `ProposalCount` | instance | Monotonic counter used to allocate proposal IDs. | Lives as long as the contract instance; never decremented. |
+
+Instance keys share the contract instance's TTL and are extended whenever the
+instance is bumped. Persistent keys have their own TTLs and can be archived if
+they are not touched; the index keys (`AllContracts`, `OwnerContracts`,
+`CategoryContracts`) are the ones most likely to strand a reference, which is
+what `prune_category` / `prune_all_contracts` exist to clean up. Slash records
+are deliberately kept past `deregister` for auditability.
+
 ### Error codes
 
 `RegistryError` crosses the contract boundary as a bare `u32`, so the
