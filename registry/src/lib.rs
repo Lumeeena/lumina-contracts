@@ -271,6 +271,8 @@ pub struct ContractProfile {
     pub entry: ContractEntry,
     /// The reputation and staking signal.
     pub reputation: Reputation,
+    /// The contract that supersedes this one, if the owner has set one.
+    pub superseded_by: Option<Address>,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -457,6 +459,10 @@ pub enum DataKey {
     // ── Tags ────────────────────────────────────────────────────────────────
     /// Vec<Symbol> — owner-set normalized tags for a registration.
     Tags(Address),
+
+    // ── Succession ──────────────────────────────────────────────────────────
+    /// Address — the contract that supersedes this registration, if any.
+    SupersededBy(Address),
 
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
@@ -1429,6 +1435,43 @@ impl LuminaRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Point a registration at its replacement.
+    ///
+    /// The `replacement` must itself be registered; passing an unknown address
+    /// is rejected so the pointer is never dangling.  Only the owner may call
+    /// this.  The registration does not need to be deactivated first — a
+    /// project can signal "migrate to v2" while v1 is still live.
+    pub fn set_superseded_by(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        replacement: Address,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        if !env.storage().persistent().has(&DataKey::Contract(replacement.clone())) {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        env.storage().persistent()
+            .set(&DataKey::SupersededBy(contract_id.clone()), &replacement);
+
+        env.events().publish(
+            (Symbol::new(&env, "superseded_by"),),
+            (contract_id, replacement),
+        );
+
+        Ok(())
+    }
+
     // ── Staking ─────────────────────────────────────────────────────────────
 
     /// Post collateral against a registration you own.
@@ -1778,6 +1821,8 @@ impl LuminaRegistry {
         Ok(ContractProfile {
             reputation,
             entry,
+            superseded_by: env.storage().persistent()
+                .get(&DataKey::SupersededBy(contract_id)),
         })
     }
 
@@ -1794,6 +1839,8 @@ impl LuminaRegistry {
                     if entry.active {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            superseded_by: env.storage().persistent()
+                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
                         });
                     }
@@ -1928,6 +1975,8 @@ impl LuminaRegistry {
                     if entry.active {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            superseded_by: env.storage().persistent()
+                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
                         });
                     }
@@ -4817,5 +4866,51 @@ mod test {
         assert_eq!(client.get_contract_count(), 1);
         assert_eq!(client.get_total_registered(), 2);
         assert_eq!(client.get_active_contract_count(), 1);
+    }
+
+    // ── set_superseded_by ───────────────────────────────────────────────────
+
+    #[test]
+    fn owner_can_set_superseded_by_and_profile_surfaces_it() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+
+        client.set_superseded_by(&owner, &old, &new_contract);
+
+        let profile = client.get_contract_profile(&old);
+        assert_eq!(profile.superseded_by, Some(new_contract));
+    }
+
+    #[test]
+    fn set_superseded_by_rejects_unregistered_replacement() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let ghost = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&owner, &old, &ghost),
+            Err(Ok(RegistryError::ContractNotFound))
+        );
+    }
+
+    #[test]
+    fn set_superseded_by_is_owner_only() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&stranger, &old, &new_contract),
+            Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn superseded_by_is_none_by_default() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_contract_profile(&target).superseded_by, None);
     }
 }
