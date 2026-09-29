@@ -30,6 +30,12 @@
 //!
 //! 
 
+// The staking config now reports the stake token's `decimals()`, read from the
+// token when staking is configured and cached alongside the token address.
+// Changing the stake token after stakes exist is unsupported: the cached
+// decimals would no longer match the token backing existing stakes. The
+// interface snapshot below must be regenerated when this changes.
+
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
 use std::path::PathBuf;
 
@@ -41,6 +47,9 @@ fn manifest_path(parts: &[&str]) -> PathBuf {
     path
 }
 
+/// Renders a type as it appears in the exported interface. `StakingConfig`
+/// carries the token's decimals so callers can render raw `i128` amounts
+/// without a separate token query.
 fn render_type(ty: &ScSpecTypeDef) -> String {
     match ty {
         ScSpecTypeDef::Option(o) => format!("Option<{}>", render_type(&o.value_type)),
@@ -136,6 +145,8 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
     out
 }
 
+/// Asserts the built wasm's exported interface matches `interface.snap`,
+/// including `get_staking_config`'s reported token decimals.
 #[test]
 fn exported_interface_matches_snapshot() {
     let wasm_path = manifest_path(&["..", "target", "wasm32v1-none", "release", "lumina_registry.wasm"]);

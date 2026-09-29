@@ -28,7 +28,7 @@ fn get_registry_stats() -> RegistryStats
 fn get_reputation(contract_id: Address) -> Reputation
 fn get_slashes(contract_id: Address) -> Vec<SlashRecord>
 fn get_stake(contract_id: Address) -> I128
-fn get_staking_config() -> Result<(Address, Address), RegistryError>
+fn get_staking_config() -> Result<(Address, Address, U32), RegistryError>
 fn get_tags(contract_id: Address) -> Vec<Symbol>
 fn get_threshold() -> Result<U32, RegistryError>
 fn get_total_registered() -> U32
@@ -74,4 +74,4 @@ struct Reputation { slashed_total: I128, stake: I128, verified: Bool, withdraw_l
 struct SlashRecord { amount: I128, reason: String, slashed_at: U32 }
 union Category { DeFi, Nft, Gaming, Identity, Infrastructure, Payments, Oracle, Dao, Other }
 union DataKey { Admins, Threshold, ProposalCount, ProposalData(U32), ContractCount, TotalRegistered, Contract(Address), OwnerContracts(Address), AllContracts, StakeToken, Treasury, Stake(Address), Verified(Address), Slashes(Address), WithdrawLockedUntil(Address), Categories(Address), ByCategory(Category), AllowlistEnabled, Allowlisted(Address), RegistrationRateLimit, RegistrationRateWindow, RegistrationWindow(Address), RegistrationFee, Tags(Address), Attestations(Address), TotalStaked, VerifiedCount, Admin }
-union ProposalAction { Deactivate(Address), Upgrade(BytesN<32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I128, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(I128) }
+union ProposalAction { Deactivate(Address), Upgrade(BytesN <32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I128, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(I128) }

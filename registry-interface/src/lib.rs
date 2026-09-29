@@ -144,9 +144,10 @@ pub trait RegistryInterface {
         limit: u32,
     ) -> Result<Vec<ContractEntry>, RegistryError>;
 
-    /// `(stake_token, treasury)`, or `StakingNotConfigured` if governance has
-    /// not opened staking yet.
-    fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError>;
+    /// `(stake_token, treasury, decimals)`, or `StakingNotConfigured` if
+    /// governance has not opened staking yet. `decimals` is the stake token's
+    /// own `decimals()` value, read and cached when staking was configured.
+    fn get_staking_config(env: Env) -> Result<(Address, Address, u32), RegistryError>;
 
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
