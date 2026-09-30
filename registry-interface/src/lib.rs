@@ -367,6 +367,8 @@ pub enum RegistryError {
     RegistrationActive = 19,
     /// A registration must declare at least one category.
     NoCategories = 20,
+    /// The registration claims more categories than `MAX_CATEGORIES_PER_CONTRACT`.
+    TooManyCategories = 28,
     /// The registration still holds stake — withdraw it before deregistering.
     StakeNotEmpty = 21,
     /// The registration rate limit configuration is invalid.
@@ -382,6 +384,18 @@ pub enum RegistryError {
     /// Caller is not the registered owner nor its delegated manager.
     NotManager = 27,
 }
+
+/// The maximum number of categories a single registration may claim.
+///
+/// The [`Category`] vocabulary is the natural upper bound, but relying on its
+/// size means the limit silently changes every time a category is added. This
+/// constant makes the cap explicit and independent of the enum's growth.
+///
+/// A registration that claims every category is not categorised in any useful
+/// sense — it is spam in a discovery surface. Claiming more than this cap is
+/// rejected with [`RegistryError::TooManyCategories`] rather than silently
+/// truncated.
+pub const MAX_CATEGORIES_PER_CONTRACT: u32 = 5;
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
 #[contracttype]

@@ -14,6 +14,12 @@
 //! `registry/interface.snap`. Doc comments are left out: rewording one is not
 //! an interface change.
 //!
+//! The exported interface also includes the `Category` enum and the
+//! `MAX_CATEGORIES_PER_CONTRACT` cap: a registration may claim at most that
+//! many categories, and claiming more is rejected with `TooManyCategories`.
+//! The cap is deliberately smaller than the vocabulary so that a registration
+//! claiming every category is rejected rather than silently truncated.
+//!
 //! To accept an intended change, rebuild the wasm and regenerate the snapshot:
 //!
 //! ```bash
