@@ -338,6 +338,14 @@ pub trait RegistryInterface {
     /// As `get_active_profiles`, plus `has_more`.
     fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
 
+    /// Returns active registrations ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_contracts_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractPage;
+
+    /// Returns active profiles ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_profiles_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
+
     /// Every contract registered by `owner`, **including** deactivated ones.
     /// Deprecated in favour of `get_contracts_by_owner_after`.
     fn get_contracts_by_owner(

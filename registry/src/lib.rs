@@ -3147,6 +3147,114 @@ impl LuminaRegistry {
         ContractProfilePage { entries, has_more }
     }
 
+    /// Returns active registrations ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    ///
+    /// ## Cost tradeoff: computed on read
+    /// This ordering is computed on read rather than maintained on write.
+    /// - **Write cost**: Zero overhead. `stake`, `withdraw_stake`, `slash`, etc. do not need to update an index.
+    /// - **Read cost**: O(N log N) sorting cost and O(N) persistent reads, where N is the total number of active contracts.
+    ///   As the registry grows, this view becomes expensive. Maintaining an index on write would invert this,
+    ///   making the read cheap but imposing overhead on every stake mutation.
+    pub fn get_active_contracts_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractPage {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(&env));
+
+        let mut active_with_stake: alloc::vec::Vec<(i128, u32, ContractEntry)> = alloc::vec::Vec::new();
+
+        for (i, contract_id) in all.into_iter().enumerate() {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+            {
+                if entry.active {
+                    let stake = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, i128>(&DataKey::Stake(contract_id.clone()))
+                        .unwrap_or(0);
+                    active_with_stake.push((stake, i as u32, entry));
+                }
+            }
+        }
+
+        active_with_stake.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut entries = Vec::new(&env);
+        let start = offset as usize;
+        let end = core::cmp::min(start + (limit as usize), active_with_stake.len());
+
+        if start < active_with_stake.len() {
+            for item in &active_with_stake[start..end] {
+                entries.push_back(item.2.clone());
+            }
+        }
+
+        let has_more = end < active_with_stake.len();
+        ContractPage { entries, has_more }
+    }
+
+    /// Returns active profiles ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    ///
+    /// ## Cost tradeoff: computed on read
+    /// See `get_active_contracts_by_stake_page` for the tradeoffs of this approach.
+    pub fn get_active_profiles_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(&env));
+
+        let mut active_with_stake: alloc::vec::Vec<(i128, u32, ContractProfile)> = alloc::vec::Vec::new();
+
+        for (i, contract_id) in all.into_iter().enumerate() {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+            {
+                if entry.active {
+                    let reputation = Self::reputation_of(&env, &contract_id);
+                    let profile = ContractProfile {
+                        reputation: reputation.clone(),
+                        metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
+                        superseded_by: env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey::SupersededBy(contract_id.clone())),
+                        registered_at_ts: env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey::ContractTimestamp(contract_id.clone()))
+                            .unwrap_or(0),
+                        entry,
+                    };
+                    active_with_stake.push((reputation.stake, i as u32, profile));
+                }
+            }
+        }
+
+        active_with_stake.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut entries = Vec::new(&env);
+        let start = offset as usize;
+        let end = core::cmp::min(start + (limit as usize), active_with_stake.len());
+
+        if start < active_with_stake.len() {
+            for item in &active_with_stake[start..end] {
+                entries.push_back(item.2.clone());
+            }
+        }
+
+        let has_more = end < active_with_stake.len();
+        ContractProfilePage { entries, has_more }
+    }
+
     /// Paginated list of every contract registered by `owner`, including
     /// deactivated entries.
     ///
