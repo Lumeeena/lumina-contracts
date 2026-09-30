@@ -276,7 +276,7 @@ fn reentrant_token_cannot_withdraw_twice() {
                 // Attempt the reentrant double withdrawal. With
                 // checks-effects-interactions ordering this must fail because
                 // the stake was already zeroed before `transfer` was called.
-                let _ = client.try_withdraw_stake(&staker, &amount);
+                let _ = client.try_withdraw_stake(&staker, &amount, &amount);
             }
         }
     }
@@ -294,6 +294,6 @@ fn reentrant_token_cannot_withdraw_twice() {
     registry.stake(&staker, &token_id, &1_000);
     // The reentrant call inside `transfer` must not have succeeded in
     // withdrawing a second time; the original withdrawal stands.
-    registry.withdraw_stake(&staker, &1_000);
+    registry.withdraw_stake(&staker, &1_000, &1_000);
     assert_eq!(registry.stake_of(&staker), 0);
 }

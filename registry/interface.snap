@@ -38,18 +38,18 @@ fn is_registered(contract_id: Address) -> Bool
 fn is_verified(contract_id: Address) -> Bool
 fn propose_add_admin(proposer: Address, new_admin: Address) -> Result<U32, RegistryError>
 fn propose_change_threshold(proposer: Address, new_threshold: U32) -> Result<U32, RegistryError>
-fn propose_configure_minimum_stake(proposer: Address, minimum: I128) -> Result<U32, RegistryError>
+fn propose_configure_minimum_stake(proposer: Address, minimum: I28) -> Result<U32, RegistryError>
 fn propose_configure_staking(proposer: Address, token: Address, treasury: Address) -> Result<U32, RegistryError>
 fn propose_deactivate(proposer: Address, contract_id: Address) -> Result<U32, RegistryError>
 fn propose_remove_admin(proposer: Address, admin_to_remove: Address) -> Result<U32, RegistryError>
 fn propose_set_allowlist_enabled(proposer: Address, enabled: Bool) -> Result<U32, RegistryError>
 fn propose_set_allowlisted(proposer: Address, owner: Address, allowed: Bool) -> Result<U32, RegistryError>
 fn propose_set_rate_limit(proposer: Address, limit: U32, window_ledgers: U32) -> Result<U32, RegistryError>
-fn propose_set_registration_fee(proposer: Address, fee: I128) -> Result<U32, RegistryError>
+fn propose_set_registration_fee(proposer: Address, fee: I28) -> Result<U32, RegistryError>
 fn propose_set_verified(proposer: Address, contract_id: Address, verified: Bool) -> Result<U32, RegistryError>
 fn propose_slash(proposer: Address, contract_id: Address, amount: I128, reason: String) -> Result<U32, RegistryError>
 fn propose_upgrade(proposer: Address, new_wasm_hash: BytesN<32>) -> Result<U32, RegistryError>
-fn propose_withdraw_from_treasury(proposer: Address, amount: I128) -> Result<U32, RegistryError>
+fn propose_withdraw_from_treasury(proposer: Address, amount: I28) -> Result<U32, RegistryError>
 fn prune_all_contracts() -> U32
 fn prune_category(category: Category) -> U32
 fn register_contract(owner: Address, contract_id: Address, name: String, description: String, categories: Vec<Category>) -> Result<(), RegistryError>
@@ -62,7 +62,7 @@ fn stake(owner: Address, contract_id: Address, amount: I28) -> Result<(), Regist
 fn transfer_ownership(caller: Address, contract_id: Address, new_owner: Address) -> Result<(), RegistryError>
 fn update_metadata(caller: Address, contract_id: Address, name: String, description: String) -> Result<(), RegistryError>
 fn upgrade(admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError>
-fn withdraw_stake(owner: Address, contract_id: Address) -> Result<I128, RegistryError>
+fn withdraw_stake(owner: Address, contract_id: Address, amount: I128) -> Result<I128, RegistryError>
 struct Attestation { attester: Address, created_at: U32, label: String }
 struct ContractEntry { active: Bool, contract_id: Address, description: String, name: String, owner: Address, registered_at: U32 }
 struct ContractPage { entries: Vec<ContractEntry>, has_more: Bool }
@@ -72,7 +72,7 @@ struct Proposal { action: ProposalAction, approvals: Vec<Address>, executed: Boo
 struct RegistrationEntry { categories: Vec<Category>, contract_id: Address, description: String, name: String }
 struct RegistrationWindow { count: U32, started_at: U32 }
 struct RegistryStats { active_count: U32, staked_count: U32, total_registered: U32, total_staked: I128, verified_count: U32 }
-struct Reputation { slashed_total: I128, stake: I128, verified: Bool, withdraw_locked_until: U32 }
+struct Reputation { slashed_total: I128, stake: I28, verified: Bool, withdraw_locked_until: U32 }
 struct SlashRecord { amount: I128, reason: String, slashed_at: U32 }
 union Category { DeFi, Nft, Gaming, Identity, Infrastructure, Payments, Oracle, Dao, Other }
 union DataKey { Admins, Threshold, ProposalCount, ProposalData(U32), ContractCount, TotalRegistered, Contract(Address), OwnerContracts(Address), AllContracts, StakeToken, Treasury, Stake(Address), Verified(Address), Slashes(Address), WithdrawLockedUntil(Address), Categories(Address), ByCategory(Category), AllowlistEnabled, Allowlisted(Address), RegistrationRateLimit, RegistrationRateWindow, RegistrationWindow(Address), RegistrationFee, Tags(Address), Attestations(Address), TotalStaked, VerifiedCount, Admin, Manager(Address) }
