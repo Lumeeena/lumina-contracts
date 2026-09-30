@@ -22,9 +22,12 @@ const TYPE_PACKAGES: [(&str, &str, &[&str]); 1] = [(
     "../registry-v2/src/lib.rs",
     &["ContractEntry", "DataKey"],
 )];
+
+fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        return;
     }
 
     check_fixtures();
@@ -275,3 +278,4 @@ fn check_v2_types_in_sync() {
              Update the fixture and commit it together with the storage change."
         );
     }
+}

@@ -1,9 +1,9 @@
-﻿// Copyright (c) Lumina contributors
+// Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
-// `#[contractclient]` macros emit synthetic items — the `SPEC` constants, the
-// generated client methods, the error-code helpers — carrying the invocation
+// `#[contractclient]` macros emit synthetic items � the `SPEC` constants, the
+// generated client methods, the error-code helpers � carrying the invocation
 // site's span. `missing_docs` reports those as undocumented and there is no
 // source position to attach a doc comment to, so on current rustc the lint
 // cannot be satisfied by any edit to this crate. It is allowed here for that
@@ -11,66 +11,66 @@
 // below are the standard the crate is held to.
 #![allow(missing_docs)]
 extern crate alloc;
-//! Lumina Registry — on-chain contract registry for the Lumina indexer.
-//!
-//! Projects deploy their Soroban contracts and register them here so that
-//! the Lumina indexer can discover and prioritize indexing their events.
-//! This creates a permissionless, decentralized index manifest for Stellar.
-//!
-//! Flow:
-//!   1. Project deploys a Soroban contract
-//!   2. Project calls register_contract() on the Lumina Registry
-//!   3. Lumina indexer polls the Registry for new entries and begins indexing
-//!   4. Indexed events become queryable via the Lumina GraphQL API
-//!
-//! ## Governance model (multi-sig admin)
-//!
-//! Privileged actions — deactivating another owner's contract, upgrading the
-//! wasm, changing the admin set — go through a **propose → approve →
-//! execute** flow rather than a single signer:
-//!
-//! 1. Any admin calls `propose_*`; a `Proposal` is stored and a
-//!    `proposal_proposed` event is emitted.
-//! 2. Other admins call `approve_proposal`; each unique approval is counted
-//!    and a `proposal_approved` event emitted.  When the threshold is reached
-//!    the proposal becomes *ready* and a `proposal_ready` event is emitted —
-//!    but it is **not** executed yet.
-//! 3. After `TIMELOCK_LEDGERS` ledgers have elapsed since the proposal became
-//!    ready, anyone may call `execute_proposal`; a `proposal_executed` event
-//!    is emitted.
-//! 4. Proposals that are never executed do not expire automatically; they can
-//!    be superseded by a new proposal for the same action or simply ignored.
-//!
-//! ## Resource cost benchmarks
-//!
-//! Soroban meters execution: an entrypoint that grows past a resource limit
-//! simply stops working on-chain while passing every test in the local host.
-//! The scanning views (`get_active_contracts`, `get_contracts_by_category`,
-//! `get_contracts_by_tag`) are the obvious candidates because their cost grows
-//! with the size of the registry index.
-//!
-//! `registry/tests/bench.rs` uses the test host's budget instrumentation to
-//! record CPU instructions and memory per entrypoint and asserts a ceiling for
-//! the scanning views. The numbers below are the ceilings asserted in CI; a
-//! significant regression fails the build.
-//!
-//! | Entrypoint | Metric | Ceiling |
-//! |------------|--------|---------|
-//! | `register_contract` | CPU instructions | 5_000_000 |
-//! | `get_active_contracts` | CPU instructions | 20_000_000 |
-//! | `get_contracts_by_category` | CPU instructions | 20_000_000 |
-//! | `get_contracts_by_tag` | CPU instructions | 20_000_000 |
-//! | `get_active_contracts` | Memory bytes | 1_000_000 |
-//!
-//! When a ceiling is intentionally raised, update this table in the same
-//! commit so the regression stays visible in review.
+// Lumina Registry — on-chain contract registry for the Lumina indexer.
+//
+// Projects deploy their Soroban contracts and register them here so that
+// the Lumina indexer can discover and prioritize indexing their events.
+// This creates a permissionless, decentralized index manifest for Stellar.
+//
+// Flow:
+//   1. Project deploys a Soroban contract
+//   2. Project calls register_contract() on the Lumina Registry
+//   3. Lumina indexer polls the Registry for new entries and begins indexing
+//   4. Indexed events become queryable via the Lumina GraphQL API
+//
+// ## Governance model (multi-sig admin)
+//
+// Privileged actions — deactivating another owner's contract, upgrading the
+// wasm, changing the admin set — go through a **propose → approve →
+// execute** flow rather than a single signer:
+//
+// 1. Any admin calls `propose_*`; a `Proposal` is stored and a
+//    `proposal_proposed` event is emitted.
+// 2. Other admins call `approve_proposal`; each unique approval is counted
+//    and a `proposal_approved` event emitted.  When the threshold is reached
+//    the proposal becomes *ready* and a `proposal_ready` event is emitted —
+//    but it is **not** executed yet.
+// 3. After `TIMELOCK_LEDGERS` ledgers have elapsed since the proposal became
+//    ready, anyone may call `execute_proposal`; a `proposal_executed` event
+//    is emitted.
+// 4. Proposals that are never executed do not expire automatically; they can
+//    be superseded by a new proposal for the same action or simply ignored.
+//
+// ## Resource cost benchmarks
+//
+// Soroban meters execution: an entrypoint that grows past a resource limit
+// simply stops working on-chain while passing every test in the local host.
+// The scanning views (`get_active_contracts`, `get_contracts_by_category`,
+// `get_contracts_by_tag`) are the obvious candidates because their cost grows
+// with the size of the registry index.
+//
+// `registry/tests/bench.rs` uses the test host's budget instrumentation to
+// record CPU instructions and memory per entrypoint and asserts a ceiling for
+// the scanning views. The numbers below are the ceilings asserted in CI; a
+// significant regression fails the build.
+//
+// | Entrypoint | Metric | Ceiling |
+// |------------|--------|---------|
+// | `register_contract` | CPU instructions | 5_000_000 |
+// | `get_active_contracts` | CPU instructions | 20_000_000 |
+// | `get_contracts_by_category` | CPU instructions | 20_000_000 |
+// | `get_contracts_by_tag` | CPU instructions | 20_000_000 |
+// | `get_active_contracts` | Memory bytes | 1_000_000 |
+//
+// When a ceiling is intentionally raised, update this table in the same
+// commit so the regression stays visible in review.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
     Symbol, Vec,
 };
 
-// ─── Version ───────────────────────────────────────────────────────────────
+// --- Version ---------------------------------------------------------------
 
 /// Version of the deployed code, returned by [`LuminaRegistry::get_version`].
 ///
@@ -125,7 +125,7 @@ pub const EXPIRY_LEDGERS: u32 = 5_256_000;
 #[cfg(test)]
 pub const EXPIRY_LEDGERS: u32 = 20;
 
-// ─── Errors ────────────────────────────────────────────────────────────────
+// --- Errors ----------------------------------------------------------------
 
 /// Errors returned by the Lumina Registry contract operations.
 ///
@@ -140,7 +140,7 @@ pub const EXPIRY_LEDGERS: u32 = 20;
 /// | Code | Name | Meaning | Usual remedy |
 /// |------|------|---------|--------------|
 /// | 1 | `AlreadyInitialized` | `initialize` was called on a deployment that already has an admin set. | Do not call `initialize` again; read `get_admins` / `get_threshold` to inspect the existing configuration. |
-/// | 2 | `Unauthorized` | The caller is not the registered owner and not permitted to perform this action. | Call from the registered owner's address, or route the action through the governance flow (`propose_*` → `approve_proposal` → `execute_proposal`). |
+/// | 2 | `Unauthorized` | The caller is not the registered owner and not permitted to perform this action. | Call from the registered owner's address, or route the action through the governance flow (`propose_*` ? `approve_proposal` ? `execute_proposal`). |
 /// | 3 | `AlreadyRegistered` | A `Contract` entry already exists for this `contract_id`. | Use `update_metadata` / `set_categories` to change the existing entry, or `deregister` it first if you intend to re-register. |
 /// | 4 | `ContractNotFound` | No `Contract` entry exists for the given `contract_id`. | Check `is_registered` before calling; register the contract first with `register_contract`. |
 /// | 5 | `InvalidMetadata` | The supplied metadata failed validation (e.g. empty batch, batch larger than 100 entries). | Pass a non-empty batch of at most 100 entries and ensure each entry has a name and description. |
@@ -219,11 +219,11 @@ pub enum RegistryError {
     InsufficientStake = 17,
     /// The stake is still inside the post-slash lock window.
     StakeLocked = 18,
-    /// The registration is still active — deactivate before withdrawing.
+    /// The registration is still active � deactivate before withdrawing.
     RegistrationActive = 19,
     /// A registration must declare at least one category.
     NoCategories = 20,
-    /// The registration still holds stake — withdraw it before deregistering.
+    /// The registration still holds stake � withdraw it before deregistering.
     StakeNotEmpty = 21,
     /// The registration rate limit configuration is invalid.
     InvalidRateLimit = 22,
@@ -265,9 +265,13 @@ pub enum RegistryError {
     /// believes is staked, so a transfer that depends on that balance cannot
     /// proceed safely.
     ContractBalanceInsufficient = 39,
+    /// The registry name is already taken by another contract.
+    NameTaken = 40,
+    /// The provided metadata URI is malformed or uses an unsupported scheme.
+    InvalidUri = 41,
 }
 
-// ─── Storage shapes ────────────────────────────────────────────────────────
+// --- Storage shapes --------------------------------------------------------
 //
 // ## Upgrade-compatibility rules
 //
@@ -282,7 +286,7 @@ pub enum RegistryError {
 // - Bump [`CONTRACT_VERSION`] alongside any such change.
 //
 // `registry-v2/src/lib.rs` re-declares both types independently and reads
-// back storage written by this version — that test keeps these rules honest.
+// back storage written by this version � that test keeps these rules honest.
 
 /// Stored entry describing a registered Soroban contract.
 #[contracttype]
@@ -302,12 +306,12 @@ pub struct ContractEntry {
     pub active: bool,
 }
 
-// ─── Category taxonomy ─────────────────────────────────────────────────────
+// --- Category taxonomy -----------------------------------------------------
 //
 // ## Why a fixed enum rather than free-form `Vec<Symbol>` tags
 //
 // Tags are more flexible, and that is exactly the problem. The point of
-// categories here is *browsing* — "show me the DeFi contracts" — and free-form
+// categories here is *browsing* � "show me the DeFi contracts" � and free-form
 // tags fragment that immediately: `DeFi`, `defi`, `De-Fi` and `Defi` become
 // four categories that each hold a slice of the answer, with no way for a
 // client to know they are the same thing. A discovery surface needs a shared
@@ -320,7 +324,7 @@ pub struct ContractEntry {
 // The cost is that adding a category needs a contract upgrade. That was a real
 // objection before the registry became upgradeable; now it is a normal release
 // (see `DEPLOY.md`), and adding a variant is safe under the storage rules above
-// because `#[contracttype]` enums encode by variant *name* — existing entries
+// because `#[contracttype]` enums encode by variant *name* � existing entries
 // keep decoding as long as current variants are neither renamed nor
 // repurposed. [`Category::Other`] is the escape hatch in the meantime, so
 // nothing is unclassifiable while waiting for that release.
@@ -328,7 +332,7 @@ pub struct ContractEntry {
 /// The category vocabulary a registration can be browsed under.
 ///
 /// Append new variants at the end and never rename or repurpose an existing
-/// one — see the storage rules above.
+/// one � see the storage rules above.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Category {
@@ -352,11 +356,11 @@ pub enum Category {
     Other,
 }
 
-// ─── Reputation types ──────────────────────────────────────────────────────
+// --- Reputation types ------------------------------------------------------
 //
 // Reputation is stored *beside* `ContractEntry`, never inside it. Adding
-// fields to `ContractEntry` would break every entry already written by v1 —
-// see the upgrade-compatibility rules above — and would force a migration on
+// fields to `ContractEntry` would break every entry already written by v1 �
+// see the upgrade-compatibility rules above � and would force a migration on
 // the live testnet deployment for what is, from storage's point of view,
 // purely additive data. New `DataKey` variants cost nothing and are safe.
 //
@@ -371,7 +375,7 @@ pub enum Category {
 pub struct SlashRecord {
     /// How much stake was taken.
     pub amount: i128,
-    /// Why governance slashed — recorded on-chain for accountability.
+    /// Why governance slashed � recorded on-chain for accountability.
     pub reason: String,
     /// Ledger at which the slash executed.
     pub slashed_at: u32,
@@ -393,7 +397,7 @@ pub struct Reputation {
     pub withdraw_locked_until: u32,
 }
 
-/// A registration joined with its reputation — what a discovery client wants.
+/// A registration joined with its reputation � what a discovery client wants.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContractProfile {
@@ -427,14 +431,14 @@ pub struct ContractProfilePage {
     pub has_more: bool,
 }
 
-// ─── Third-party attestations ──────────────────────────────────────────────
+// --- Third-party attestations ----------------------------------------------
 //
 // ## Why this is not `Verified`
 //
 // `Verified` is the governance signal: only the admin set, through a
 // threshold-and-timelocked proposal, can set it, and a registrant cannot
 // vouch for themselves. That is exactly the property that makes it worth
-// anything, so this feature deliberately does not touch it — there is no
+// anything, so this feature deliberately does not touch it � there is no
 // `attest`-driven path to `Verified` and no counter that aggregates
 // attestations into it.
 //
@@ -519,7 +523,7 @@ pub struct RegistryStats {
     pub total_staked: i128,
 }
 
-// ─── Proposal types ────────────────────────────────────────────────────────
+// --- Proposal types --------------------------------------------------------
 
 /// The action a governance proposal will execute once it clears threshold and
 /// timelock.
@@ -595,35 +599,35 @@ pub struct Proposal {
 ///
 /// | Key | Storage | Holds | Lifetime / TTL behaviour |
 /// |-----|---------|-------|--------------------------|
-/// | `Admins` | instance | `Vec<Address>` — current admin set | Lives as long as the contract instance; refreshed by `initialize` / admin-set proposals. |
-/// | `Threshold` | instance | `u32` — approvals required to pass | Same as the instance; changed only by `ChangeThreshold` proposals. |
-/// | `ProposalCount` | instance | `u32` — monotonic proposal counter | Never expires while the instance lives; never decremented. |
-/// | `ProposalData(u32)` | persistent | `Proposal` — full proposal record | Persistent; survives until its TTL lapses. Never deleted, so executed proposals remain readable. |
-/// | `ContractCount` | instance | `u32` — live registrations | Instance lifetime; decremented on `deregister`. |
-/// | `TotalRegistered` | instance | `u32` — lifetime registrations | Instance lifetime; never decremented. Missing on pre-existing deployments — `get_total_registered` falls back to `ContractCount`. |
-/// | `Contract(Address)` | persistent | `ContractEntry` — registration metadata | Persistent; the authoritative entry. Removed by `deregister`; may be archived by TTL, which is what the prune entrypoints clean up after. |
-/// | `OwnerContracts(Address)` | persistent | `Vec<Address>` — per-owner index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, pruned via `prune_all_contracts` for archival. |
-/// | `AllContracts` | instance | `Vec<Address>` — global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, `prune_all_contracts` for archival. |
-/// | `StakeToken` | instance | `Address` — SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
-/// | `Treasury` | instance | `Address` — slash destination | Instance lifetime; set once via `ConfigureStaking`. |
-/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
-/// | `Verified(Address)` | persistent | `bool` — governance-attested status | Persistent; removed by `deregister`. |
-/// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
-/// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
-/// | `MinimumStake` | instance | `i128` — minimum stake threshold | Instance lifetime; zero disables it. |
-/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
-/// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
-/// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
-/// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
-/// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
-/// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
-/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
-/// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
-/// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
-/// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
-/// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
-/// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
-/// | `Admin` | instance | `Address` — legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
+/// | `Admins` | instance | `Vec<Address>` � current admin set | Lives as long as the contract instance; refreshed by `initialize` / admin-set proposals. |
+/// | `Threshold` | instance | `u32` � approvals required to pass | Same as the instance; changed only by `ChangeThreshold` proposals. |
+/// | `ProposalCount` | instance | `u32` � monotonic proposal counter | Never expires while the instance lives; never decremented. |
+/// | `ProposalData(u32)` | persistent | `Proposal` � full proposal record | Persistent; survives until its TTL lapses. Never deleted, so executed proposals remain readable. |
+/// | `ContractCount` | instance | `u32` � live registrations | Instance lifetime; decremented on `deregister`. |
+/// | `TotalRegistered` | instance | `u32` � lifetime registrations | Instance lifetime; never decremented. Missing on pre-existing deployments � `get_total_registered` falls back to `ContractCount`. |
+/// | `Contract(Address)` | persistent | `ContractEntry` � registration metadata | Persistent; the authoritative entry. Removed by `deregister`; may be archived by TTL, which is what the prune entrypoints clean up after. |
+/// | `OwnerContracts(Address)` | persistent | `Vec<Address>` � per-owner index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries � eager cleanup on `deregister`, pruned via `prune_all_contracts` for archival. |
+/// | `AllContracts` | instance | `Vec<Address>` � global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries � eager cleanup on `deregister`, `prune_all_contracts` for archival. |
+/// | `StakeToken` | instance | `Address` � SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Treasury` | instance | `Address` � slash destination | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Stake(Address)` | persistent | `i128` � staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
+/// | `Verified(Address)` | persistent | `bool` � governance-attested status | Persistent; removed by `deregister`. |
+/// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` � slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
+/// | `WithdrawLockedUntil(Address)` | persistent | `u32` � post-slash lock ledger | Persistent; removed by `deregister`. |
+/// | `MinimumStake` | instance | `i128` � minimum stake threshold | Instance lifetime; zero disables it. |
+/// | `Categories(Address)` | persistent | `Vec<Category>` � declared categories | Persistent; removed by `deregister`. |
+/// | `ByCategory(Category)` | persistent | `Vec<Address>` � per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries � eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
+/// | `AllowlistEnabled` | instance | `bool` � permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
+/// | `Allowlisted(Address)` | persistent | `bool` � allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
+/// | `RegistrationRateLimit` | instance | `u32` � per-owner limit | Instance lifetime; zero disables limiting. |
+/// | `RegistrationRateWindow` | instance | `u32` � window size in ledgers | Instance lifetime. |
+/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` � current window counter | Persistent; rolls over as windows elapse. |
+/// | `RegistrationFee` | instance | `i128` � fee in the stake token | Instance lifetime; zero disables it. |
+/// | `Tags(Address)` | persistent | `Vec<String>` � owner-set tags | Persistent; removed by `deregister`. |
+/// | `Attestations(Address)` | persistent | `Vec<Attestation>` � third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
+/// | `TotalStaked` | instance | `i128` � total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
+/// | `VerifiedCount` | instance | `u32` � count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
+/// | `Admin` | instance | `Address` � legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
 ///
 /// Indexes that must stay consistent with their entries: `OwnerContracts`,
 /// `AllContracts`, and `ByCategory`. Each names `Contract` entries, so a
@@ -631,118 +635,117 @@ pub struct Proposal {
 /// cleanup paths or the prune entrypoints run.
 #[contracttype]
 pub enum DataKey {
-    // ── Governance ──────────────────────────────────────────────────────────
-    /// Vec<Address> — the current admin set.
+    // -- Governance ----------------------------------------------------------
+    /// Vec<Address> � the current admin set.
     Admins,
-    /// u32 — number of approvals required to pass a proposal.
+    /// u32 � number of approvals required to pass a proposal.
     Threshold,
-    /// u32 — monotonically-increasing proposal counter.
+    /// u32 � monotonically-increasing proposal counter.
     ProposalCount,
-    /// Proposal — the full proposal record.
+    /// Proposal � the full proposal record.
     ProposalData(u32),
 
-    // ── Registry ────────────────────────────────────────────────────────────
-    /// u32 — live registrations (deactivated included, deregistered excluded).
+    // -- Registry ------------------------------------------------------------
+    /// u32 � live registrations (deactivated included, deregistered excluded).
     /// Incremented on `register_contract`, decremented on `deregister`.
     /// See `get_contract_count` / `get_total_registered` for which figure to read.
     ContractCount,
-    /// u32 — lifetime registrations ever made. Incremented on
+    /// u32 � lifetime registrations ever made. Incremented on
     /// `register_contract` and never decremented, so it survives `deregister`.
     /// Added alongside deregistration to keep the old "registrations ever made"
     /// figure available after `ContractCount` became the live total. Missing on
-    /// deployments that predate it — `get_total_registered` falls back to
+    /// deployments that predate it � `get_total_registered` falls back to
     /// `ContractCount` in that case.
     TotalRegistered,
-    /// Contract(Address) — the stored entry for one registered contract.
+    /// Contract(Address) � the stored entry for one registered contract.
     Contract(Address),
-    /// Vec<Address> — list of contracts registered by a specific owner.
+    /// Vec<Address> � list of contracts registered by a specific owner.
     OwnerContracts(Address),
-    /// Vec<Address> — insertion-ordered list of every registered contract.
+    /// Vec<Address> � insertion-ordered list of every registered contract.
     AllContracts,
+    /// String(normalized) -> Address � registry name -> contract id claim.
+    /// Names are compared case-insensitively after trimming ASCII whitespace.
+    NameOwner(String),
     Expiry(Address),
 
-    // ── Staking & reputation ────────────────────────────────────────────────
-    /// Address — the SEP-41 token stakes are denominated in.
+    // -- Staking & reputation ------------------------------------------------
+    /// Address � the SEP-41 token stakes are denominated in.
     StakeToken,
-    /// Address — where slashed stake is sent.
+    /// Address � where slashed stake is sent.
     Treasury,
-    /// Address — the previous staking token, if any (for reconfiguration tracking).
+    /// Address � the previous staking token, if any (for reconfiguration tracking).
     PreviousStakeToken,
-    /// Address — the previous treasury, if any (for reconfiguration tracking).
+    /// Address � the previous treasury, if any (for reconfiguration tracking).
     PreviousTreasury,
-    /// i128 — currently staked balance for a registration.
+    /// i128 � currently staked balance for a registration.
     Stake(Address),
-    /// bool — governance-attested verified status.
+    /// bool � governance-attested verified status.
     Verified(Address),
-    /// Vec<SlashRecord> — every slash ever levied, oldest first.
+    /// Vec<SlashRecord> � every slash ever levied, oldest first.
     Slashes(Address),
-    /// u32 — ledger before which `withdraw_stake` is refused.
+    /// u32 � ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),
-    /// i128 — minimum stake threshold; zero disables it.
+    /// i128 � minimum stake threshold; zero disables it.
     MinimumStake,
 
-    // ── Category taxonomy ───────────────────────────────────────────────────
-    /// Vec<Category> — the categories a registration declared, deduplicated.
+    // -- Category taxonomy ---------------------------------------------------
+    /// Vec<Category> � the categories a registration declared, deduplicated.
     Categories(Address),
-    /// Vec<Address> — insertion-ordered registrations in one category.
+    /// Vec<Address> � insertion-ordered registrations in one category.
     ///
     /// Persistent rather than instance, following `OwnerContracts`: these grow
     /// with the number of registrations, and instance storage is a single
     /// bounded entry shared by everything in it.
     ByCategory(Category),
 
-    // ── Registration policy ─────────────────────────────────────────────────
-    /// bool — whether only allowlisted owners may register.
+    // -- Registration policy -------------------------------------------------
+    /// bool � whether only allowlisted owners may register.
     AllowlistEnabled,
-    /// bool — whether an owner is allowlisted.
+    /// bool � whether an owner is allowlisted.
     Allowlisted(Address),
-    /// u32 — per-owner registrations per fixed window; zero disables limiting.
+    /// u32 � per-owner registrations per fixed window; zero disables limiting.
     RegistrationRateLimit,
-    /// u32 — fixed registration window size in ledgers.
+    /// u32 � fixed registration window size in ledgers.
     RegistrationRateWindow,
-    /// RegistrationWindow — the current fixed-window counter for one owner.
+    /// RegistrationWindow � the current fixed-window counter for one owner.
     RegistrationWindow(Address),
 
-    // ── Registration fee ────────────────────────────────────────────────────
-    /// i128 — governance-set registration fee in the stake token; zero disables it.
+    // -- Registration fee ----------------------------------------------------
+    /// i128 � governance-set registration fee in the stake token; zero disables it.
     RegistrationFee,
 
-    // ── Tags ────────────────────────────────────────────────────────────────
-    /// Vec<String> — owner-set normalized tags for a registration.
+    // -- Tags ----------------------------------------------------------------
+    /// Vec<String> � owner-set normalized tags for a registration.
     Tags(Address),
-    /// Option<Address> — replacement contract that supersedes this one.
+    /// Option<Address> � replacement contract that supersedes this one.
     SupersededBy(Address),
 
-    // ── Metadata ────────────────────────────────────────────────────────────
-    /// String — off-chain metadata URI (e.g., ipfs:// or https://).
+    // -- Metadata ------------------------------------------------------------
+    /// String � off-chain metadata URI (e.g., ipfs:// or https://).
     MetadataUri(Address),
 
-    // ── Succession ──────────────────────────────────────────────────────────
-    /// Address — the contract that supersedes this registration, if any.
-    SupersededBy(Address),
-
-    // ── Third-party attestations ────────────────────────────────────────────
-    /// Vec<Attestation> — third-party attestations on a registration, oldest
+    // -- Third-party attestations --------------------------------------------
+    /// Vec<Attestation> � third-party attestations on a registration, oldest
     /// first. Kept beside `ContractEntry` rather than inside it, for the same
     /// reason as `Reputation`: a new field on `ContractEntry` would break every
     /// entry already written (see the upgrade-compatibility rules above),
     /// whereas a new `DataKey` variant is safe.
     Attestations(Address),
 
-    // ── Registry statistics ────────────────────────────────────────────────
-    /// i128 — total staked across all registrations.
+    // -- Registry statistics ------------------------------------------------
+    /// i128 � total staked across all registrations.
     TotalStaked,
-    /// u32 — count of verified registrations.
+    /// u32 � count of verified registrations.
     VerifiedCount,
 
-    // ── Legacy key kept for upgrade compatibility ────────────────────────
+    // -- Legacy key kept for upgrade compatibility ------------------------
     /// Single-admin key written by the original v1 initialize.  Retained so
     /// that the registry-v2 upgrade tests, which read `DataKey::Admin` from
     /// instance storage, continue to decode correctly after an upgrade.
     Admin,
 }
 
-// ─── Contract ──────────────────────────────────────────────────────────────
+// --- Contract --------------------------------------------------------------
 
 /// Main contract type implementing the Lumina on-chain contract registry.
 #[contract]
@@ -765,7 +768,7 @@ impl LuminaRegistry {
             .set(&DataKey::Admin, &bootstrap_admin);
     }
 
-    // ── Initialization ──────────────────────────────────────────────────────
+    // -- Initialization ------------------------------------------------------
 
     /// One-time setup.  `admins` must be non-empty and `threshold` must be
     /// between 1 and `admins.len()`.
@@ -807,7 +810,7 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    // ── Governance: proposal creation ───────────────────────────────────────
+    // -- Governance: proposal creation ---------------------------------------
 
     /// Propose deactivating a contract that belongs to someone else.
     /// Returns the new proposal ID.
@@ -986,15 +989,15 @@ impl LuminaRegistry {
     ///
     /// Deliberately a proposal rather than a setter on `initialize`: whoever
     /// sets the treasury decides where every future slash lands, and the live
-    /// registry was already initialized under the old signature — routing this
+    /// registry was already initialized under the old signature � routing this
     /// through governance lets a deployed registry adopt staking after an
     /// upgrade instead of needing to be redeployed.
     ///
     /// Both `token` and `treasury` must not be addresses already registered in
     /// the registry.  Permitting an overlap would create a confusing state: a
     /// `ContractEntry` whose owner could receive its own slashes, making the
-    /// slash semantics circular.  The validation is intentionally placed here —
-    /// at proposal time — so an obviously-invalid configuration is rejected
+    /// slash semantics circular.  The validation is intentionally placed here �
+    /// at proposal time � so an obviously-invalid configuration is rejected
     /// immediately rather than sitting through the timelock only to revert on
     /// execution.
     pub fn propose_configure_staking(
@@ -1052,7 +1055,7 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
-    /// Propose attesting — or revoking — verified status for a registration.
+    /// Propose attesting � or revoking � verified status for a registration.
     ///
     /// There is no non-governance path to this: a registrant cannot mark
     /// themselves verified, which is the whole point of the signal.
@@ -1321,7 +1324,7 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
-    // ── Governance: approval ────────────────────────────────────────────────
+    // -- Governance: approval ------------------------------------------------
 
     /// Record an admin's approval of a proposal.  When the number of unique
     /// approvals reaches the stored threshold the proposal transitions to
@@ -1373,7 +1376,7 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    // ── Governance: execution ───────────────────────────────────────────────
+    // -- Governance: execution -----------------------------------------------
 
     /// Execute a proposal that has reached threshold and passed the timelock.
     /// Callable by anyone once those conditions are satisfied.
@@ -1416,9 +1419,9 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    // ── Governance: instant deactivate by the owner ─────────────────────────
+    // -- Governance: instant deactivate by the owner -------------------------
 
-    /// Deactivate a contract you own *immediately* — no proposal needed because
+    /// Deactivate a contract you own *immediately* � no proposal needed because
     /// you are the registered owner.  An admin deactivating *another* owner's
     /// contract must go through `propose_deactivate`.
     pub fn deactivate(
@@ -1465,7 +1468,7 @@ impl LuminaRegistry {
     ///
     /// 1. the caller is the registered owner;
     /// 2. the registration is already deactivated (`deactivate` first);
-    /// 3. no stake remains (`withdraw_stake` first — otherwise funds would be
+    /// 3. no stake remains (`withdraw_stake` first � otherwise funds would be
     ///    stranded under an address the registry no longer tracks).
     ///
     /// Cleanup is **eager**: the entry is removed from the global
@@ -1479,7 +1482,7 @@ impl LuminaRegistry {
     /// without any explicit call) is handled separately by the permissionless,
     /// idempotent `prune_category` / `prune_all_contracts` entrypoints: eager
     /// removal covers every path the contract itself controls, while pruning
-    /// covers the one path it does not — the ledger garbage-collecting an
+    /// covers the one path it does not � the ledger garbage-collecting an
     /// entry out from under an index that still names it.
     pub fn deregister(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
         owner.require_auth();
@@ -1545,6 +1548,9 @@ impl LuminaRegistry {
             .remove(&DataKey::Contract(contract_id.clone()));
         env.storage()
             .persistent()
+            .remove(&DataKey::NameOwner(Self::normalize_name(&env, &entry.name)));
+        env.storage()
+            .persistent()
             .remove(&DataKey::Stake(contract_id.clone()));
         env.storage()
             .persistent()
@@ -1604,15 +1610,15 @@ impl LuminaRegistry {
 
     /// Remove dead references from one category index.
     ///
-    /// A reference is dead when its `Contract` entry no longer loads — either
+    /// A reference is dead when its `Contract` entry no longer loads � either
     /// because the registration was removed outside the indexed paths (e.g.
     /// storage archival/TTL expiry) or because it predates eager cleanup.
     /// `deregister` and `set_categories` already remove their own references
     /// eagerly; this covers the paths they cannot, which is why it exists
     /// alongside eager removal rather than instead of it.
     ///
-    /// Permissionless (no auth) so anyone — indexer, frontend, or a cron-like
-    /// caller — can pay for the cleanup. Idempotent and safe to call
+    /// Permissionless (no auth) so anyone � indexer, frontend, or a cron-like
+    /// caller � can pay for the cleanup. Idempotent and safe to call
     /// repeatedly: a second call with nothing dead removes nothing and
     /// returns 0. Returns the number of references removed.
     pub fn prune_category(env: Env, category: Category) -> u32 {
@@ -1682,7 +1688,7 @@ impl LuminaRegistry {
         removed
     }
 
-    // ── Legacy upgrade kept for backward-compatibility with existing tests ───
+    // -- Legacy upgrade kept for backward-compatibility with existing tests ---
 
     /// Direct upgrade, kept for the upgrade-path tests in this crate (which
     /// deploy v1 wasm via `contractimport!` and then call `upgrade` with the
@@ -1716,7 +1722,7 @@ impl LuminaRegistry {
         // `CONTRACT_VERSION` is the version being *replaced*, not the incoming
         // one: the new wasm only takes over once this invocation returns, and
         // this code cannot know what version the new wasm carries. Consumers
-        // read this field as "upgraded away from vN" — do not "fix" it to the
+        // read this field as "upgraded away from vN" � do not "fix" it to the
         // new version. Pinned by `registry_upgraded_event_reports_the_replaced_version`.
         env.events().publish(
             (Symbol::new(&env, "registry_upgraded"),),
@@ -1726,10 +1732,10 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    // ── Registry ────────────────────────────────────────────────────────────
+    // -- Registry ------------------------------------------------------------
 
     /// Register a Soroban contract for Lumina indexing.
-    /// Anyone can register — the owner must authorize the call.
+    /// Anyone can register � the owner must authorize the call.
     ///
     /// `categories` must name at least one [`Category`]; duplicates are
     /// collapsed, so passing the same category twice indexes it once. Use
@@ -1768,6 +1774,15 @@ impl LuminaRegistry {
 
         Self::validate_contract_metadata(&name, &description)?;
 
+        let norm = Self::normalize_name(&env, &name);
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::NameOwner(norm.clone()))
+        {
+            return Err(RegistryError::NameTaken);
+        }
+
         let categories = Self::dedup_categories(&env, &categories)?;
 
         Self::consume_registration_rate(&env, &owner)?;
@@ -1794,6 +1809,9 @@ impl LuminaRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NameOwner(norm), &contract_id);
 
         env.storage().persistent().set(&DataKey::Expiry(contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
         let mut owned = Self::owner_index(&env, &owner);
@@ -1880,6 +1898,14 @@ impl LuminaRegistry {
                 return Err(RegistryError::AlreadyRegistered);
             }
             Self::validate_contract_metadata(&entry.name, &entry.description)?;
+            let norm = Self::normalize_name(&env, &entry.name);
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::NameOwner(norm.clone()))
+            {
+                return Err(RegistryError::NameTaken);
+            }
             Self::dedup_categories(&env, &entry.categories)?;
         }
 
@@ -1897,6 +1923,7 @@ impl LuminaRegistry {
         for entry in entries.iter() {
             Self::consume_registration_rate(&env, &owner)?;
 
+            let norm = Self::normalize_name(&env, &entry.name);
             let contract_entry = ContractEntry {
                 contract_id: entry.contract_id.clone(),
                 owner: owner.clone(),
@@ -1910,6 +1937,9 @@ impl LuminaRegistry {
                 &DataKey::Contract(entry.contract_id.clone()),
                 &contract_entry,
             );
+            env.storage()
+                .persistent()
+                .set(&DataKey::NameOwner(norm), &entry.contract_id);
 
             env.storage().persistent().set(&DataKey::Expiry(entry.contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
             let mut owned = Self::owner_index(&env, &owner);
@@ -1960,7 +1990,7 @@ impl LuminaRegistry {
 
     /// Re-declare which categories a registration is browsable under.
     ///
-    /// Only the registered owner — the same authority as `update_metadata`,
+    /// Only the registered owner � the same authority as `update_metadata`,
     /// for the same reason: how a project files itself is metadata, not
     /// something the admin set has a say in.
     ///
@@ -2075,7 +2105,7 @@ impl LuminaRegistry {
     ///
     /// The `replacement` must itself be registered; passing an unknown address
     /// is rejected so the pointer is never dangling.  Only the owner may call
-    /// this.  The registration does not need to be deactivated first — a
+    /// this.  The registration does not need to be deactivated first � a
     /// project can signal "migrate to v2" while v1 is still live.
     pub fn set_superseded_by(
         env: Env,
@@ -2115,13 +2145,13 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    // ── Third-party attestations ────────────────────────────────────────────
+    // -- Third-party attestations --------------------------------------------
 
     /// Vouch for a registration with a short, bounded label.
     ///
     /// Permissionless by design: any address may attest, including the
     /// registration's own owner. This is a transparency feature, not a trust
-    /// signal — it grants nothing, changes no counter that feeds
+    /// signal � it grants nothing, changes no counter that feeds
     /// [`LuminaRegistry::is_verified`], and confers no privilege. What it does
     /// is record *who* is vouching, so the claim is attributable and the
     /// attester can take it back via
@@ -2214,7 +2244,7 @@ impl LuminaRegistry {
     ///
     /// Scoped to the caller's own record: it removes the single attestation
     /// whose `attester` equals `attester`, and errors if the caller has none.
-    /// No caller can remove anyone else's attestation — not a registry admin,
+    /// No caller can remove anyone else's attestation � not a registry admin,
     /// not the registration's owner, not a third party. That is the point:
     /// a claim stays exactly as long as the party making it stands behind it,
     /// and nobody else gets to decide that for them.
@@ -2269,7 +2299,7 @@ impl LuminaRegistry {
         Self::attestations_of(&env, &contract_id)
     }
 
-    // ── Staking ─────────────────────────────────────────────────────────────
+    // -- Staking -------------------------------------------------------------
 
     /// Post collateral against a registration you own.
     ///
@@ -2279,7 +2309,7 @@ impl LuminaRegistry {
     /// top. It also means the registrations that already exist can acquire a
     /// stake without re-registering.
     ///
-    /// Additive — calling it again tops the stake up.
+    /// Additive � calling it again tops the stake up.
     pub fn stake(
         env: Env,
         owner: Address,
@@ -2356,7 +2386,7 @@ impl LuminaRegistry {
     /// "Good standing" is three conditions, all checked here:
     ///
     /// 1. the caller is the registered owner;
-    /// 2. the registration is **deactivated** — you get your collateral back
+    /// 2. the registration is **deactivated** � you get your collateral back
     ///    by leaving, not while still listed and benefiting from the stake;
     /// 3. no slash has landed within the last [`SLASH_LOCK_LEDGERS`] ledgers,
     ///    so an owner cannot front-run governance by emptying the stake as
@@ -2439,7 +2469,7 @@ impl LuminaRegistry {
         Ok(staked)
     }
 
-    // ─── View ──────────────────────────────────────────────────────────────
+    // --- View --------------------------------------------------------------
 
     /// Which build of the registry is live at this address.
     pub fn get_version(_env: Env) -> u32 {
@@ -2484,7 +2514,7 @@ impl LuminaRegistry {
     }
 
     /// The categories a registration declared. Empty for one registered
-    /// before the taxonomy existed — see `set_categories`.
+    /// before the taxonomy existed � see `set_categories`.
     pub fn get_categories(env: Env, contract_id: Address) -> Vec<Category> {
         Self::categories_of(&env, &contract_id)
     }
@@ -2502,7 +2532,7 @@ impl LuminaRegistry {
     /// category's raw index, not into the filtered result, so a page can come
     /// back shorter than `limit` when it spans deactivated entries.
     ///
-    /// `deactivate` deliberately does not touch category indices — filtering
+    /// `deactivate` deliberately does not touch category indices � filtering
     /// here on `active` is what keeps a deactivated registration out of
     /// browsing, exactly as it does for the global listing, and it means
     /// reactivating a registration would restore it to every category it
@@ -2771,7 +2801,7 @@ impl LuminaRegistry {
         Self::reputation_of(&env, &contract_id)
     }
 
-    /// A registration joined with its reputation — one call instead of a
+    /// A registration joined with its reputation � one call instead of a
     /// `get_contract` plus a `get_reputation`.
     pub fn get_contract_profile(
         env: Env,
@@ -2821,35 +2851,6 @@ impl LuminaRegistry {
                 .persistent()
                 .get(&DataKey::SupersededBy(contract_id)),
         })
-    }
-
-    /// Record that one registration has been superseded by another project.
-    /// The old entry remains in place, but consumers can surface the newer
-    /// contract in the profile and history views.
-    pub fn set_superseded_by(
-        env: Env,
-        owner: Address,
-        old_contract: Address,
-        new_contract: Address,
-    ) -> Result<(), RegistryError> {
-        owner.require_auth();
-
-        let old_entry: ContractEntry = env.storage().persistent()
-            .get(&DataKey::Contract(old_contract.clone()))
-            .ok_or(RegistryError::ContractNotFound)?;
-        if owner != old_entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
-
-        let new_entry: ContractEntry = env.storage().persistent()
-            .get(&DataKey::Contract(new_contract.clone()))
-            .ok_or(RegistryError::ContractNotFound)?;
-        if new_entry.owner != owner {
-            return Err(RegistryError::Unauthorized);
-        }
-
-        env.storage().persistent().set(&DataKey::SupersededBy(old_contract), &new_contract);
-        Ok(())
     }
 
     /// `get_active_contracts`, with each entry's reputation attached. Same
@@ -3010,7 +3011,7 @@ impl LuminaRegistry {
     /// page. The position is anchored to a registration rather than to a
     /// numeric index, so a registration inserted while the caller is walking is
     /// appended after the cursor and neither duplicates nor skips an entry
-    /// already returned — the stability the offset form cannot offer.
+    /// already returned � the stability the offset form cannot offer.
     ///
     /// Typical loop:
     ///
@@ -3170,8 +3171,8 @@ impl LuminaRegistry {
     ///
     /// `cursor` is the `contract_id` of the last entry the previous call
     /// returned (`None` to start at the beginning). Like the offset form, this
-    /// includes deactivated registrations — an owner listing is a management
-    /// view, not a discovery one — and a registration added mid-walk is
+    /// includes deactivated registrations � an owner listing is a management
+    /// view, not a discovery one � and a registration added mid-walk is
     /// appended after the cursor without duplicating or skipping earlier
     /// entries.
     pub fn get_contracts_by_owner_after(
@@ -3300,9 +3301,14 @@ impl LuminaRegistry {
             if u.len() > 2048 {
                 return Err(RegistryError::InvalidUri);
             }
-            
-            let u_str: alloc::string::String = alloc::format!("{}", u);
-            if !u_str.starts_with("http://") && !u_str.starts_with("https://") && !u_str.starts_with("ipfs://") && !u_str.starts_with("ipns://") {
+            let mut raw = [0u8; 2048];
+            let slice = &mut raw[..u.len() as usize];
+            u.copy_into_slice(slice);
+            let ok = slice.starts_with(b"http://")
+                || slice.starts_with(b"https://")
+                || slice.starts_with(b"ipfs://")
+                || slice.starts_with(b"ipns://");
+            if !ok {
                 return Err(RegistryError::InvalidUri);
             }
         }
@@ -3325,7 +3331,7 @@ impl LuminaRegistry {
         Ok(())
     }
     /// Hand a registration over to a new owner.
-    /// Only the current owner can call this (admin override removed — ownership
+    /// Only the current owner can call this (admin override removed � ownership
     /// transfer should be driven by the owner themselves).
     pub fn transfer_ownership(
         env: Env,
@@ -3356,7 +3362,7 @@ impl LuminaRegistry {
 
         if !is_owner && !is_admin && !is_legacy_admin {
             // Neither the new multi-sig admins nor the legacy admin nor the
-            // owner — check whether we're initialized at all so the error
+            // owner � check whether we're initialized at all so the error
             // message stays informative.
             if !env.storage().instance().has(&DataKey::Admins)
                 && !env.storage().instance().has(&DataKey::Admin)
@@ -3395,7 +3401,7 @@ impl LuminaRegistry {
     }
 }
 
-// ─── Internal helpers ──────────────────────────────────────────────────────
+// --- Internal helpers ------------------------------------------------------
 
 impl LuminaRegistry {
     fn consume_registration_rate(env: &Env, owner: &Address) -> Result<(), RegistryError> {
@@ -3507,6 +3513,30 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
+    /// Normalize a registry name for uniqueness: trim ASCII whitespace and
+    /// lowercase ASCII letters. Non-ASCII bytes are left as-is.
+    fn normalize_name(env: &Env, name: &String) -> String {
+        let len = (name.len() as usize).min(256);
+        let mut raw = [0u8; 256];
+        let slice = &mut raw[..len];
+        name.copy_into_slice(slice);
+        let start = slice
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(len);
+        let end = slice
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(start);
+        let trimmed = &slice[start..end];
+        let mut out = [0u8; 256];
+        for (i, b) in trimmed.iter().enumerate() {
+            out[i] = if b.is_ascii_uppercase() { *b + 32 } else { *b };
+        }
+        String::from_bytes(env, &out[..trimmed.len()])
+    }
+
     fn save_proposal(env: &Env, proposal: &Proposal) {
         env.storage()
             .instance()
@@ -3534,7 +3564,7 @@ impl LuminaRegistry {
             ProposalAction::Upgrade(new_wasm_hash) => {
                 env.deployer()
                     .update_current_contract_wasm(new_wasm_hash.clone());
-                // The version being replaced, deliberately — see `upgrade`.
+                // The version being replaced, deliberately � see `upgrade`.
                 env.events().publish(
                     (Symbol::new(env, "registry_upgraded"),),
                     (new_wasm_hash.clone(), CONTRACT_VERSION),
@@ -4048,7 +4078,7 @@ impl LuminaRegistry {
     }
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────
+// --- Tests -----------------------------------------------------------------
 
 #[cfg(test)]
 mod test {
@@ -4058,7 +4088,7 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::{IntoVal, TryFromVal};
 
-    // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
+    // -- Upgrade-path wasm fixtures ------------------------------------------
 
     mod registry_v1_wasm {
         soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/lumina_registry.wasm");
@@ -4070,7 +4100,7 @@ mod test {
         );
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────────
+    // -- Helpers -------------------------------------------------------------
 
     /// Set up a registry with a 2-of-3 multi-sig admin.
     fn setup_multisig() -> (
@@ -4145,13 +4175,45 @@ mod test {
         cats(env, &[Category::Infrastructure])
     }
 
+    // ── Helpers ─────────────────────────────────────────────────────────────
+
+    /// Monotonic counter so helper-registered contracts get unique names
+    /// (registry names are now unique under normalize_name).
+    fn unique_test_name(env: &Env) -> String {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 32];
+        let prefix = b"Test Contract ";
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let mut i = prefix.len();
+        let mut v = n;
+        let mut digits = [0u8; 10];
+        let mut d = 0usize;
+        if v == 0 {
+            digits[0] = b'0';
+            d = 1;
+        } else {
+            while v > 0 {
+                digits[d] = b'0' + (v % 10) as u8;
+                v /= 10;
+                d += 1;
+            }
+        }
+        for j in 0..d {
+            buf[i] = digits[d - 1 - j];
+            i += 1;
+        }
+        String::from_bytes(env, &buf[..i])
+    }
+
     fn register_sample(env: &Env, client: &LuminaRegistryClient) -> (Address, Address) {
         let owner = Address::generate(env);
         let target = Address::generate(env);
         client.register_contract(
             &owner,
             &target,
-            &String::from_str(env, "Test Contract"),
+            &unique_test_name(env),
             &String::from_str(env, "A test contract"),
             &default_cats(env),
         );
@@ -4163,7 +4225,7 @@ mod test {
         client.register_contract(
             owner,
             &target,
-            &String::from_str(env, "Test Contract"),
+            &unique_test_name(env),
             &String::from_str(env, "A test contract"),
             &default_cats(env),
         );
@@ -4181,7 +4243,7 @@ mod test {
         client.register_contract(
             owner,
             &target,
-            &String::from_str(env, "Test Contract"),
+            &unique_test_name(env),
             &String::from_str(env, "A test contract"),
             &cats(env, categories),
         );
@@ -4198,7 +4260,106 @@ mod test {
         env.ledger().set_sequence_number(seq + n);
     }
 
-    // ── Initialization ──────────────────────────────────────────────────────
+    // -- Duplicate registry names (issue #19) ---------------------------------
+
+    #[test]
+    fn register_contract_rejects_duplicate_name() {
+        let (env, client, owner) = setup();
+        let first = Address::generate(&env);
+        client.register_contract(
+            &owner,
+            &first,
+            &String::from_str(&env, "Awesome DEX"),
+            &String::from_str(&env, "A sample registration"),
+            &Vec::from_array(&env, [Category::DeFi]),
+        );
+        let err = client
+            .try_register_contract(
+                &owner,
+                &Address::generate(&env),
+                &String::from_str(&env, "Awesome DEX"),
+                &String::from_str(&env, "Another"),
+                &Vec::from_array(&env, [Category::DeFi]),
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RegistryError::NameTaken);
+    }
+
+    #[test]
+    fn register_contract_rejects_case_insensitive_duplicate_name() {
+        let (env, client, owner) = setup();
+        client.register_contract(
+            &owner,
+            &Address::generate(&env),
+            &String::from_str(&env, "Awesome DEX"),
+            &String::from_str(&env, "A sample registration"),
+            &Vec::from_array(&env, [Category::DeFi]),
+        );
+        let err = client
+            .try_register_contract(
+                &owner,
+                &Address::generate(&env),
+                &String::from_str(&env, "  awesome dex  "),
+                &String::from_str(&env, "Another"),
+                &Vec::from_array(&env, [Category::DeFi]),
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RegistryError::NameTaken);
+    }
+
+    #[test]
+    fn deregister_releases_name_for_reuse() {
+        let (env, client, owner) = setup();
+        let first = Address::generate(&env);
+        client.register_contract(
+            &owner,
+            &first,
+            &String::from_str(&env, "Reusable Name"),
+            &String::from_str(&env, "A sample registration"),
+            &Vec::from_array(&env, [Category::DeFi]),
+        );
+        client.deactivate(&owner, &first);
+        client.deregister(&owner, &first);
+
+        let second = Address::generate(&env);
+        client.register_contract(
+            &owner,
+            &second,
+            &String::from_str(&env, "reusable name"),
+            &String::from_str(&env, "Another"),
+            &Vec::from_array(&env, [Category::DeFi]),
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn register_contracts_batch_rejects_duplicate_names() {
+        let (env, client, owner) = setup();
+        let c1 = Address::generate(&env);
+        let c2 = Address::generate(&env);
+        let mut entries = Vec::new(&env);
+        entries.push_back(RegistrationEntry {
+            contract_id: c1,
+            name: String::from_str(&env, "Batch Name"),
+            description: String::from_str(&env, "first"),
+            categories: Vec::from_array(&env, [Category::DeFi]),
+        });
+        entries.push_back(RegistrationEntry {
+            contract_id: c2,
+            name: String::from_str(&env, "batch name"),
+            description: String::from_str(&env, "second"),
+            categories: Vec::from_array(&env, [Category::DeFi]),
+        });
+        let err = client
+            .try_register_contracts(&owner, &entries)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RegistryError::NameTaken);
+    }
+
+    // -- Initialization ------------------------------------------------------
 
     #[test]
     fn initialize_sets_zero_count() {
@@ -4233,7 +4394,7 @@ mod test {
         );
     }
 
-    // ── Threshold enforcement ───────────────────────────────────────────────
+    // -- Threshold enforcement -----------------------------------------------
 
     #[test]
     fn proposal_cannot_execute_below_threshold() {
@@ -4244,7 +4405,7 @@ mod test {
         let pid = client.propose_deactivate(&a1, &target);
         client.approve_proposal(&a1, &pid);
 
-        // Advance past timelock — should still fail because threshold not met.
+        // Advance past timelock � should still fail because threshold not met.
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         assert_eq!(
             client.try_execute_proposal(&pid),
@@ -4269,7 +4430,7 @@ mod test {
         assert!(!client.get_contract(&target).active);
     }
 
-    // ── Timelock enforcement ────────────────────────────────────────────────
+    // -- Timelock enforcement ------------------------------------------------
 
     #[test]
     fn proposal_cannot_execute_before_timelock_elapses() {
@@ -4303,7 +4464,7 @@ mod test {
         assert!(!client.get_contract(&target).active);
     }
 
-    // ── Duplicate-approval rejection ────────────────────────────────────────
+    // -- Duplicate-approval rejection ----------------------------------------
 
     #[test]
     fn same_admin_approving_twice_is_rejected() {
@@ -4338,7 +4499,7 @@ mod test {
         );
     }
 
-    // ── Unanimous threshold ─────────────────────────────────────────────────
+    // -- Unanimous threshold -------------------------------------------------
 
     #[test]
     fn unanimous_threshold_waits_for_the_last_admin() {
@@ -4366,7 +4527,7 @@ mod test {
         assert!(client.get_contract(&target).active);
 
         // The third approval is the one that matters, and the timelock only
-        // starts counting from it — not from the first two.
+        // starts counting from it � not from the first two.
         client.approve_proposal(&a3, &pid);
         assert_eq!(client.get_proposal(&pid).ready_at, env.ledger().sequence());
 
@@ -4392,7 +4553,7 @@ mod test {
         assert!(client.get_contract(&target2).active);
     }
 
-    // ── Concurrent, conflicting proposals ───────────────────────────────────
+    // -- Concurrent, conflicting proposals -----------------------------------
 
     #[test]
     fn two_open_proposals_for_conflicting_actions_are_counted_separately() {
@@ -4477,7 +4638,7 @@ mod test {
         );
     }
 
-    // ── Non-admin cannot propose or approve ─────────────────────────────────
+    // -- Non-admin cannot propose or approve ---------------------------------
 
     #[test]
     fn non_admin_cannot_propose() {
@@ -4532,7 +4693,7 @@ mod test {
         );
     }
 
-    // ── Admin-set changes go through governance ─────────────────────────────
+    // -- Admin-set changes go through governance -----------------------------
 
     #[test]
     fn add_admin_via_governance() {
@@ -4553,7 +4714,7 @@ mod test {
     fn remove_admin_via_governance() {
         let (env, client, a1, a2, a3) = setup_multisig();
 
-        // Remove a3 — set goes from 3 to 2, still satisfies threshold=2.
+        // Remove a3 � set goes from 3 to 2, still satisfies threshold=2.
         let pid = client.propose_remove_admin(&a1, &a3);
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
@@ -4603,7 +4764,7 @@ mod test {
         assert_eq!(client.get_threshold(), 1);
     }
 
-    // ── Full realistic scenario ─────────────────────────────────────────────
+    // -- Full realistic scenario ---------------------------------------------
 
     #[test]
     fn full_scenario_compromised_admin_removed_via_governance() {
@@ -4639,14 +4800,14 @@ mod test {
         assert!(!client.get_contract(&target).active);
     }
 
-    // ── Owner self-deactivate is still instant ──────────────────────────────
+    // -- Owner self-deactivate is still instant ------------------------------
 
     #[test]
     fn owner_can_deactivate_own_contract_immediately() {
         let (env, client, _a1, _a2, _a3) = setup_multisig();
         let (owner, target) = register_sample(&env, &client);
 
-        // No proposal needed — owner deactivates directly.
+        // No proposal needed � owner deactivates directly.
         client.deactivate(&owner, &target);
         assert!(!client.get_contract(&target).active);
     }
@@ -4663,7 +4824,7 @@ mod test {
         );
     }
 
-    // ── Executed proposal cannot be re-executed ─────────────────────────────
+    // -- Executed proposal cannot be re-executed -----------------------------
 
     #[test]
     fn executed_proposal_cannot_execute_again() {
@@ -4682,7 +4843,7 @@ mod test {
         );
     }
 
-    // ── Existing registry tests (single-admin setup) ────────────────────────
+    // -- Existing registry tests (single-admin setup) ------------------------
 
     #[test]
     fn register_contract_succeeds() {
@@ -4869,7 +5030,7 @@ mod test {
         assert!(page_contains(&b, &target_b));
     }
 
-    // ── Cursor pagination (#26) ─────────────────────────────────────────────
+    // -- Cursor pagination (#26) ---------------------------------------------
 
     #[test]
     fn cursor_walks_every_active_entry_exactly_once() {
@@ -5180,7 +5341,7 @@ mod test {
         );
     }
 
-    // ── Upgrade-path tests ──────────────────────────────────────────────────
+    // -- Upgrade-path tests --------------------------------------------------
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
         let admin = Address::generate(env);
@@ -5405,7 +5566,7 @@ mod test {
     // The upgrade event carries the version of the code being *replaced*.
     // Emitting the incoming version would be an equally plausible-looking
     // choice, and it would silently invert every consumer's reading of the
-    // field — these tests pin the intent so that change cannot slip through.
+    // field � these tests pin the intent so that change cannot slip through.
 
     #[test]
     fn registry_upgraded_event_reports_the_replaced_version() {
@@ -5599,7 +5760,7 @@ mod test {
         client.update_metadata(&owner, &target, &name, &desc);
     }
 
-    // ── Staking, verification & slashing ────────────────────────────────────
+    // -- Staking, verification & slashing ------------------------------------
 
     /// A registry with a live Stellar Asset Contract as its stake token and
     /// staking already opened through governance.
@@ -5682,7 +5843,7 @@ mod test {
     ///
     /// `stake` moves tokens in and tracks them, `withdraw_stake` moves them
     /// out and untracks them, and slash execution moves them to the treasury
-    /// and untracks them — so after any sequence the two figures agree.
+    /// and untracks them � so after any sequence the two figures agree.
     /// Deliberately an equality (not just `balance >= tracked`): both an
     /// over-credited and an under-credited accounting bug break it.
     fn assert_solvency(env: &Env, client: &LuminaRegistryClient, token_id: &Address) {
@@ -5695,7 +5856,7 @@ mod test {
         );
     }
 
-    // ── Configuration ───────────────────────────────────────────────────────
+    // -- Configuration -------------------------------------------------------
 
     #[test]
     fn staking_is_closed_until_governance_opens_it() {
@@ -5732,7 +5893,7 @@ mod test {
         );
     }
 
-    // ── Staking ─────────────────────────────────────────────────────────────
+    // -- Staking -------------------------------------------------------------
 
     #[test]
     fn stake_moves_real_tokens_into_the_registry() {
@@ -5807,7 +5968,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── Verification ────────────────────────────────────────────────────────
+    // -- Verification --------------------------------------------------------
 
     #[test]
     fn verification_is_unset_by_default() {
@@ -5838,7 +5999,7 @@ mod test {
         let (owner, target) = register_sample(&env, &client);
 
         // The owner is not an admin, and there is no non-governance path to
-        // verified status at all — this is the entire value of the signal.
+        // verified status at all � this is the entire value of the signal.
         assert_eq!(
             client.try_propose_set_verified(&owner, &target, &true),
             Err(Ok(RegistryError::NotAdmin)),
@@ -5876,7 +6037,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── Slashing ────────────────────────────────────────────────────────────
+    // -- Slashing ------------------------------------------------------------
 
     #[test]
     fn slash_moves_stake_to_the_treasury_and_records_the_reason() {
@@ -6002,14 +6163,14 @@ mod test {
 
     #[test]
     fn normal_slash_is_unaffected_by_the_balance_guard() {
-        // The guard must not fire when the contract is solvent — that would
+        // The guard must not fire when the contract is solvent � that would
         // break every legitimate slash.
         let (env, client, admin, token, _treasury) = setup_failing_staking();
         let (owner, target) = register_sample(&env, &client);
         token.mint(&owner, &1_000);
         client.stake(&owner, &target, &1_000);
 
-        let reason = String::from_str(&env, "normal slash — guard must pass");
+        let reason = String::from_str(&env, "normal slash � guard must pass");
         let pid = client.propose_slash(&admin, &target, &400, &reason);
         // This must succeed: real balance == tracked total == 1 000.
         pass_proposal(&env, &client, &admin, pid);
@@ -6027,9 +6188,9 @@ mod test {
         let (env, client, admin, token, _treasury) = setup_failing_staking();
         let (owner, target) = register_sample(&env, &client);
         token.mint(&owner, &1_000);
-        // The registry credits 1 000 to TotalStaked …
+        // The registry credits 1 000 to TotalStaked �
         client.stake(&owner, &target, &1_000);
-        // … but 1 token was silently removed (fee-on-transfer / direct drain).
+        // � but 1 token was silently removed (fee-on-transfer / direct drain).
         token.burn_from(&client.address, &1);
         // Now real balance (999) < tracked total (1 000).
 
@@ -6048,7 +6209,7 @@ mod test {
         assert_eq!(client.get_reputation(&target).withdraw_locked_until, 0);
     }
 
-    // ── Withdrawal ──────────────────────────────────────────────────────────
+    // -- Withdrawal ----------------------------------------------------------
 
     #[test]
     fn withdraw_returns_the_full_stake_once_the_owner_has_deactivated() {
@@ -6147,7 +6308,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── Reputation views ────────────────────────────────────────────────────
+    // -- Reputation views ----------------------------------------------------
 
     #[test]
     fn reputation_of_an_untouched_registration_is_all_zeroes() {
@@ -6234,7 +6395,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── End-to-end lifecycle ────────────────────────────────────────────────
+    // -- End-to-end lifecycle ------------------------------------------------
 
     #[test]
     fn full_stake_verify_slash_withdraw_lifecycle() {
@@ -6274,7 +6435,7 @@ mod test {
             Err(Ok(RegistryError::StakeLocked)),
         );
 
-        // Once the lock expires the remainder — and only the remainder —
+        // Once the lock expires the remainder � and only the remainder �
         // comes back.
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
         assert_eq!(client.withdraw_stake(&owner, &target), 750);
@@ -6288,9 +6449,9 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── Stake-token failure ─────────────────────────────────────────────────
+    // -- Stake-token failure -------------------------------------------------
     //
-    // Real stake tokens can refuse a transfer — a frozen trustline, an
+    // Real stake tokens can refuse a transfer � a frozen trustline, an
     // insufficient balance, a clawback-enabled asset. Every staking path moves
     // tokens before writing its own bookkeeping, and relies on the failed
     // transfer aborting the whole invocation so that nothing it wrote
@@ -6356,7 +6517,7 @@ mod test {
 
         /// Directly reduce `account`'s balance by `amount`, bypassing any auth
         /// or failing-flag checks.  Used in tests to simulate the registry
-        /// holding fewer tokens than its tracked total — the scenario this
+        /// holding fewer tokens than its tracked total � the scenario this
         /// guard is designed to surface.
         pub fn burn_from(env: Env, account: Address, amount: i128) {
             let current: i128 = env
@@ -6493,8 +6654,8 @@ mod test {
         assert!(client.try_execute_proposal(&pid).is_err());
 
         // No stake debited, no slash recorded, no withdraw lock applied, and
-        // — although `execute_proposal` marks the proposal executed before
-        // applying it — that mark is rolled back too, so it can be retried.
+        // � although `execute_proposal` marks the proposal executed before
+        // applying it � that mark is rolled back too, so it can be retried.
         assert_eq!(client.get_stake(&target), 1_000);
         assert_eq!(client.get_slashes(&target).len(), 0);
         assert_eq!(client.get_reputation(&target).slashed_total, 0);
@@ -6543,7 +6704,7 @@ mod test {
         assert_accounting_matches_token(&client, &token, &[&a, &b]);
     }
 
-    // ── Category taxonomy ───────────────────────────────────────────────────
+    // -- Category taxonomy ---------------------------------------------------
 
     #[test]
     fn registration_requires_at_least_one_category() {
@@ -6785,7 +6946,7 @@ mod test {
         assert_eq!(page.get(1).unwrap().contract_id, registered.get(4).unwrap());
     }
 
-    // ── set_categories ──────────────────────────────────────────────────────
+    // -- set_categories ------------------------------------------------------
 
     #[test]
     fn set_categories_moves_a_registration_between_categories() {
@@ -6870,7 +7031,7 @@ mod test {
             client.try_set_categories(&stranger, &target, &cats(&env, &[Category::Gaming])),
             Err(Ok(RegistryError::NotOwner)),
         );
-        // Not even the admin — how a project files itself is its own business,
+        // Not even the admin � how a project files itself is its own business,
         // exactly as with `update_metadata`.
         assert_eq!(
             client.try_set_categories(&admin, &target, &cats(&env, &[Category::Gaming])),
@@ -6985,7 +7146,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── Third-party attestations ────────────────────────────────────────────
+    // -- Third-party attestations --------------------------------------------
 
     #[test]
     fn multiple_parties_can_attest_to_the_same_registration() {
@@ -7007,7 +7168,7 @@ mod test {
         let attestations = client.get_attestations(&target);
         assert_eq!(attestations.len(), 3);
 
-        // Every attester's identity is recorded — the claim is attributable,
+        // Every attester's identity is recorded � the claim is attributable,
         // not anonymous.
         assert!(attestations.iter().any(|a| a.attester == alice));
         assert!(attestations.iter().any(|a| a.attester == bob));
@@ -7377,7 +7538,7 @@ mod test {
         assert_eq!(client.get_attestations(&fresh).len(), 0);
     }
 
-    // ── Deregistration, pruning & counters ──────────────────────────────────
+    // -- Deregistration, pruning & counters ----------------------------------
 
     #[test]
     fn deregister_removes_every_index_reference_and_decrements_the_live_count() {
@@ -7462,7 +7623,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── respond_to_slash ───────────────────────────────────────────────────
+    // -- respond_to_slash ---------------------------------------------------
 
     #[test]
     fn owner_can_respond_to_slash() {
@@ -7641,7 +7802,7 @@ mod test {
         assert_solvency(&env, &client, &token_id);
     }
 
-    // ── Category pruning ────────────────────────────────────────────────────
+    // -- Category pruning ----------------------------------------------------
 
     #[test]
     fn prune_category_drops_dead_references_and_is_safe_to_repeat() {
@@ -7702,7 +7863,7 @@ mod test {
         assert_eq!(client.get_active_contract_count(), 1);
     }
 
-    // ── set_superseded_by ───────────────────────────────────────────────────
+    // -- set_superseded_by ---------------------------------------------------
 
     #[test]
     fn owner_can_set_superseded_by_and_profile_surfaces_it() {
@@ -7748,7 +7909,7 @@ mod test {
         assert_eq!(client.get_contract_profile(&target).superseded_by, None);
     }
 
-    // ── Governance hardening (#40, #41, #42, #43) ───────────────────────────
+    // -- Governance hardening (#40, #41, #42, #43) ---------------------------
 
     // Issue 4: Require a minimum admin set size (#40)
     #[test]
@@ -7907,10 +8068,10 @@ mod test {
         assert_eq!(executable_from, ready_at + TIMELOCK_LEDGERS);
     }
 
-    // ── Issue #56: negative auth coverage for every state-changing entrypoint ──
+    // -- Issue #56: negative auth coverage for every state-changing entrypoint --
     //
     // A missing `require_auth()` is the highest-severity bug this contract can
-    // have, and it is invisible to any test that uses `mock_all_auths` — that
+    // have, and it is invisible to any test that uses `mock_all_auths` � that
     // helper approves *any* address's authorization, including one the
     // contract never actually asked to authorize, so a dropped
     // `require_auth()` call would not fail a single test above this section.
