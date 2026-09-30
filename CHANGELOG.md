@@ -8,16 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## Version 4 (unreleased)
 
 ### Interface Changes
-- **Added `cancel_proposal(env, admin, proposal_id)`** — allows the proposer or a threshold of admins to cancel a pending proposal before it executes. A cancelled proposal can no longer be approved or executed, and emits `proposal_cancelled`.
-- **Cancellation guards** — cancelling an already-executed proposal is rejected, and non-admins cannot cancel.
-
-### Storage Changes
-- **Added `DataKey::Cancelled`** — tracks proposals that have been cancelled so they can no longer be approved or executed.
-
-### Interface Changes
-- **Enhanced `staking_configured` event** — now emits `(prev_token, prev_treasury, token_id, treasury)` instead of just `(token_id, treasury)`. This makes reconfigurations distinguishable from first configuration, preventing stranded stakes when changing the stake token.
+- **Enhanced `staking_configured` event** — now emits `(prev_token, prev_treasury, token_id, treasury)`, instead of just `(token_id, treasury)`. This makes reconfigurations distinguishable from first configuration, preventing stranded stakes when changing the stake token.
 - **Token change protection** — `propose_configure_staking` now refuses to change the stake token if any stakes are held, returning `RegistryError::StakeNotEmpty`. This prevents the critical scenario where changing the token while stakes exist would strand them in the old token.
 - **Previous values tracking** — added `PreviousStakeToken` and `PreviousTreasury` `DataKey` entries that store the old token/treasury before overwriting, visible via the enhanced event.
+- **Added `cancel_proposal`** — callable by the proposer or by a threshold of admins, allowing a mistaken or superseded proposal to be withdrawn before execution. A cancelled proposal cannot be approved or executed, and emits `proposal_cancelled`.
 
 ### Storage Changes
 - **Added `DataKey::PreviousStakeToken`** — stores the previous staking token address prior to reconfiguration. Variant names are preserved in `#[contracttype]` enum, so adding this new variant is safe for upgrades.

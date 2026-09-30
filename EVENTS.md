@@ -10,16 +10,16 @@ Events are the integration surface for downstream consumers, serving as the inte
 ## Events
 
 | Topic | Payload Shape | When It Fires | Consumers | Example Test Reference |
-||---|---|---|---|---|
+|---|---|---|---|---|
 | `proposal_proposed` | `(proposal_id: u32, proposer: Address, action: Symbol, data: T)` | When an admin proposes an action (e.g., slash, upgrade, change settings). | | `propose_deactivate_requires_admin` |
 | `proposal_approved` | `(proposal_id: u32, admin: Address, approvals_len: u32, threshold: u32)` | When an admin approves an existing proposal. | | `approve_proposal_records_approval_and_returns_total` |
 | `proposal_ready` | `(proposal_id: u32, ready_at: u32, executable_from: u32)` | When a proposal receives enough approvals and enters the timelock. | | `proposal_enters_timelock_after_sufficient_approvals` |
-| `proposal_cancelled` | `(proposal_id: u32, canceller: Address)` | When the proposer or a threshold of admins cancels a proposal before it executes. | | `cancel_proposal_prevents_execution_even_after_timelock` |
+| `proposal_cancelled` | `(proposal_id: u32, canceller_admin: Address)` | When a proposal is cancelled before execution by the proposer or a threshold of admins. | | `cancel_proposal_prevents_execution` |
 | `proposal_executed` | `(proposal_id: u32, executed_at: u64)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |
 | `contract_deactivated` | `(contract_id: Address, caller: Address)` or `(contract_id: Address, Symbol("governance"))` | When a contract is deactivated by its owner or governance. | Indexer, History | `deactivate_requires_contract_owner` |
 | `contract_deregistered` | `(contract_id: Address, owner: Address)` | When a deactivated and unstaked contract is fully deregistered. | Indexer, History | `deregister_removes_every_index_reference...` |
 | `contract_registered` | `(contract_id: Address, owner: Address, name: String, categories: Vec<String>)` | When a new contract is registered to the manifest. | Indexer, History | `registration_records_its_categories` |
-| `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>)` | When a contract's categories are updated by its owner or manager. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
+| `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>+` | When a contract's categories are updated by its owner or manager. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
 | `tags_updated` | `(contract_id: Address, owner: Address, tags_len: u32)` | When a contract's tags are updated by its owner or manager. | History | `tags_are_updated_and_returned` |
 | `metadata_updated` | `(contract_id: Address, owner: Address, name: String)` | When the contract's metadata (name) is updated by the owner or manager. | Indexer, History | `update_metadata_succeeds_with_real_owner_signature` |
 | `ownership_transferred`| `(contract_id: Address, previous_owner: Address, new_owner: Address)` | When the contract's ownership is transferred to a new address. | History | `ownership_transfer_preserves_stake_and_verification` |
