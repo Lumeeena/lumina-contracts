@@ -178,6 +178,8 @@ pub const EXPIRY_LEDGERS: u32 = 20;
 /// | 37 | `SlashNotFound` | No slash exists at the given index in a registration's slash history. | Check `get_slashes` for valid indices before calling `respond_to_slash`. |
 /// | 38 | `ResponseAlreadyExists` | The referenced slash already has a recorded response. | Responses are immutable once set; there is nothing further to call. |
 /// | 39 | `ContractBalanceInsufficient` | The registry's real token balance is smaller than the total it believes is staked. | This signals a token/registry desync (e.g. a fee-on-transfer token); investigate before retrying. |
+/// | 40 | `InvalidBatchSize` | A proposal batch is empty or contains more than `MAX_BATCH_ACTIONS` actions. | Supply between 1 and 10 actions. |
+/// | 41 | `NestedBatch` | An action inside a proposal batch is itself a batch. | Supply a flat list of actions. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -265,6 +267,10 @@ pub enum RegistryError {
     /// believes is staked, so a transfer that depends on that balance cannot
     /// proceed safely.
     ContractBalanceInsufficient = 39,
+    /// A proposal batch is empty or exceeds [`MAX_BATCH_ACTIONS`].
+    InvalidBatchSize = 40,
+    /// A proposal batch contains another batch.
+    NestedBatch = 41,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -554,7 +560,13 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Execute actions in order in one transaction, reverting all on failure.
+    /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
+    Batch(Vec<ProposalAction>),
 }
+
+/// Maximum number of actions in one governance proposal batch.
+pub const MAX_BATCH_ACTIONS: u32 = 10;
 
 /// Fixed-window registration counter for one owner.
 #[contracttype]
@@ -808,6 +820,31 @@ impl LuminaRegistry {
     }
 
     // ── Governance: proposal creation ───────────────────────────────────────
+
+    /// Propose a bounded, non-nested batch of governance actions.
+    ///
+    /// Actions execute in the supplied order after the ordinary approval and
+    /// timelock checks. Action-specific validation runs against the state at
+    /// each execution step, so later actions can depend on earlier ones. An
+    /// error rolls back every action and leaves the proposal available to retry.
+    pub fn propose_batch(
+        env: Env,
+        proposer: Address,
+        actions: Vec<ProposalAction>,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&Self::admin_index(&env), &proposer)?;
+        Self::validate_batch(&actions)?;
+
+        let action_count = actions.len();
+        let proposal_id =
+            Self::create_proposal(&env, proposer.clone(), ProposalAction::Batch(actions));
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "batch"), action_count),
+        );
+        Ok(proposal_id)
+    }
 
     /// Propose deactivating a contract that belongs to someone else.
     /// Returns the new proposal ID.
@@ -3513,9 +3550,30 @@ impl LuminaRegistry {
             .set(&DataKey::ProposalData(proposal.id), proposal);
     }
 
+    fn validate_batch(actions: &Vec<ProposalAction>) -> Result<(), RegistryError> {
+        if actions.is_empty() || actions.len() > MAX_BATCH_ACTIONS {
+            return Err(RegistryError::InvalidBatchSize);
+        }
+        for action in actions.iter() {
+            if matches!(action, ProposalAction::Batch(_)) {
+                return Err(RegistryError::NestedBatch);
+            }
+        }
+        Ok(())
+    }
+
     /// Execute the side-effect of a passed proposal.
     fn apply_action(env: &Env, action: &ProposalAction) -> Result<(), RegistryError> {
         match action {
+            ProposalAction::Batch(actions) => {
+                // Recheck stored batches before any side effects. Propagate
+                // errors to the host so storage, events, token transfers and
+                // the executed marker all roll back in the same transaction.
+                Self::validate_batch(actions)?;
+                for action in actions.iter() {
+                    Self::apply_action(env, &action)?;
+                }
+            }
             ProposalAction::Deactivate(contract_id) => {
                 let mut entry: ContractEntry = env
                     .storage()

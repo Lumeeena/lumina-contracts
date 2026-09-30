@@ -1,4 +1,4 @@
-error RegistryError { AlreadyInitialized = 1, Unauthorized = 2, AlreadyRegistered = 3, ContractNotFound = 4, InvalidMetadata = 5, NotOwner = 6, NotInitialized = 7, ProposalNotFound = 8, ThresholdNotMet = 9, TimelockNotElapsed = 10, AlreadyApproved = 11, NotAdmin = 12, InvalidThreshold = 13, AlreadyExecuted = 14, StakingNotConfigured = 15, InvalidAmount = 16, InsufficientStake = 17, StakeLocked = 18, RegistrationActive = 19, NoCategories = 20, StakeNotEmpty = 21, InvalidRateLimit = 22, NotAllowlisted = 23, RegistrationRateLimited = 24, InsufficientFee = 25, InvalidTags = 26, InvalidAttestation = 27, AttestationNotFound = 28, NotManager = 29, TooManyCategories = 30 }
+error RegistryError { AlreadyInitialized = 1, Unauthorized = 2, AlreadyRegistered = 3, ContractNotFound = 4, InvalidMetadata = 5, NotOwner = 6, NotInitialized = 7, ProposalNotFound = 8, ThresholdNotMet = 9, TimelockNotElapsed = 10, AlreadyApproved = 11, NotAdmin = 12, InvalidThreshold = 13, AlreadyExecuted = 14, StakingNotConfigured = 15, InvalidAmount = 16, InsufficientStake = 17, StakeLocked = 18, RegistrationActive = 19, NoCategories = 20, StakeNotEmpty = 21, InvalidRateLimit = 22, NotAllowlisted = 23, RegistrationRateLimited = 24, InsufficientFee = 25, InvalidTags = 26, InvalidAttestation = 27, AttestationNotFound = 28, NotManager = 29, TooManyCategories = 30, InvalidBatchSize = 40, NestedBatch = 41 }
 fn __constructor(bootstrap_admin: Address)
 fn approve_proposal(admin: Address, proposal_id: U32) -> Result<(), RegistryError>
 fn attest(attester: Address, contract_id: Address, label: String) -> Result<(), RegistryError>
@@ -40,6 +40,7 @@ fn initialize(admins: Vec<Address>, threshold: U32) -> Result<(), RegistryError>
 fn is_registered(contract_id: Address) -> Bool
 fn is_verified(contract_id: Address) -> Bool
 fn propose_add_admin(proposer: Address, new_admin: Address) -> Result<U32, RegistryError>
+fn propose_batch(proposer: Address, actions: Vec<ProposalAction>) -> Result<U32, RegistryError>
 fn propose_change_threshold(proposer: Address, new_threshold: U32) -> Result<U32, RegistryError>
 fn propose_configure_minimum_stake(proposer: Address, minimum: I28) -> Result<U32, RegistryError>
 fn propose_configure_staking(proposer: Address, token: Address, treasury: Address) -> Result<U32, RegistryError>
@@ -79,4 +80,4 @@ struct Reputation { slashed_total: I128, stake: I28, verified: Bool, withdraw_lo
 struct SlashRecord { amount: I128, reason: String, slashed_at: U32 }
 union Category { DeFi, Nft, Gaming, Identity, Infrastructure, Payments, Oracle, Dao, Other }
 union DataKey { Admins, Threshold, ProposalCount, ProposalData(U32), ContractCount, TotalRegistered, Contract(Address), OwnerContracts(Address), AllContracts, StakeToken, Treasury, Stake(Address), Verified(Address), Slashes(Address), WithdrawLockedUntil(Address), Categories(Address), ByCategory(Category), AllowlistEnabled, Allowlisted(Address), RegistrationRateLimit, RegistrationRateWindow, RegistrationWindow(Address), RegistrationFee, Tags(Address), Attestations(Address), TotalStaked, VerifiedCount, Admin, Manager(Address) }
-union ProposalAction { Deactivate(Address), Upgrade(BytesN<32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I28, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(I128) }
+union ProposalAction { Deactivate(Address), Upgrade(BytesN<32>), AddAdmin(Address), RemoveAdmin(Address), ChangeThreshold(U32), ConfigureStaking(Address, Address), SetVerified(Address, Bool), Slash(Address, I28, String), SetAllowlistEnabled(Bool), SetAllowlisted(Address, Bool), ConfigureRegistrationRateLimit(U32, U32), SetRegistrationFee(I128), Batch(Vec<ProposalAction>) }

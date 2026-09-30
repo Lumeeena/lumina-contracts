@@ -12,6 +12,7 @@ Events are the integration surface for downstream consumers, serving as the inte
 | Topic | Payload Shape | When It Fires | Consumers | Example Test Reference |
 |---|---|---|---|---|
 | `proposal_proposed` | `(proposal_id: u32, proposer: Address, action: Symbol, data: T, description: String)` | When an admin proposes an action (e.g., slash, upgrade, change settings). The optional `description` is a human-readable rationale for the proposal, length-bounded by the contract. | | `propose_deactivate_requires_admin` |
+| `proposal_proposed` (batch) | `(proposal_id: u32, proposer: Address, action: Symbol("batch"), action_count: u32)` | When an authenticated admin proposes a bounded batch. Read `get_proposal(proposal_id).action` for the ordered actions. Execution uses the existing per-action events and one `proposal_executed` event; a failure reverts the whole transaction. | | `batch_rotates_admins_in_order_under_one_proposal` |
 | `proposal_approved` | `(proposal_id: u32, admin: Address, approvals_len: u32, threshold: u32)` | When an admin approves an existing proposal. | | `approve_proposal_records_approval_and_returns_total` |
 | `proposal_ready` | `(proposal_id: u32, ready_at: u32, executable_from: u32)` | When a proposal receives enough approvals and enters the timelock. | | `proposal_enters_timelock_after_sufficient_approvals` |
 | `proposal_executed` | `(proposal_id: u32, executed_at: u64)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |

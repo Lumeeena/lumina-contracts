@@ -193,6 +193,23 @@ that move value. Those remain owner-only (or admin, for `transfer_ownership`
 and `deactivate`). Revocation via `clear_manager` is immediate: the next call
 from the former manager fails with `Unauthorized`.
 
+### Batched governance actions
+
+`propose_batch(proposer, actions)` creates one proposal containing 1–10
+`ProposalAction` values. Only an authenticated admin may propose it. Nested
+`ProposalAction::Batch` values are rejected. Approval and timelock requirements
+are the same as for individual proposals.
+
+Actions execute in their supplied order. For example, add two replacement admins
+before removing the old admin, then change the threshold. Each action validates
+against the state produced by earlier actions. If any action fails, all storage
+changes, events and token transfers revert, including the proposal's execution
+marker; governance can retry the proposal once the cause is resolved.
+
+The new `Batch` union variant preserves the encoding of existing individual
+actions and adds no storage keys or fields to stored structs. Clients submitting
+batches need bindings that include `Batch` and `propose_batch`.
+
 ### Upgrades
 
 The registry is upgradeable in place, so a fix or a new entrypoint does not
