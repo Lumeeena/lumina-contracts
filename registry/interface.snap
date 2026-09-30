@@ -68,7 +68,7 @@ struct ContractEntry { active: Bool, contract_id: Address, description: String, 
 struct ContractPage { entries: Vec<ContractEntry>, has_more: Bool }
 struct ContractProfile { entry: ContractEntry, reputation: Reputation, superseded_by: Option<Address> }
 struct ContractProfilePage { entries: Vec<ContractProfile>, has_more: Bool }
-struct Proposal { action: ProposalAction, approvals: Vec<Address>, executed: Bool, id: U32, proposer: Address, ready_at: U32 }
+struct Proposal { action: ProposalAction, approvals: Vec<Address>, description: String, executed: Bool, id: U32, proposer: Address, ready_at: U32 }
 struct RegistrationEntry { categories: Vec<Category>, contract_id: Address, description: String, name: String }
 struct RegistrationWindow { count: U32, started_at: U32 }
 struct RegistryStats { active_count: U32, staked_count: U32, total_registered: U32, total_staked: I128, verified_count: U32 }

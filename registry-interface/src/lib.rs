@@ -421,6 +421,39 @@ pub enum ProposalAction {
     SetRegistrationFee(i128),
 }
 
+/// A governance proposal, with the rationale its proposer attached.
+///
+/// Byte-compatible with `lumina_registry::Proposal`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    /// Monotonic identifier assigned at creation.
+    pub id: u32,
+    /// The action the proposal would take if approved.
+    pub action: ProposalAction,
+    /// Optional human-readable rationale, bounded by
+    /// `MAX_PROPOSAL_DESCRIPTION_LEN` bytes. Empty when the proposer
+    /// supplied none.
+    pub description: String,
+    /// Address that created the proposal.
+    pub proposer: Address,
+    /// Ledger at which the proposal was created.
+    pub created_at: u32,
+    /// Ledger after which the proposal can no longer be voted on.
+    pub expires_at: u32,
+    /// Approvals recorded so far.
+    pub approvals: u32,
+    /// Whether the proposal has been executed or rejected.
+    pub finalized: bool,
+}
+
+/// Maximum length, in bytes, of a proposal description.
+///
+/// Enforced at creation; a longer description is rejected with
+/// `InvalidDescription`. Documented here so clients can validate before
+/// submitting a transaction.
+pub const MAX_PROPOSAL_DESCRIPTION_LEN: u32 = 256;
+
 /// Byte-compatible with `lumina_registry::SlashRecord`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
