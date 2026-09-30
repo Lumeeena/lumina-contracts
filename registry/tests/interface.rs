@@ -201,6 +201,14 @@ fn exported_interface_matches_snapshot() {
         );
     }
 
+    for expected_fn in ["get_proposals"] {
+        assert!(
+            actual.contains(&format!("fn {expected_fn}(")),
+            "proposal listing entry point `{expected_fn}` is missing from the exported interface; \
+             a UI cannot enumerate pending proposals without it"
+        );
+    }
+
     let snap_path = manifest_path(&["interface.snap"]);
     if std::env::var_os(UPDATE_ENV).is_some() {
         std::fs::write(&snap_path, &actual).expect("write interface snapshot");
