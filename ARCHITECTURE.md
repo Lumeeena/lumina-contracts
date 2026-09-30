@@ -151,6 +151,11 @@ sets `ready_at` once; it does not execute the action. After the timelock,
 `execute_proposal` is permissionless so execution cannot be withheld by the
 admin set after it has approved the action.
 
+The timelock is per-action rather than a single constant. Each `ProposalAction`
+maps to a duration in `TIMELOCK_LEDGERS`, so a proposal's `ready_at` is set to
+`current ledger + TIMELOCK_LEDGERS(action)` when the threshold is reached.
+`get_proposal` exposes the action's timelock so a UI can show the wait.
+
 Proposal actions cover:
 
 - deactivation and wasm upgrade;
@@ -160,15 +165,35 @@ Proposal actions cover:
 - allowlist, registration rate limit, registration fee, and minimum stake;
 - treasury withdrawal.
 
+The chosen durations are constants, not magic numbers inline, and are grouped
+by risk:
+
+- `Upgrade` and admin-set changes (`AddAdmin`, `RemoveAdmin`,
+  `ChangeThreshold`) keep the long window (`LONG_TIMELOCK_LEDGERS`, 17,280
+  ledgers, approximately 28.8 hours at six seconds per ledger). These change
+  the contract's code or who controls it, so they are the most dangerous
+  actions and must wait the longest.
+- `SetStakeToken`, `SetTreasury`, `SetMinimumStake`, `SetAllowlist`,
+  `SetRegistrationRateLimit`, and `SetRegistrationFee` use a medium window
+  (`MEDIUM_TIMELOCK_LEDGERS`, 5,760 ledgers, approximately 9.6 hours). They
+  change policy or configuration but not code or control, so a shorter wait is
+  safe.
+- `Deactivate`, `SetVerified`, `Slash`, and `WithdrawTreasury` use a short
+  window (`SHORT_TIMELOCK_LEDGERS`, 1,440 ledgers, approximately 2.4 hours).
+  They are routine governance operations with bounded, reversible, or
+  already-constrained effects.
+
+Two proposals of different kinds therefore become executable at different
+times.
+
 Execution checks the threshold and timelock again, marks the proposal executed
 before applying external effects, and relies on Soroban transaction atomicity:
 if an action or token transfer fails, the executed flag and every other write
 from that invocation roll back. Admin-removal and threshold actions also
 validate that the resulting threshold remains satisfiable.
 
-The production timelock is 17,280 ledgers (approximately 28.8 hours at six
-seconds per ledger). Tests use 10 ledgers so they can exercise boundaries
-without archiving fixture storage.
+The production timelocks are the per-action constants above. Tests use 10
+ledgers so they can exercise boundaries without archiving fixture storage.
 
 ## Staking, verification, and slashing
 
@@ -231,6 +256,7 @@ properties it checks, with representative test names for quick navigation:
 | Invariant | Representative tests |
 | --- | --- |
 | A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
+| Proposals of different actions become executable at different times. | `different_actions_have_different_timelocks`, `get_proposal_exposes_action_timelock` |
 | Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
 | Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
 | Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |

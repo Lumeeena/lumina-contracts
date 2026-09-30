@@ -171,6 +171,9 @@ pub trait RegistryInterface {
     /// Retrieve a governance proposal by ID.
     fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError>;
 
+    /// The timelock duration, in ledgers, that applies to a given action.
+    fn get_action_timelock(env: Env, action: ProposalAction) -> u32;
+
     /// The categories a registration declared. Empty for a registration that
     /// predates the taxonomy, or for one that was never registered.
     fn get_categories(env: Env, contract_id: Address) -> Vec<Category>;
@@ -564,3 +567,10 @@ pub enum ProposalAction {
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
 }
+
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_UPGRADE: u32 = 17_280;
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_ADMIN: u32 = 17_280;
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_STANDARD: u32 = 720;
