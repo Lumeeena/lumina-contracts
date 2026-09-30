@@ -233,6 +233,22 @@ pub trait RegistryInterface {
     /// and zero — not an error — for an address that was never registered.
     fn get_stake(env: Env, contract_id: Address) -> i128;
 
+    /// The reputation score of a registration, decayed for inactivity.
+    ///
+    /// The score is computed at read time from the registration's stored
+    /// reputation and the number of ledgers since its last activity. It is
+    /// not written back, so reading does not amplify writes.
+    ///
+    /// The decay curve is a half-life: the score is multiplied by
+    /// `0.5 ^ (ledgers_since_activity / HALF_LIFE_LEDGERS)`, where
+    /// `HALF_LIFE_LEDGERS` is a governance-set parameter. A registration
+    /// that has been inactive for one half-life reports half its stored
+    /// score; for two half-lives, a quarter; and so on. A registration
+    /// with recent activity reports its stored score unchanged.
+    ///
+    /// Returns zero for an address that was never registered.
+    fn get_reputation(env: Env, contract_id: Address) -> i128;
+
     /// The ledger at which an in-progress unbonding completes, or zero if no
     /// unbonding is in progress. `withdraw_stake` refuses until the current
     /// ledger reaches this value. The unbonding period is deliberately longer
