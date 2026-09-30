@@ -1,4 +1,4 @@
-﻿// Copyright (c) Lumina contributors
+// Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
@@ -646,6 +646,8 @@ pub enum DataKey {
     /// Incremented on `register_contract`, decremented on `deregister`.
     /// See `get_contract_count` / `get_total_registered` for which figure to read.
     ContractCount,
+    /// u32 — number of active registrations (active: true).
+    ActiveCount,
     /// u32 — lifetime registrations ever made. Incremented on
     /// `register_contract` and never decremented, so it survives `deregister`.
     /// Added alongside deregistration to keep the old "registrations ever made"
@@ -682,6 +684,8 @@ pub enum DataKey {
     MinimumStake,
 
     // ── Category taxonomy ───────────────────────────────────────────────────
+    /// u32 — number of active registrations in a category.
+    CategoryCount(Category),
     /// Vec<Category> — the categories a registration declared, deduplicated.
     Categories(Address),
     /// Vec<Address> — insertion-ordered registrations in one category.
@@ -1440,10 +1444,16 @@ impl LuminaRegistry {
             return Err(RegistryError::Unauthorized);
         }
 
+        let was_active = entry.active;
         entry.active = false;
         env.storage()
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
+
+        if was_active {
+            let categories = Self::categories_of(&env, &contract_id);
+            Self::decrement_active_counts(&env, &categories);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "contract_deactivated"),),
@@ -1828,6 +1838,7 @@ impl LuminaRegistry {
             .set(&DataKey::TotalRegistered, &(total + 1));
 
         Self::index_categories(&env, &contract_id, &categories);
+        Self::increment_active_counts(&env, &categories);
 
         env.events().publish(
             (Symbol::new(&env, "contract_registered"),),
@@ -1943,6 +1954,7 @@ impl LuminaRegistry {
 
             let categories = Self::dedup_categories(&env, &entry.categories)?;
             Self::index_categories(&env, &entry.contract_id, &categories);
+            Self::increment_active_counts(&env, &categories);
 
             env.events().publish(
                 (Symbol::new(&env, "contract_registered"),),
@@ -1987,9 +1999,11 @@ impl LuminaRegistry {
 
         let categories = Self::dedup_categories(&env, &categories)?;
 
+        let previous_categories = Self::categories_of(&env, &contract_id);
+
         // Drop the registration from any category it is leaving, so a stale
         // index cannot resurface it under a category it no longer claims.
-        for previous in Self::categories_of(&env, &contract_id).iter() {
+        for previous in previous_categories.iter() {
             if !categories.contains(previous) {
                 let mut index = Self::category_index(&env, &previous);
                 if let Some(i) = index.first_index_of(&contract_id) {
@@ -1998,10 +2012,21 @@ impl LuminaRegistry {
                         .persistent()
                         .set(&DataKey::ByCategory(previous), &index);
                 }
+                if entry.active {
+                    Self::change_category_count(&env, &previous, -1);
+                }
             }
         }
 
         Self::index_categories(&env, &contract_id, &categories);
+
+        if entry.active {
+            for new_cat in categories.iter() {
+                if !previous_categories.contains(new_cat) {
+                    Self::change_category_count(&env, &new_cat, 1);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "categories_updated"),),
@@ -2932,24 +2957,10 @@ impl LuminaRegistry {
     /// counts entries that still load and are flagged active, skipping dead
     /// references exactly as `get_active_contracts` does.
     pub fn get_active_contract_count(env: Env) -> u32 {
-        let all: Vec<Address> = env
-            .storage()
+        env.storage()
             .instance()
-            .get(&DataKey::AllContracts)
-            .unwrap_or(Vec::new(&env));
-        let mut active: u32 = 0;
-        for contract_id in all.iter() {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
-            {
-                if entry.active {
-                    active += 1;
-                }
-            }
-        }
-        active
+            .get(&DataKey::ActiveCount)
+            .unwrap_or(0)
     }
 
     fn is_active_listing(env: &Env, entry: &ContractEntry) -> bool {
@@ -3300,7 +3311,7 @@ impl LuminaRegistry {
             if u.len() > 2048 {
                 return Err(RegistryError::InvalidUri);
             }
-            
+
             let u_str: alloc::string::String = alloc::format!("{}", u);
             if !u_str.starts_with("http://") && !u_str.starts_with("https://") && !u_str.starts_with("ipfs://") && !u_str.starts_with("ipns://") {
                 return Err(RegistryError::InvalidUri);
@@ -3522,10 +3533,17 @@ impl LuminaRegistry {
                     .persistent()
                     .get(&DataKey::Contract(contract_id.clone()))
                     .ok_or(RegistryError::ContractNotFound)?;
+                let was_active = entry.active;
                 entry.active = false;
                 env.storage()
                     .persistent()
                     .set(&DataKey::Contract(contract_id.clone()), &entry);
+
+                if was_active {
+                    let categories = Self::categories_of(env, contract_id);
+                    Self::decrement_active_counts(env, &categories);
+                }
+
                 env.events().publish(
                     (Symbol::new(env, "contract_deactivated"),),
                     (contract_id.clone(), Symbol::new(env, "governance")),
@@ -4045,6 +4063,35 @@ impl LuminaRegistry {
             i += 1;
         }
         result
+    }
+
+    fn change_active_count(env: &Env, delta: i32) {
+        if delta == 0 { return; }
+        let count: u32 = env.storage().instance().get(&DataKey::ActiveCount).unwrap_or(0);
+        let new_count = if delta > 0 { count.saturating_add(delta as u32) } else { count.saturating_sub((-delta) as u32) };
+        env.storage().instance().set(&DataKey::ActiveCount, &new_count);
+    }
+
+    fn change_category_count(env: &Env, category: &Category, delta: i32) {
+        if delta == 0 { return; }
+        let key = DataKey::CategoryCount(*category);
+        let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+        let new_count = if delta > 0 { count.saturating_add(delta as u32) } else { count.saturating_sub((-delta) as u32) };
+        env.storage().instance().set(&key, &new_count);
+    }
+
+    fn increment_active_counts(env: &Env, categories: &Vec<Category>) {
+        Self::change_active_count(env, 1);
+        for category in categories.iter() {
+            Self::change_category_count(env, &category, 1);
+        }
+    }
+
+    fn decrement_active_counts(env: &Env, categories: &Vec<Category>) {
+        Self::change_active_count(env, -1);
+        for category in categories.iter() {
+            Self::change_category_count(env, &category, -1);
+        }
     }
 }
 
@@ -4683,6 +4730,80 @@ mod test {
     }
 
     // ── Existing registry tests (single-admin setup) ────────────────────────
+
+    #[test]
+    fn test_active_counts_invariant() {
+        let (env, client, _admin) = setup();
+
+        let (owner1, target1) = register_sample(&env, &client); // default_cats = [Infrastructure]
+
+        let owner2 = Address::generate(&env);
+        let target2 = register_in(&env, &client, &owner2, &[Category::DeFi, Category::Oracle]);
+
+        let owner3 = Address::generate(&env);
+        let target3 = register_in(&env, &client, &owner3, &[Category::Oracle, Category::Infrastructure]);
+
+        // Deactivate one
+        client.deactivate(&owner2, &target2);
+
+        // Deregister another (deactivate first)
+        client.deactivate(&owner1, &target1);
+        client.deregister(&owner1, &target1);
+
+        // Change categories of an active one (target3 is still active)
+        client.set_categories(&owner3, &target3, &cats(&env, &[Category::DeFi, Category::Infrastructure]));
+
+        let mut expected_active = 0;
+        let mut expected_defi = 0;
+        let mut expected_oracle = 0;
+        let mut expected_infrastructure = 0;
+
+        let all: Vec<Address> = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env))
+        });
+
+        for target in all.iter() {
+            let active = env.as_contract(&client.address, || {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(target.clone())) {
+                    entry.active
+                } else {
+                    false
+                }
+            });
+
+            if active {
+                expected_active += 1;
+                let categories = env.as_contract(&client.address, || {
+                    LuminaRegistry::categories_of(&env, &target)
+                });
+                for cat in categories.iter() {
+                    match cat {
+                        Category::DeFi => expected_defi += 1,
+                        Category::Oracle => expected_oracle += 1,
+                        Category::Infrastructure => expected_infrastructure += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let actual_active = env.as_contract(&client.address, || {
+            env.storage().instance().get::<DataKey, u32>(&DataKey::ActiveCount).unwrap_or(0)
+        });
+
+        assert_eq!(actual_active, expected_active);
+        assert_eq!(client.get_active_contract_count(), expected_active);
+
+        let get_cat_count = |cat: Category| -> u32 {
+            env.as_contract(&client.address, || {
+                env.storage().instance().get::<DataKey, u32>(&DataKey::CategoryCount(cat)).unwrap_or(0)
+            })
+        };
+
+        assert_eq!(get_cat_count(Category::DeFi), expected_defi);
+        assert_eq!(get_cat_count(Category::Oracle), expected_oracle);
+        assert_eq!(get_cat_count(Category::Infrastructure), expected_infrastructure);
+    }
 
     #[test]
     fn register_contract_succeeds() {
