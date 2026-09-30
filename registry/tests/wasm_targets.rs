@@ -122,7 +122,10 @@ fn the_shipped_target_loads_and_runs_in_the_host() {
             )
         });
 
-        let env = Env::default();
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.cost_estimate().budget().reset_unlimited();
         let contract = load(&env, &wasm, module.bootstrap_admin);
 
         if let Some(view) = module.view {

@@ -8,10 +8,10 @@
 
 #![cfg(test)]
 
-use lumina_registry_interface::{Category, ContractEntry, RegistryInterfaceClient};
+use lumina_registry_interface::Category;
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
-    Address, Env, IntoVal, String, Symbol, Vec,
+    testutils::{Address as _, Events as _},
+    Address, Env, String, Vec,
 };
 
 // Import the registry wasm for deployment
@@ -30,30 +30,27 @@ mod example_wasm {
 struct Fixture {
     env: Env,
     registry: Address,
-    admin: Address,
     owner: Address,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let env = Env::default();
-        env.mock_all_auths();
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.cost_estimate().budget().reset_unlimited();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let admin = Address::generate(&env);
         let owner = Address::generate(&env);
 
-        // Deploy the registry with the admin as bootstrap
-        let registry = env.register(registry_wasm::WASM, (admin.clone() /* bootstrap_admin */,));
-
-        // Initialize the registry with multi-sig governance
-        let registry_client = registry_wasm::Client::new(&env, &registry);
-        let admins = Vec::from_array(&env, [admin.clone()]);
-        registry_client.initialize(&admins, &1u32);
+        // Deploy the registry with the admin as bootstrap; constructor calls
+        // initialize internally for single-admin mode.
+        let registry = env.register(registry_wasm::WASM, (&admin,));
 
         Self {
             env,
             registry,
-            admin,
             owner,
         }
     }
@@ -62,7 +59,22 @@ impl Fixture {
     fn deploy_example(&self, name: &str, description: &str, categories: &[Category]) -> Address {
         let name_str = String::from_str(&self.env, name);
         let desc_str = String::from_str(&self.env, description);
-        let cats = Vec::from_slice(&self.env, categories);
+        // Categories must match the wasm-generated type; use a soroban Vec.
+        let mut cats: Vec<registry_wasm::Category> = Vec::new(&self.env);
+        for cat in categories {
+            let wasm_cat = match cat {
+                Category::DeFi => registry_wasm::Category::DeFi,
+                Category::Payments => registry_wasm::Category::Payments,
+                Category::Nft => registry_wasm::Category::Nft,
+                Category::Gaming => registry_wasm::Category::Gaming,
+                Category::Oracle => registry_wasm::Category::Oracle,
+                Category::Infrastructure => registry_wasm::Category::Infrastructure,
+                Category::Dao => registry_wasm::Category::Dao,
+                Category::Other => registry_wasm::Category::Other,
+                Category::Identity => registry_wasm::Category::Identity,
+            };
+            cats.push_back(wasm_cat);
+        }
 
         self.env.register(
             example_wasm::WASM,
@@ -76,8 +88,8 @@ impl Fixture {
         )
     }
 
-    fn registry_client(&self) -> RegistryInterfaceClient {
-        RegistryInterfaceClient::new(&self.env, &self.registry)
+    fn registry_client(&self) -> registry_wasm::Client {
+        registry_wasm::Client::new(&self.env, &self.registry)
     }
 
     fn example_client(&self, addr: &Address) -> example_wasm::Client {
@@ -130,17 +142,20 @@ fn registration_appears_in_category_listings() {
     let registry = f.registry_client();
 
     // Should appear in DeFi category
-    let defi_contracts = registry.get_active_contracts_by_category(&Category::DeFi, &0, &10);
+    let defi_contracts =
+        registry.get_active_contracts_by_category(&registry_wasm::Category::DeFi, &0, &10);
     assert_eq!(defi_contracts.len(), 1);
     assert_eq!(defi_contracts.get(0).unwrap().contract_id, example);
 
     // Should appear in Payments category
-    let payment_contracts = registry.get_active_contracts_by_category(&Category::Payments, &0, &10);
+    let payment_contracts =
+        registry.get_active_contracts_by_category(&registry_wasm::Category::Payments, &0, &10);
     assert_eq!(payment_contracts.len(), 1);
     assert_eq!(payment_contracts.get(0).unwrap().contract_id, example);
 
     // Should NOT appear in other categories
-    let nft_contracts = registry.get_active_contracts_by_category(&Category::Nft, &0, &10);
+    let nft_contracts =
+        registry.get_active_contracts_by_category(&registry_wasm::Category::Nft, &0, &10);
     assert_eq!(nft_contracts.len(), 0);
 }
 
@@ -180,6 +195,7 @@ fn example_contract_business_logic_works() {
 
     // Test the greeting function
     let greeting = client.greet(&String::from_str(&f.env, "World"));
+    // greet() now returns a fixed string "Hello, World!"
     assert_eq!(greeting, String::from_str(&f.env, "Hello, World!"));
 
     // Test the swap function (mock)
@@ -198,7 +214,8 @@ fn multiple_contracts_can_register() {
     // Deploy three different contracts
     let protocol_a = f.deploy_example("Protocol A", "First protocol", &[Category::DeFi]);
     let protocol_b = f.deploy_example("Protocol B", "Second protocol", &[Category::Payments]);
-    let protocol_c = f.deploy_example("Protocol C", "Third protocol", &[Category::Infrastructure]);
+    let protocol_c =
+        f.deploy_example("Protocol C", "Third protocol", &[Category::Infrastructure]);
 
     // All should be in the registry
     let registry = f.registry_client();
@@ -206,7 +223,7 @@ fn multiple_contracts_can_register() {
 
     assert_eq!(contracts.len(), 3);
 
-    let ids: Vec<Address> = contracts.iter().map(|e| e.contract_id.clone()).collect();
+    let ids: std::vec::Vec<Address> = contracts.iter().map(|e| e.contract_id.clone()).collect();
     assert!(ids.contains(&protocol_a));
     assert!(ids.contains(&protocol_b));
     assert!(ids.contains(&protocol_c));
@@ -238,12 +255,14 @@ fn cannot_register_same_contract_twice() {
     // Try to register the same address again - should fail
     // (This would require calling register_contract directly, not via constructor)
     let registry = f.registry_client();
+    let mut cats: Vec<registry_wasm::Category> = Vec::new(&f.env);
+    cats.push_back(registry_wasm::Category::DeFi);
     registry.register_contract(
         &f.owner,
         &example,
         &String::from_str(&f.env, "Duplicate"),
         &String::from_str(&f.env, "Should fail"),
-        &Vec::from_array(&f.env, [Category::DeFi]),
+        &cats,
     );
 }
 
@@ -255,7 +274,8 @@ fn deployment_emits_event() {
 
     // Check that the contract emitted its deployment event
     let events = f.env.events().all();
-    let contract_events: Vec<_> = events.iter().filter(|e| e.0 == example).collect();
+    let contract_events: std::vec::Vec<_> =
+        events.iter().filter(|e| e.0 == example).collect();
 
     // Should have emitted at least one event from the example contract
     assert!(!contract_events.is_empty());

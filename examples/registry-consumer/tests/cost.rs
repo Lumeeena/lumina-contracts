@@ -102,6 +102,14 @@ impl ReadProbe {
     pub fn read_local(_env: Env, flag: bool) -> bool {
         flag
     }
+
+    /// Read active contracts via the registry's scanning view.
+    pub fn read_active_contracts(
+        env: Env,
+        registry: Address,
+    ) -> Vec<lumina_registry_interface::ContractEntry> {
+        RegistryInterfaceClient::new(&env, &registry).get_active_contracts(&0, &100)
+    }
 }
 
 struct Fixture {
@@ -127,6 +135,7 @@ struct Cost {
 fn measure<T>(f: &Fixture, call: impl FnOnce(&Env, &Address) -> T) -> (Cost, T) {
     let env = &f.env;
     let probe = f.probe.clone();
+    env.cost_estimate().budget().reset_unlimited();
     // Metering resets before every top-level invocation, so the reading taken
     // afterwards covers exactly this call and nothing that came before it.
     let value = call(env, &probe);
@@ -145,7 +154,10 @@ fn measure<T>(f: &Fixture, call: impl FnOnce(&Env, &Address) -> T) -> (Cost, T) 
 }
 
 fn setup() -> Fixture {
-    let env = Env::default();
+    let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.cost_estimate().budget().reset_unlimited();
     env.mock_all_auths();
     env.ledger().set_max_entry_ttl(1_000_000);
     env.ledger().set_min_persistent_entry_ttl(1_000_000);
@@ -234,12 +246,14 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
     // A second registration, so the scan has something more to walk. The
     // difference between the two scans is the marginal cost per entry.
     let second = Address::generate(&f.env);
+    let mut second_categories = Vec::new(&f.env);
+    second_categories.push_back(registry_wasm::Category::Infrastructure);
     registry_wasm::Client::new(&f.env, &registry).register_contract(
         &Address::generate(&f.env),
         &second,
         &String::from_str(&f.env, "Second"),
         &String::from_str(&f.env, "another counterparty"),
-        &Vec::new(&f.env),
+        &second_categories,
     );
     let (scan_two, active_two) = measure(&f, |env, probe| {
         probe_client(env, probe).read_active_contracts(&registry)

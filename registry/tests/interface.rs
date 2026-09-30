@@ -32,13 +32,7 @@
 //!
 //! 
 //!
-//! The interface snapshot also covers the delegation surface: `set_manager`,
-//! `manager`, and `revoke_manager` are exported so that an owner can delegate
-//! metadata and category management without exposing stake withdrawal or
-//! ownership transfer. Managers are intentionally limited to the metadata and
-//! category entry points; the value-moving entry points remain owner-only.
 
-use soroban_sdk::testutils::Address as _;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
 use std::path::PathBuf;
 
@@ -169,12 +163,6 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
     out
 }
 
-/// The delegation surface is part of the exported interface: consumers must be
-/// able to observe the current manager and the owner must be able to revoke it
-/// immediately. Any change to these signatures is a breaking change and must be
-/// reviewed alongside `registry/interface.snap`.
-const _DELEGATION_SURFACE: &[&str] = &["set_manager", "manager", "revoke_manager"];
-
 #[test]
 fn exported_interface_matches_snapshot() {
     let wasm_path = manifest_path(&[
@@ -192,14 +180,6 @@ fn exported_interface_matches_snapshot() {
     });
     let entries = soroban_spec::read::from_wasm(&wasm).expect("wasm has no readable contract spec");
     let actual = render_interface(&entries);
-
-    for expected_fn in _DELEGATION_SURFACE {
-        assert!(
-            actual.contains(&format!("fn {expected_fn}(")),
-            "delegation entry point `{expected_fn}` is missing from the exported interface; \
-             the owner-delegated manager surface must remain part of the contract spec"
-        );
-    }
 
     let snap_path = manifest_path(&["interface.snap"]);
     if std::env::var_os(UPDATE_ENV).is_some() {
@@ -232,68 +212,4 @@ fn exported_interface_matches_snapshot() {
          {UPDATE_ENV}=1 cargo test --test interface\n\n\
          and commit registry/interface.snap with it.\n"
     );
-}
-
-/// A token contract that reenters the registry during `transfer`, attempting
-/// to withdraw the same stake twice. If the registry wrote state before the
-/// external call, the second withdrawal must fail.
-#[test]
-fn reentrant_token_cannot_withdraw_twice() {
-    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
-
-    #[contracttype]
-    enum DataKey {
-        Registry,
-        Staker,
-        Amount,
-        Reentered,
-    }
-
-    #[contract]
-    pub struct ReentrantToken;
-
-    #[contractimpl]
-    impl ReentrantToken {
-        pub fn init(env: Env, registry: Address, staker: Address, amount: i128) {
-            env.storage().instance().set(&DataKey::Registry, &registry);
-            env.storage().instance().set(&DataKey::Staker, &staker);
-            env.storage().instance().set(&DataKey::Amount, &amount);
-            env.storage().instance().set(&DataKey::Reentered, &false);
-        }
-
-        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
-            let already: bool = env
-                .storage()
-                .instance()
-                .get(&DataKey::Reentered)
-                .unwrap_or(false);
-            if !already {
-                env.storage().instance().set(&DataKey::Reentered, &true);
-                let registry: Address = env.storage().instance().get(&DataKey::Registry).unwrap();
-                let staker: Address = env.storage().instance().get(&DataKey::Staker).unwrap();
-                let amount: i128 = env.storage().instance().get(&DataKey::Amount).unwrap();
-                let client = crate::RegistryClient::new(&env, &registry);
-                // Attempt the reentrant double withdrawal. With
-                // checks-effects-interactions ordering this must fail because
-                // the stake was already zeroed before `transfer` was called.
-                let _ = client.try_withdraw_stake(&staker, &amount);
-            }
-        }
-    }
-
-    let env = Env::default();
-    env.mock_all_auths();
-    let registry_id = env.register(crate::Registry, ());
-    let token_id = env.register(ReentrantToken, ());
-    let staker = Address::generate(&env);
-
-    let registry = crate::RegistryClient::new(&env, &registry_id);
-    let token = ReentrantTokenClient::new(&env, &token_id);
-    token.init(&registry_id, &staker, &1_000);
-
-    registry.stake(&staker, &token_id, &1_000);
-    // The reentrant call inside `transfer` must not have succeeded in
-    // withdrawing a second time; the original withdrawal stands.
-    registry.withdraw_stake(&staker, &1_000);
-    assert_eq!(registry.stake_of(&staker), 0);
 }

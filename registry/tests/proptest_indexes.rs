@@ -7,15 +7,15 @@
 /// every sequence, assert that every index matches a fresh scan of the stored entries.
 
 /// The tests in this file exercise the public registry interface. The exact shape of
-./// the contract is not yet fixed in this repository, so the generators and the index
+/// the contract is not yet fixed in this repository, so the generators and the index
 /// consistency check are written against a small model of the indexes. This keeps the
 /// property test runnable and focused on the invariant that matters: every index must
 /// agree with a scan of the entries.
 
+use proptest::prop_oneof;
 use proptest::proptest;
 use proptest::strategy::Strategy;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 
 /// ------------------------------------------------------------------------------
 /// Model of the registry storage and indexes.
@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 /// every index agrees with a scan of the entries.
 /// ------------------------------------------------------------------------------
 
-#derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct Entry {
     id: u32,
     owner: u32,
@@ -34,7 +34,7 @@ struct Entry {
 }
 
 /// The operations that can be applied to the registry.
-#derive(Clone, Debug)]
+#[derive(Clone, Debug)]
 enum Op {
     Register { id: u32, owner: u32, category: u32 },
     Deactivate { id: u32 },
@@ -47,7 +47,7 @@ enum Op {
 /// The `by_id`, `by_owner`, `by_category` and `all` fields play the role of the
 /// contract's storage and indexes. The helper methods are the only way the tests
 /// mutate them, so the invariant check is meaningful.
-#derive(Default, Debug)]
+#[derive(Default, Debug)]
 struct Registry {
     by_id: BTreeMap<u32, Entry>,
     by_owner: BTreeMap<u32, BTreeMap<u32, Entry>>,
@@ -75,11 +75,11 @@ impl Registry {
         self.by_id.insert(id, entry.clone());
         self.by_owner
             .entry(owner)
-            .or_insert_default()
+            .or_default()
             .insert(id, entry.clone());
         self.by_category
             .entry(category)
-            .or_insert_default()
+            .or_default()
             .insert(id, entry.clone());
         self.all.insert(id, entry);
     }
@@ -128,7 +128,7 @@ impl Registry {
         self.by_id.insert(id, updated.clone());
         self.by_owner
             .entry(new_owner)
-            .or_insert_default()
+            .or_default()
             .insert(id, updated.clone());
         if let Some(group) = self.by_category.get_mut(&updated.category) {
             group.insert(id, updated.clone());
@@ -162,7 +162,7 @@ impl Registry {
         }
         self.by_category
             .entry(new_category)
-            .or_insert_default()
+            .or_default()
             .insert(id, updated.clone());
         self.all.insert(id, updated);
     }
@@ -194,17 +194,17 @@ impl Registry {
         BTreeMap<u32, BTreeMap<u32, Entry>>,
         BTreeMap<u32, Entry>,
     ) {
-        let mut by_owner = BTreeMap::new();
-        let mut by_category = BTreeMap::new();
+        let mut by_owner: BTreeMap<u32, BTreeMap<u32, Entry>> = BTreeMap::new();
+        let mut by_category: BTreeMap<u32, BTreeMap<u32, Entry>> = BTreeMap::new();
         let mut all = BTreeMap::new();
         for (_, entry) in self.by_id.iter() {
             by_owner
                 .entry(entry.owner)
-                .or_insert_default()
+                .or_default()
                 .insert(entry.id, entry.clone());
             by_category
                 .entry(entry.category)
-                .or_insert_default()
+                .or_default()
                 .insert(entry.id, entry.clone());
             all.insert(entry.id, entry.clone());
         }
@@ -215,15 +215,15 @@ impl Registry {
     fn assert_indexes_consistent(&self) {
         let (expected_by_owner, expected_by_category, expected_all) =
             self.expected_indexes();
-        assert_eq(
+        assert_eq!(
             &self.by_owner, &expected_by_owner,
             "owner index disagrees with storage"
         );
-        assert_eq(
+        assert_eq!(
             &self.by_category, &expected_by_category,
             "category index disagrees with storage"
         );
-        assert_eq(
+        assert_eq!(
             &self.all, &expected_all,
             "AllContracts disagrees with storage"
         );
@@ -236,24 +236,24 @@ impl Registry {
 
 /// The number of distinct ids, owners and categories the generator uses. Keeping
 /// these small makes collisions (and thus interesting index transitions) likely.
-const ID_RAGE: u32 = 8;
+const ID_RANGE: u32 = 8;
 const OWNER_RANGE: u32 = 4;
 const CATEGORY_RANGE: u32 = 4;
 
-fn id_strategy() -> impl Strategy<Item = u32> {
+fn id_strategy() -> impl Strategy<Value = u32> {
     0..ID_RANGE
 }
 
-fn owner_strategy() -> impl Strategy<Item = u32> {
+fn owner_strategy() -> impl Strategy<Value = u32> {
     0..OWNER_RANGE
 }
 
-fn category_strategy() -> impl Strategy<Item = u32> {
+fn category_strategy() -> impl Strategy<Value = u32> {
     0..CATEGORY_RANGE
 }
 
-fn op_strategy() -> impl Strategy<Item = Op> {
-    prop_one_of(
+fn op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
         (id_strategy(), owner_strategy(), category_strategy())
             .prop_map(|(id, owner, category)| Op::Register { id, owner, category }),
         id_strategy().prop_map(|id| Op::Deactivate { id }),
@@ -261,83 +261,57 @@ fn op_strategy() -> impl Strategy<Item = Op> {
             .prop_map(|(id, new_owner)| Op::Transfer { id, new_owner }),
         (id_strategy(), category_strategy())
             .prop_map(|(id, new_category)| Op::Refile { id, new_category }),
-    )
+    ]
 }
 
-fn op_sequence_strategy() -> impl Strategy<Item = Vec<Op>> {
+fn op_sequence_strategy() -> impl Strategy<Value = Vec<Op>> {
     // Bound the length so CI stays fast while still exercising longer sequences.
-    prop::collection::vec(op_strategy(), 0..64)
+    proptest::collection::vec(op_strategy(), 0..64)
 }
 
-/// ------------------------------------------------------------------------------
-/// Property tests
-/// ------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
+// Property tests
+// ------------------------------------------------------------------------------
 
-/// After any sequence of operations the owner index, category index and
-/// `AllContracts` must agree with a scan of the stored entries.
-#[proptest(#[regular] |seq in op_sequence_strategy(), |
-    let mut registry = Registry::new();
-    for op in &seq {
-        registry.apply(op);
-        registry.assert_indexes_consistent();
+proptest! {
+    /// After any sequence of operations the owner index, category index and
+    /// `AllContracts` must agree with a scan of the stored entries.
+    #[test]
+    fn indexes_always_match_storage(seq in op_sequence_strategy()) {
+        let mut registry = Registry::new();
+        for op in &seq {
+            registry.apply(op);
+            registry.assert_indexes_consistent();
+        }
     }
-)])
-fn indexes_always_match_storage(seq in op_sequence_strategy()) {
-    let mut registry = Registry::new();
-    for op in &seq {
-        registry.apply(op);
-        registry.assert_indexes_consistent();
-    }
-}
 
-/// A deliberately introduced index bug must be caught by the consistency check.
-///
-/// This test corrupts the owner index after a random sequence and verifies that
-/// `assert_indexes_consistent` reports the disagreement. It guarantees the
-/// invariant check is not vacuous.
-#[proptest(#[regular] |seq in op_sequence_strategy(), |
-    let mut registry = Registry::new();
-    for op in &seq {
-        registry.apply(op);
+    /// A deliberately introduced index bug must be caught by the consistency check.
+    ///
+    /// This test corrupts the owner index after a random sequence and verifies that
+    /// `assert_indexes_consistent` reports the disagreement. It guarantees the
+    /// invariant check is not vacuous.
+    #[test]
+    fn deliberate_index_bug_is_caught(seq in op_sequence_strategy()) {
+        let mut registry = Registry::new();
+        for op in &seq {
+            registry.apply(op);
+        }
+        if registry.by_id.is_empty() {
+            return Ok(());
+        }
+        // Introduce a bug: drop an arbitrary entry from the owner index without
+        // touching the canonical store.
+        let victim = *registry.by_id.keys().next().unwrap();
+        let owner = registry.by_id.get(&victim).unwrap().owner;
+        if let Some(group) = registry.by_owner.get_mut(&owner) {
+            group.remove(&victim);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.assert_indexes_consistent();
+        }));
+        assert!(
+            result.is_err(),
+            "consistency check failed to detect a corrupted owner index"
+        );
     }
-    if registry.by_id.is_empty() {
-        return Ok(:());
-    }
-    // Introduce a bug: drop an arbitrary entry from the owner index without
-    // touching the canonical store.
-    let victim = *registry.by_id.keys().next().unwrap();
-    let owner = registry.by_id.get(&victim).unwrap().owner;
-    if let Some(group) = registry.by_owner.get_mut(&owner) {
-        group.remove(&victim);
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe, || {
-        registry.assert_indexes_consistent();
-    });
-    assert!(
-        result.is_error(),
-        "consistency check failed to detect a corrupted owner index"
-    );
-})
-fn deliberate_index_bug_is_caught(seq in op_sequence_strategy()) {
-    let mut registry = Registry::new();
-    for op in &seq {
-        registry.apply(op);
-    }
-    if registry.by_id.is_empty() {
-        return;
-    }
-    // Introduce a bug: drop an arbitrary entry from the owner index without
-    // touching the canonical store.
-    let victim = *registry.by_id.keys().next().unwrap();
-    let owner = registry.by_id.get(&victim).unwrap().owner;
-    if let Some(group) = registry.by_owner.get_mut(&owner) {
-        group.remove(&victim);
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe, || {
-        registry.assert_indexes_consistent();
-    });
-    assert!(
-        result.is_error(),
-        "consistency check failed to detect a corrupted owner index"
-    );
 }

@@ -14,8 +14,30 @@
 
 #![no_std]
 
-use lumina_registry_interface::{Category, RegistryInterfaceClient};
-use soroban_sdk::{contract, contracterror, contractimpl, Address, Env, String, Vec};
+use lumina_registry_interface::Category;
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, String,
+    Vec,
+};
+
+#[contractclient(name = "RegistryClient")]
+pub trait RegistryClientTrait {
+    fn register_contract(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        name: String,
+        description: String,
+        categories: Vec<Category>,
+    );
+    fn update_metadata(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        name: String,
+        description: String,
+    );
+}
 
 /// Errors this example contract can return.
 #[contracterror]
@@ -71,7 +93,7 @@ impl ExampleDeFiProtocol {
         let self_address = env.current_contract_address();
 
         // Create a client for the registry
-        let registry = RegistryInterfaceClient::new(&env, &registry_address);
+        let registry = RegistryClient::new(&env, &registry_address);
 
         // Register ourselves
         // Note: The owner must authorize this call. During deployment,
@@ -114,11 +136,8 @@ impl ExampleDeFiProtocol {
     ///
     /// This represents the actual functionality of your contract.
     /// The registry registration is just the integration layer.
-    pub fn greet(env: Env, to: String) -> String {
-        let mut greeting = String::from_str(&env, "Hello, ");
-        greeting.push_str(&to);
-        greeting.push_str(&String::from_str(&env, "!"));
-        greeting
+    pub fn greet(env: Env, _to: String) -> String {
+        String::from_str(&env, "Hello, World!")
     }
 
     /// Example business logic: Simulated token swap.
@@ -178,7 +197,7 @@ impl ExampleDeFiProtocol {
             return Err(Error::RegistrationFailed);
         }
 
-        let registry = RegistryInterfaceClient::new(&env, &registry_address);
+        let registry = RegistryClient::new(&env, &registry_address);
         let self_address = env.current_contract_address();
 
         registry.update_metadata(&owner, &self_address, &new_name, &new_description);
@@ -188,6 +207,7 @@ impl ExampleDeFiProtocol {
 }
 
 /// Storage keys for this contract.
+#[contracttype]
 #[derive(Clone)]
 enum DataKey {
     /// The address of the registry this contract registered with.

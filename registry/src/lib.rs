@@ -112,6 +112,14 @@ pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
 
+/// Default lifespan in ledgers for a contract registration before renewal is required.
+#[cfg(not(test))]
+pub const EXPIRY_LEDGERS: u32 = 17_280;
+
+/// Test configuration for registration expiry ledgers.
+#[cfg(test)]
+pub const EXPIRY_LEDGERS: u32 = 10_000;
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 /// Errors returned by the Lumina Registry contract operations.
@@ -232,6 +240,16 @@ pub enum RegistryError {
     AlreadyVerified = 34,
     /// Staking is already configured with the proposed token and treasury.
     StakingAlreadyConfigured = 35,
+    /// The caller is neither the registered owner nor the owner-appointed manager.
+    NotManager = 36,
+    /// Input validation failed (e.g., empty response).
+    InvalidInput = 37,
+    /// The specified slash record does not exist (invalid index).
+    SlashNotFound = 38,
+    /// This slash already has a response attached.
+    ResponseAlreadyExists = 39,
+    /// The contract's token balance is lower than total tracked stake.
+    ContractBalanceInsufficient = 40,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -717,8 +735,6 @@ impl LuminaRegistry {
 
     // ── Initialization ──────────────────────────────────────────────────────
 
-    /// One-time setup.  `admins` must be non-empty and `threshold` must be
-    /// between 1 and `admins.len()`.
     pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> Result<(), RegistryError> {
         if env.storage().instance().has(&DataKey::Admins) {
             return Err(RegistryError::AlreadyInitialized);
@@ -2477,6 +2493,34 @@ impl LuminaRegistry {
         result
     }
 
+    /// Count of currently active registrations in a category.
+    ///
+    /// Walks the category index and counts entries that still load and are
+    /// flagged active, skipping dead references and deactivated entries exactly
+    /// as `get_active_contracts_by_category` does.
+    ///
+    /// # Performance
+    ///
+    /// This is an O(n) scan over the category index today. Issue #25 ("Maintain
+    /// active and per-category counters instead of scanning") tracks maintaining
+    /// running counters on write so this read becomes O(1).
+    pub fn get_active_category_count(env: Env, category: Category) -> u32 {
+        let index = Self::category_index(&env, &category);
+        let mut active: u32 = 0;
+        for contract_id in index.iter() {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+            {
+                if entry.active {
+                    active += 1;
+                }
+            }
+        }
+        active
+    }
+
     /// Paginated list of active registrations in multiple categories.
     ///
     /// Returns contracts appearing in ANY of the selected categories (union),
@@ -2822,7 +2866,13 @@ impl LuminaRegistry {
 
     /// Currently listed (active) registrations. Walks `AllContracts` and
     /// counts entries that still load and are flagged active, skipping dead
-    /// references exactly as `get_active_contracts` does.
+    /// references and deactivated entries exactly as `get_active_contracts` does.
+    ///
+    /// # Performance
+    ///
+    /// This is an O(n) scan over `AllContracts` today. Issue #25 ("Maintain
+    /// active and per-category counters instead of scanning") tracks maintaining
+    /// running counters on write so this read becomes O(1).
     pub fn get_active_contract_count(env: Env) -> u32 {
         let all: Vec<Address> = env
             .storage()
@@ -2844,6 +2894,7 @@ impl LuminaRegistry {
         active
     }
 
+    #[allow(dead_code)]
     fn is_active_listing(env: &Env, entry: &ContractEntry) -> bool {
         if !entry.active {
             return false;
@@ -3357,6 +3408,14 @@ impl LuminaRegistry {
                     .has(&DataKey::Contract(treasury.clone()))
                 {
                     return Err(RegistryError::OverlappingAddress);
+                }
+                let prev_token: Option<Address> = env.storage().instance().get(&DataKey::StakeToken);
+                let prev_treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+                if let Some(ref p) = prev_token {
+                    env.storage().instance().set(&DataKey::PreviousStakeToken, p);
+                }
+                if let Some(ref p) = prev_treasury {
+                    env.storage().instance().set(&DataKey::PreviousTreasury, p);
                 }
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
@@ -4642,6 +4701,7 @@ mod test {
     // ── Upgrade-path tests ──────────────────────────────────────────────────
 
     fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
+        env.cost_estimate().budget().reset_unlimited();
         let admin = Address::generate(env);
         // `__constructor` calls `require_auth()`, and deploying *from wasm*
         // runs it as a sub-invocation of the `CreateContractV2` host function
@@ -4672,7 +4732,10 @@ mod test {
 
     #[test]
     fn upgrade_swaps_code_and_preserves_registrations() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, contract_id) = deploy_v1(&env);
 
@@ -4705,7 +4768,10 @@ mod test {
 
     #[test]
     fn upgrade_retires_previous_interface() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, _) = deploy_v1(&env);
         register_via(&env, &v1, &Address::generate(&env));
@@ -4718,7 +4784,10 @@ mod test {
 
     #[test]
     fn upgrade_by_non_admin_is_rejected() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, _admin, _) = deploy_v1(&env);
         let stranger = Address::generate(&env);
@@ -4732,7 +4801,10 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn upgrade_without_admin_signature_panics() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, _) = deploy_v1(&env);
         let stranger = Address::generate(&env);
@@ -4752,7 +4824,10 @@ mod test {
 
     #[test]
     fn upgrade_with_admin_signature_succeeds() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, contract_id) = deploy_v1(&env);
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
@@ -4775,7 +4850,10 @@ mod test {
 
     #[test]
     fn upgraded_registry_can_be_rolled_back() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, contract_id) = deploy_v1(&env);
         let owner = Address::generate(&env);
@@ -4796,7 +4874,10 @@ mod test {
 
     #[test]
     fn upgrade_carries_admin_across_swap() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, contract_id) = deploy_v1(&env);
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
@@ -4840,7 +4921,10 @@ mod test {
 
     #[test]
     fn registry_upgraded_event_reports_the_replaced_version() {
-        let env = Env::default();
+        let mut env = Env::default();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         let (v1, admin, contract_id) = deploy_v1(&env);
         let replaced = v1.get_version();
@@ -4869,7 +4953,11 @@ mod test {
         // enforces the production timelock. Stretch entry TTLs so waiting it
         // out does not archive the registry's storage or code.
         let production_timelock: u32 = 17_280;
-        let env = Env::default();
+        let mut env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        env.set_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.ledger().with_mut(|li| {
             li.min_persistent_entry_ttl = production_timelock * 2;
             li.min_temp_entry_ttl = production_timelock * 2;
@@ -7170,15 +7258,18 @@ mod test {
     // Issue 4: Require a minimum admin set size (#40)
     #[test]
     fn initialize_below_min_admins_is_refused() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
+        let (env, client, admin) = setup();
+
+        // Clear Admins so the contract behaves as uninitialized
+        env.as_contract(&client.address, || {
+            env.storage().instance().remove(&DataKey::Admins);
+        });
 
         let mut admins = Vec::new(&env);
         admins.push_back(admin);
         // MIN_ADMINS is 2; passing 1 admin must fail with AdminSetTooSmall
-        let res = LuminaRegistry::initialize(env.clone(), admins, 1);
-        assert_eq!(res, Err(RegistryError::AdminSetTooSmall));
+        let res = client.try_initialize(&admins, &1);
+        assert_eq!(res, Err(Ok(RegistryError::AdminSetTooSmall)));
     }
 
     #[test]
@@ -7255,12 +7346,7 @@ mod test {
 
     #[test]
     fn propose_configure_staking_rejects_noop() {
-        let (env, client, admin) = setup();
-        let token_id = Address::generate(&env);
-        let treasury = Address::generate(&env);
-
-        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
-        pass_proposal(&env, &client, &admin, pid);
+        let (_env, client, admin, token_id, treasury) = setup_staking();
 
         // Staking is now configured with token_id and treasury. Proposing identical config must fail.
         let res = client.try_propose_configure_staking(&admin, &token_id, &treasury);
@@ -7310,5 +7396,85 @@ mod test {
             ready_events.get(0).unwrap().into_val(&env);
         assert_eq!(r_pid, pid);
         assert_eq!(executable_from, ready_at + TIMELOCK_LEDGERS);
+    }
+
+    #[test]
+    fn active_contract_count_and_category_count_match_pagination_walk() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+
+        // Initially 0
+        assert_eq!(client.get_active_contract_count(), 0);
+        assert_eq!(client.get_active_category_count(&Category::DeFi), 0);
+        assert_eq!(client.get_active_category_count(&Category::Gaming), 0);
+        assert_eq!(client.get_active_category_count(&Category::Dao), 0);
+
+        // Register 2 in DeFi, 1 in Gaming, 1 in both DeFi and Gaming
+        let defi1 = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let defi2 = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let _game1 = register_in(&env, &client, &owner, &[Category::Gaming]);
+        let both = register_in(&env, &client, &owner, &[Category::DeFi, Category::Gaming]);
+
+        assert_eq!(client.get_active_contract_count(), 4);
+        assert_eq!(client.get_active_category_count(&Category::DeFi), 3);
+        assert_eq!(client.get_active_category_count(&Category::Gaming), 2);
+        assert_eq!(client.get_active_category_count(&Category::Dao), 0);
+
+        // Verify counts match full pagination walks
+        let mut walked_active = 0u32;
+        let mut offset = 0u32;
+        let limit = 2u32;
+        loop {
+            let page = client.get_active_contracts(&offset, &limit);
+            if page.is_empty() {
+                break;
+            }
+            walked_active += page.len();
+            offset += limit;
+        }
+        assert_eq!(client.get_active_contract_count(), walked_active);
+
+        let mut walked_defi = 0u32;
+        offset = 0;
+        loop {
+            let page = client.get_active_contracts_by_category(&Category::DeFi, &offset, &limit);
+            if page.is_empty() {
+                break;
+            }
+            walked_defi += page.len();
+            offset += limit;
+        }
+        assert_eq!(client.get_active_category_count(&Category::DeFi), walked_defi);
+
+        // Deactivate one DeFi contract (defi1)
+        client.deactivate(&owner, &defi1);
+
+        assert_eq!(client.get_active_contract_count(), 3);
+        assert_eq!(client.get_active_category_count(&Category::DeFi), 2);
+        assert_eq!(client.get_active_category_count(&Category::Gaming), 2);
+        assert_eq!(client.get_active_category_count(&Category::Dao), 0);
+
+        // Deactivate the contract in both (both)
+        client.deactivate(&owner, &both);
+
+        assert_eq!(client.get_active_contract_count(), 2);
+        assert_eq!(client.get_active_category_count(&Category::DeFi), 1);
+        assert_eq!(client.get_active_category_count(&Category::Gaming), 1);
+
+        // Verify full pagination walks again
+        let all_active = client.get_active_contracts(&0, &100);
+        assert_eq!(client.get_active_contract_count(), all_active.len());
+
+        let defi_active = client.get_active_contracts_by_category(&Category::DeFi, &0, &100);
+        assert_eq!(client.get_active_category_count(&Category::DeFi), defi_active.len());
+
+        let gaming_active = client.get_active_contracts_by_category(&Category::Gaming, &0, &100);
+        assert_eq!(client.get_active_category_count(&Category::Gaming), gaming_active.len());
+
+        // Deregister defi1
+        client.deregister(&owner, &defi1);
+        assert_eq!(client.get_active_contract_count(), 2);
+        assert_eq!(client.get_active_category_count(&Category::DeFi), 1);
+        assert_eq!(client.is_registered(&defi2), true);
     }
 }
