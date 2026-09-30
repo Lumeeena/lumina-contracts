@@ -44,8 +44,9 @@
 //! `registry` crate's `fixture_sync` test. When a storage type changes, update
 //! this file in the same commit; CI fails otherwise.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec};
-
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+};
 /// Always `lumina_registry::CONTRACT_VERSION + 1` — the value the upgrade test
 /// reads back to confirm the new code is the one now executing. The tests
 /// assert the relationship rather than the literal, so bumping the registry's
@@ -78,9 +79,9 @@ pub struct ContractEntry {
     /// Owner/deployer who registered this contract.
     pub owner: Address,
     /// Human-readable name.
-    pub name: soroban_sdk::String,
+    pub name: String,
     /// Short description of what the contract does.
-    pub description: soroban_sdk::String,
+    pub description: String,
     /// Ledger at which this contract was registered.
     pub registered_at: u32,
     /// Whether indexing is currently active for this contract.

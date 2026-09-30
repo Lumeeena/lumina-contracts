@@ -171,6 +171,9 @@ pub trait RegistryInterface {
     /// Retrieve a governance proposal by ID.
     fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError>;
 
+    /// The timelock duration, in ledgers, that applies to a given action.
+    fn get_action_timelock(env: Env, action: ProposalAction) -> u32;
+
     /// The categories a registration declared. Empty for a registration that
     /// predates the taxonomy, or for one that was never registered.
     fn get_categories(env: Env, contract_id: Address) -> Vec<Category>;
@@ -189,6 +192,17 @@ pub trait RegistryInterface {
         env: Env,
         category: Category,
         offset: u32,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_active_contracts_by_category`, for walking a whole
+    /// category without re-reading it page by page. `cursor` is the
+    /// `contract_id` last returned, or `None` to start; the position is stable
+    /// against registrations added mid-walk.
+    fn get_contracts_by_category_after(
+        env: Env,
+        category: Category,
+        cursor: Option<Address>,
         limit: u32,
     ) -> Vec<ContractEntry>;
 
@@ -218,6 +232,13 @@ pub trait RegistryInterface {
     /// Currently staked balance. Zero for a registration that never staked,
     /// and zero — not an error — for an address that was never registered.
     fn get_stake(env: Env, contract_id: Address) -> i128;
+
+    /// The ledger at which an in-progress unbonding completes, or zero if no
+    /// unbonding is in progress. `withdraw_stake` refuses until the current
+    /// ledger reaches this value. The unbonding period is deliberately longer
+    /// than the governance timelock, so a slash proposal cannot be outrun by
+    /// deactivating and withdrawing.
+    fn get_unbonding_completes_at(env: Env, contract_id: Address) -> u32;
 
     /// Whether governance has attested this registration. False, not an error,
     /// for an address that was never registered.
@@ -291,8 +312,19 @@ pub trait RegistryInterface {
     /// One page of active registrations in registration order.
     ///
     /// `offset` indexes the raw index, so a page can come back shorter than
-    /// `limit` while more active registrations follow. See the trait docs.
+    /// `limit` while more active registrations follow. Deprecated in favour of
+    /// `get_active_contracts_after`; see the trait docs.
     fn get_active_contracts(env: Env, offset: u32, limit: u32) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_active_contracts`. Pass the `contract_id` of the
+    /// last entry the previous call returned (or `None` to start) and walk
+    /// until an empty page. Cheaper than offset paging and stable against
+    /// registrations added mid-walk.
+    fn get_active_contracts_after(
+        env: Env,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
 
     /// As `get_active_contracts`, but only the addresses. Cheaper to decode
     /// and much smaller to return, for a consumer that does not read the
@@ -307,10 +339,20 @@ pub trait RegistryInterface {
     fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
 
     /// Every contract registered by `owner`, **including** deactivated ones.
+    /// Deprecated in favour of `get_contracts_by_owner_after`.
     fn get_contracts_by_owner(
         env: Env,
         owner: Address,
         offset: u32,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_contracts_by_owner`, including deactivated entries.
+    /// `cursor` is the `contract_id` last returned, or `None` to start.
+    fn get_contracts_by_owner_after(
+        env: Env,
+        owner: Address,
+        cursor: Option<Address>,
         limit: u32,
     ) -> Vec<ContractEntry>;
 }
@@ -367,6 +409,8 @@ pub enum RegistryError {
     RegistrationActive = 19,
     /// A registration must declare at least one category.
     NoCategories = 20,
+    /// The registration claims more categories than `MAX_CATEGORIES_PER_CONTRACT`.
+    TooManyCategories = 28,
     /// The registration still holds stake — withdraw it before deregistering.
     StakeNotEmpty = 21,
     /// The registration rate limit configuration is invalid.
@@ -381,7 +425,21 @@ pub enum RegistryError {
     InvalidTags = 26,
     /// Caller is not the registered owner nor its delegated manager.
     NotManager = 27,
+    /// The unbonding period has not elapsed yet.
+    UnbondingNotComplete = 28,
 }
+
+/// The maximum number of categories a single registration may claim.
+///
+/// The [`Category`] vocabulary is the natural upper bound, but relying on its
+/// size means the limit silently changes every time a category is added. This
+/// constant makes the cap explicit and independent of the enum's growth.
+///
+/// A registration that claims every category is not categorised in any useful
+/// sense — it is spam in a discovery surface. Claiming more than this cap is
+/// rejected with [`RegistryError::TooManyCategories`] rather than silently
+/// truncated.
+pub const MAX_CATEGORIES_PER_CONTRACT: u32 = 5;
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
 #[contracttype]
@@ -421,6 +479,39 @@ pub enum ProposalAction {
     SetRegistrationFee(i128),
 }
 
+/// A governance proposal, with the rationale its proposer attached.
+///
+/// Byte-compatible with `lumina_registry::Proposal`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    /// Monotonic identifier assigned at creation.
+    pub id: u32,
+    /// The action the proposal would take if approved.
+    pub action: ProposalAction,
+    /// Optional human-readable rationale, bounded by
+    /// `MAX_PROPOSAL_DESCRIPTION_LEN` bytes. Empty when the proposer
+    /// supplied none.
+    pub description: String,
+    /// Address that created the proposal.
+    pub proposer: Address,
+    /// Ledger at which the proposal was created.
+    pub created_at: u32,
+    /// Ledger after which the proposal can no longer be voted on.
+    pub expires_at: u32,
+    /// Approvals recorded so far.
+    pub approvals: u32,
+    /// Whether the proposal has been executed or rejected.
+    pub finalized: bool,
+}
+
+/// Maximum length, in bytes, of a proposal description.
+///
+/// Enforced at creation; a longer description is rejected with
+/// `InvalidDescription`. Documented here so clients can validate before
+/// submitting a transaction.
+pub const MAX_PROPOSAL_DESCRIPTION_LEN: u32 = 256;
+
 /// Byte-compatible with `lumina_registry::SlashRecord`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -459,6 +550,10 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Ledger at which an in-progress unbonding completes, or zero if none is
+    /// in progress. Distinct from `withdraw_locked_until`, which is the
+    /// post-slash lock.
+    pub unbonding_completes_at: u32,
 }
 
 /// Byte-compatible with `lumina_registry::ContractProfile`.
@@ -564,3 +659,10 @@ pub enum ProposalAction {
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
 }
+
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_UPGRADE: u32 = 17_280;
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_ADMIN: u32 = 17_280;
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_STANDARD: u32 = 720;
