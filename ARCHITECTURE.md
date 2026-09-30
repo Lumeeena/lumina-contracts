@@ -143,6 +143,10 @@ Ready (ready_at = current ledger)
       | TIMELOCK_LEDGERS elapse
       v
 Anyone executes ----> Executed (cannot execute twice)
+      |
+      | PROPOSAL_EXPIRY_LEDGERS elapse without execution
+      v
+Expired (must be re-proposed)
 ```
 
 Only an address in `Admins` can create or approve a proposal. Approvals are
@@ -169,6 +173,17 @@ validate that the resulting threshold remains satisfiable.
 The production timelock is 17,280 ledgers (approximately 28.8 hours at six
 seconds per ledger). Tests use 10 ledgers so they can exercise boundaries
 without archiving fixture storage.
+
+The production expiry window is 518,400 ledgers (approximately 36 days at six
+seconds per ledger), measured from `ready_at`. It is deliberately far longer
+than the timelock: the timelock protects against haste, while the expiry
+protects against staleness. A proposal that reaches threshold but is never
+executed within this window becomes invalid and must be re-proposed, so a
+decision cannot be executed against an admin set or policy context that has
+since changed. `execute_proposal` refuses an expired proposal with a named
+error, and `get_proposal` exposes the expiry so a UI can surface it. Tests use
+a short window so they can exercise the boundary without archiving fixture
+storage.
 
 ## Staking, verification, and slashing
 
@@ -231,6 +246,7 @@ properties it checks, with representative test names for quick navigation:
 | Invariant | Representative tests |
 | --- | --- |
 | A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
+| A proposal that is never executed within the expiry window is refused and must be re-proposed. | `proposal_executes_inside_expiry_window`, `expired_proposal_cannot_execute`, `get_proposal_reports_expiry` |
 | Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
 | Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
 | Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |
@@ -259,6 +275,10 @@ That makes storage encoding part of the long-lived protocol:
   read-time composition over modifying `ContractEntry`.
 - `CONTRACT_VERSION` must change with exported-interface or storage-shape
   changes.
+
+`PROPOSAL_EXPIRY_LEDGERS` is a documented constant rather than a stored value:
+changing its length is an exported-behavior change and must be accompanied by
+an update to this document and the interface snapshot.
 
 Before changing the architecture, run `make check`. For changes to exported
 functions or contract types, also update the interface snapshot and verify the
