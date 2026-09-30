@@ -566,6 +566,10 @@ pub struct ContractProfile {
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Optional URI pointing at richer off-chain metadata.
+    pub metadata_uri: Option<String>,
+    /// The Unix timestamp of when the contract was registered, or 0 if legacy.
+    pub registered_at_ts: u64,
 }
 
 /// The reputation signal for a registration.

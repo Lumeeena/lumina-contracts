@@ -1,4 +1,4 @@
-﻿// Copyright (c) Lumina contributors
+// Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
@@ -405,6 +405,8 @@ pub struct ContractProfile {
     pub superseded_by: Option<Address>,
     /// Optional URI pointing at richer off-chain metadata.
     pub metadata_uri: Option<String>,
+    /// The Unix timestamp of when the contract was registered, or 0 if legacy.
+    pub registered_at_ts: u64,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -657,6 +659,8 @@ pub enum DataKey {
     Contract(Address),
     /// Vec<Address> — list of contracts registered by a specific owner.
     OwnerContracts(Address),
+    /// u64 — the Unix timestamp of when the contract was registered.
+    ContractTimestamp(Address),
     /// Vec<Address> — insertion-ordered list of every registered contract.
     AllContracts,
     Expiry(Address),
@@ -1795,6 +1799,11 @@ impl LuminaRegistry {
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
 
+        let ts: u64 = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractTimestamp(contract_id.clone()), &ts);
+
         env.storage().persistent().set(&DataKey::Expiry(contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
         let mut owned = Self::owner_index(&env, &owner);
         owned.push_back(contract_id.clone());
@@ -2819,7 +2828,12 @@ impl LuminaRegistry {
             superseded_by: env
                 .storage()
                 .persistent()
-                .get(&DataKey::SupersededBy(contract_id)),
+                .get(&DataKey::SupersededBy(contract_id.clone())),
+            registered_at_ts: env
+                .storage()
+                .persistent()
+                .get(&DataKey::ContractTimestamp(contract_id))
+                .unwrap_or(0),
         })
     }
 
