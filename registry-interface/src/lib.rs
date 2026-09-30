@@ -381,6 +381,8 @@ pub enum RegistryError {
     InvalidTags = 26,
     /// Caller is not the registered owner nor its delegated manager.
     NotManager = 27,
+    /// The proposal has been cancelled.
+    ProposalCancelled = 28,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -401,6 +403,8 @@ pub struct ContractEntry {
     pub active: bool,
     /// Address the owner delegated registration management to, if any.
     pub manager: Option<Address>,
+    /// Whether this registration has been superseded by another.
+    pub superseded_by: Option<Address>,
 }
 
 /// The kind of action a proposal carries.
@@ -419,6 +423,8 @@ pub enum ProposalAction {
     SetStakingConfig(Address, Address),
     /// Set the registration fee.
     SetRegistrationFee(i128),
+    /// Cancel a proposal.
+    Cancel(u32),
 }
 
 /// Byte-compatible with `lumina_registry::SlashRecord`.
@@ -433,6 +439,8 @@ pub struct SlashRecord {
     pub slashed_at: u32,
     /// Owner's optional response to the slash.
     pub response: Option<String>,
+    /// Whether the slash has been appealed.
+    pub appealed: bool,
 }
 
 /// Byte-compatible with `lumina_registry::Attestation`.
@@ -445,6 +453,8 @@ pub struct Attestation {
     pub label: String,
     /// Ledger at which the attestation was made.
     pub created_at: u32,
+    /// Whether the attestation has been revoked.
+    pub revoked: bool,
 }
 
 /// Byte-compatible with `lumina_registry::Reputation`.
@@ -459,6 +469,8 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Number of slashes levied against this registration.
+    pub slash_count: u32,
 }
 
 /// Byte-compatible with `lumina_registry::ContractProfile`.
@@ -471,6 +483,8 @@ pub struct ContractProfile {
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Whether the profile is active.
+    pub active: bool,
 }
 
 /// The reputation signal for a registration.
@@ -487,6 +501,8 @@ pub struct Reputation {
     public total_slashed: i128,
     /// Whether the registration is verified.
     public verified: bool,
+    /// The ledger at which the reputation was last updated.
+    public updated_at: u32,
 }
 
 /// Aggregate registry counters.
@@ -505,6 +521,8 @@ pub struct RegistryStats {
     public staked_count: u32,
     /// Total amount staked.
     public total_staked: i128,
+    /// Number of slashes levied.
+    public slash_count: u32,
 }
 
 /// A registration joined with its reputation.
@@ -517,6 +535,8 @@ pub struct ContractProfile {
     public entry: ContractEntry,
     /// The reputation signal.
     public reputation: Reputation,
+    /// Whether the profile is active.
+    public active: bool,
 }
 
 /// A page of registration entries.
@@ -529,6 +549,8 @@ pub struct ContractPage {
     public entries: Vec<ContractEntry>,
     /// Whether more entries follow.
     public has_more: bool,
+    /// The total number of entries.
+    public total: u32,
 }
 
 /// Byte-compatible with `lumina_registry::ProposalAction`.
@@ -563,4 +585,6 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Cancel a proposal.
+    Cancel(u32),
 }
