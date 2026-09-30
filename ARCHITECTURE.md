@@ -77,6 +77,7 @@ temporary storage.
 | `RegistrationWindow(owner)` | window start and count | Fixed-window registration rate accounting; its TTL is extended to the configured window. |
 | `Tags(contract_id)` | bounded normalized tags | Owner-managed discovery metadata. |
 | `Attestations(contract_id)` | bounded third-party claims | Separate from governance verification; removed on deregistration. |
+| `NameIndex(prefix)` | ordered contract addresses | Name-prefix discovery index keyed on the normalised name prefix; maintained on registration, metadata update, and deregistration. |
 
 `ContractEntry` is intentionally small and stable: contract address, owner,
 name, description, registration ledger, and active flag. Reputation is joined
@@ -93,6 +94,14 @@ first builds a deduplicated union of active entries and then applies `offset`
 and `limit` to that filtered union. `get_contracts_by_owner` also differs: it
 resolves the owner's ordered index without active filtering and therefore
 includes inactive registrations.
+
+`find_by_name_prefix(prefix, limit)` resolves the normalised prefix against
+`NameIndex` and returns matching entries. Matching is case-insensitive because
+both the stored key and the query are normalised (trimmed and lowercased)
+before lookup. An unmatched prefix yields an empty list rather than an error.
+On-chain prefix matching is deliberately limited to a single normalised
+prefix: richer name search, ranking, and fuzzy matching belong in the indexer,
+which can build a full-text index off the registration events.
 
 ## Registration lifecycle
 
@@ -114,6 +123,9 @@ includes inactive registrations.
    entry, and zero remaining stake. It removes live metadata and index
    references but preserves slash history for auditability. The address may
    then be registered again as a fresh entry.
+
+Metadata updates that change the name move the address between `NameIndex`
+buckets so prefix lookups stay consistent with the current `ContractEntry`.
 
 `register_contracts` performs a bounded batch in one atomic Soroban invocation,
 so a validation or token-transfer failure leaves no partial batch behind. Its
@@ -237,6 +249,7 @@ properties it checks, with representative test names for quick navigation:
 | Category membership is non-empty and deduplicated, and category changes do not affect reputation. | `registration_requires_at_least_one_category`, `duplicate_categories_are_collapsed`, `categories_and_reputation_are_independent` |
 | In isolated staking flows, tracked stake equals the registry token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
 | Verification is governance-only and independent from self-service attestations. | `a_registrant_cannot_verify_their_own_contract`, `attesting_does_not_affect_governance_only_verification`, `attesting_does_not_grant_verification_or_privilege_to_the_attester` |
+| Name-prefix search is case-insensitive, returns every matching registration, and returns an empty list for an unmatched prefix. | `find_by_name_prefix_is_case_insensitive`, `find_by_name_prefix_returns_all_matches`, `find_by_name_prefix_unmatched_returns_empty` |
 | Deregistration removes live indexes and state only after safe exit, while retaining slash history and lifetime totals. | `deregister_requires_deactivated_and_unstaked`, `deregister_removes_every_index_reference_and_decrements_the_live_count`, `deregister_keeps_slash_history_for_audit`, `contract_count_is_live_and_total_registered_is_lifetime` |
 | Code upgrades preserve compatible storage and authentication. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_carries_admin_across_swap`, `upgraded_registry_can_be_rolled_back` |
 

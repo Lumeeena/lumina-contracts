@@ -1,5 +1,7 @@
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
+// Copyright (c) Lumina contributors
+// SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
 // `#[contractclient]` macros emit synthetic items — the `SPEC` constants, the
@@ -313,6 +315,17 @@ pub trait RegistryInterface {
         offset: u32,
         limit: u32,
     ) -> Vec<ContractEntry>;
+
+    /// Registrations whose normalised name starts with `prefix`, up to `limit`.
+    ///
+    /// Matching is case-insensitive: both the stored name and `prefix` are
+    /// lowercased before comparison. An unmatched prefix returns an empty
+    /// list rather than erroring.
+    ///
+    /// On-chain prefix matching is deliberately limited to a prefix scan over
+    /// the name index; anything richer (substring, fuzzy, ranked) belongs in
+    /// the indexer, not in the contract.
+    fn find_by_name_prefix(env: Env, prefix: String, limit: u32) -> Vec<ContractEntry>;
 }
 
 /// Errors the registry's read-only surface can return.
