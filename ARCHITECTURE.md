@@ -73,6 +73,7 @@ temporary storage.
 | `Verified(contract_id)` | governance trust signal | Changed only by an executed proposal. |
 | `Slashes(contract_id)` | ordered `SlashRecord` history | Appended on slash and deliberately retained after deregistration. |
 | `WithdrawLockedUntil(contract_id)` | ledger sequence | Prevents immediate withdrawal of remaining collateral after a slash. |
+| `UnbondingUntil(contract_id)` | ledger sequence | Set by `request_unbond`; `withdraw_stake` refuses until it elapses. |
 | `Allowlisted(owner)` | admission flag | Consulted only when allowlist mode is enabled. |
 | `RegistrationWindow(owner)` | window start and count | Fixed-window registration rate accounting; its TTL is extended to the configured window. |
 | `Tags(contract_id)` | bounded normalized tags | Owner-managed discovery metadata. |
@@ -202,8 +203,21 @@ inactive + unlocked + owner -- withdraw --> owner
   from the registry to the treasury, decreases tracked stake, appends a reason
   and ledger to slash history, and locks the remainder for
   `SLASH_LOCK_LEDGERS`.
+- `request_unbond` is an owner action on a deactivated registration. It starts
+  the unbonding timer by writing `UnbondingUntil(contract_id)`.
 - `withdraw_stake` returns the entire remainder only to the owner, only after
-  deactivation, and only after the post-slash lock expires.
+  deactivation, only after the post-slash lock expires, and only after the
+  unbonding period elapses.
+
+The unbonding period exists to close the withdrawal race against governance.
+The slash lock only stops withdrawal *after* a slash lands, so an owner who
+sees a slash coming could otherwise deactivate and withdraw before a proposal
+finishes its timelock. `UNBONDING_LEDGERS` must therefore exceed
+`TIMELOCK_LEDGERS`; if it does not, the window reopens and the queue provides
+no protection. That relationship is asserted by a test rather than the literal
+numbers, so the two constants can be retuned together without silently
+inverting the ordering. A view exposes when unbonding completes so indexers
+and the frontend can display the remaining wait.
 
 The internal bookkeeping invariant across staking transitions is:
 
@@ -236,6 +250,7 @@ properties it checks, with representative test names for quick navigation:
 | Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |
 | Category membership is non-empty and deduplicated, and category changes do not affect reputation. | `registration_requires_at_least_one_category`, `duplicate_categories_are_collapsed`, `categories_and_reputation_are_independent` |
 | In isolated staking flows, tracked stake equals the registry token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
+| Withdrawal is refused until the unbonding period elapses, and the unbonding period exceeds the governance timelock. | `withdraw_before_unbonding_period_is_refused`, `unbonding_period_exceeds_governance_timelock` |
 | Verification is governance-only and independent from self-service attestations. | `a_registrant_cannot_verify_their_own_contract`, `attesting_does_not_affect_governance_only_verification`, `attesting_does_not_grant_verification_or_privilege_to_the_attester` |
 | Deregistration removes live indexes and state only after safe exit, while retaining slash history and lifetime totals. | `deregister_requires_deactivated_and_unstaked`, `deregister_removes_every_index_reference_and_decrements_the_live_count`, `deregister_keeps_slash_history_for_audit`, `contract_count_is_live_and_total_registered_is_lifetime` |
 | Code upgrades preserve compatible storage and authentication. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_carries_admin_across_swap`, `upgraded_registry_can_be_rolled_back` |

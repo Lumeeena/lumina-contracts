@@ -219,6 +219,13 @@ pub trait RegistryInterface {
     /// and zero — not an error — for an address that was never registered.
     fn get_stake(env: Env, contract_id: Address) -> i128;
 
+    /// The ledger at which an in-progress unbonding completes, or zero if no
+    /// unbonding is in progress. `withdraw_stake` refuses until the current
+    /// ledger reaches this value. The unbonding period is deliberately longer
+    /// than the governance timelock, so a slash proposal cannot be outrun by
+    /// deactivating and withdrawing.
+    fn get_unbonding_completes_at(env: Env, contract_id: Address) -> u32;
+
     /// Whether governance has attested this registration. False, not an error,
     /// for an address that was never registered.
     fn is_verified(env: Env, contract_id: Address) -> bool;
@@ -381,6 +388,8 @@ pub enum RegistryError {
     InvalidTags = 26,
     /// Caller is not the registered owner nor its delegated manager.
     NotManager = 27,
+    /// The unbonding period has not elapsed yet.
+    UnbondingNotComplete = 28,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -459,6 +468,10 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Ledger at which an in-progress unbonding completes, or zero if none is
+    /// in progress. Distinct from `withdraw_locked_until`, which is the
+    /// post-slash lock.
+    pub unbonding_completes_at: u32,
 }
 
 /// Byte-compatible with `lumina_registry::ContractProfile`.
