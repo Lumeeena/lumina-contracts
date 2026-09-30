@@ -4,7 +4,7 @@ fn approve_proposal(admin: Address, proposal_id: U32) -> Result<(), RegistryErro
 fn attest(attester: Address, contract_id: Address, label: String) -> Result<(), RegistryError>
 fn deactivate(caller: Address, contract_id: Address) -> Result<(), RegistryError>
 fn deregister(owner: Address, contract_id: Address) -> Result<(), RegistryError>
-fn execute_proposal(proposal_id: U32) -> Result<(), RegistryError>
+fn execute_proposal(executor: Address, proposal_id: U32) -> Result<(), RegistryError>
 fn get_active_contract_count() -> U32
 fn get_active_contract_ids(offset: U32, limit: U32) -> Vec<Address>
 fn get_active_contracts(offset: U32, limit: U32) -> Vec<ContractEntry>
@@ -68,7 +68,7 @@ struct ContractEntry { active: Bool, contract_id: Address, description: String, 
 struct ContractPage { entries: Vec<ContractEntry>, has_more: Bool }
 struct ContractProfile { entry: ContractEntry, reputation: Reputation, superseded_by: Option<Address> }
 struct ContractProfilePage { entries: Vec<ContractProfile>, has_more: Bool }
-struct Proposal { action: ProposalAction, approvals: Vec<Address>, executed: Bool, id: U32, proposer: Address, ready_at: U32 }
+struct Proposal { action: ProposalAction, approvals: Vec<Address>, executed: Bool, executor: Option<Address>, id: U32, proposer: Address, ready_at: U32 }
 struct RegistrationEntry { categories: Vec<Category>, contract_id: Address, description: String, name: String }
 struct RegistrationWindow { count: U32, started_at: U32 }
 struct RegistryStats { active_count: U32, staked_count: U32, total_registered: U32, total_staked: I128, verified_count: U32 }

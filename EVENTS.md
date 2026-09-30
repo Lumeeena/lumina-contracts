@@ -14,7 +14,7 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `proposal_proposed` | `(proposal_id: u32, proposer: Address, action: Symbol, data: T)` | When an admin proposes an action (e.g., slash, upgrade, change settings). | | `propose_deactivate_requires_admin` |
 | `proposal_approved` | `(proposal_id: u32, admin: Address, approvals_len: u32, threshold: u32)` | When an admin approves an existing proposal. | | `approve_proposal_records_approval_and_returns_total` |
 | `proposal_ready` | `(proposal_id: u32, ready_at: u32, executable_from: u32)` | When a proposal receives enough approvals and enters the timelock. | | `proposal_enters_timelock_after_sufficient_approvals` |
-| `proposal_executed` | `(proposal_id: u32, executed_at: u64)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |
+| `proposal_executed` | `(proposal_id: u32, executed_at: u64, executor: Address)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |
 | `contract_deactivated` | `(contract_id: Address, caller: Address)` or `(contract_id: Address, Symbol("governance"))` | When a contract is deactivated by its owner or governance. | Indexer, History | `deactivate_requires_contract_owner` |
 | `contract_deregistered` | `(contract_id: Address, owner: Address)` | When a deactivated and unstaked contract is fully deregistered. | Indexer, History | `deregister_removes_every_index_reference...` |
 | `contract_registered` | `(contract_id: Address, owner: Address, name: String, categories: Vec<String>)` | When a new contract is registered to the manifest. | Indexer, History | `registration_records_its_categories` |

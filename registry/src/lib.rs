@@ -75,7 +75,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 7;
+pub const CONTRACT_VERSION: u32 = 8;
 
 /// Minimum number of admins required for multi-sig governance.
 pub const MIN_ADMINS: u32 = 2;
@@ -537,6 +537,9 @@ pub struct Proposal {
     pub ready_at: u32,
     /// Whether the proposal has already been executed.
     pub executed: bool,
+    /// The address that executed this proposal, if it has been executed.
+    /// `None` for proposals created before this field existed or not yet executed.
+    pub executor: Option<Address>,
 }
 
 /// Storage keys used by the Lumina Registry contract.
@@ -1327,7 +1330,10 @@ impl LuminaRegistry {
 
     /// Execute a proposal that has reached threshold and passed the timelock.
     /// Callable by anyone once those conditions are satisfied.
-    pub fn execute_proposal(env: Env, proposal_id: u32) -> Result<(), RegistryError> {
+    /// The executor's address is recorded for audit purposes.
+    pub fn execute_proposal(env: Env, executor: Address, proposal_id: u32) -> Result<(), RegistryError> {
+        executor.require_auth();
+        
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.executed {
@@ -1352,15 +1358,16 @@ impl LuminaRegistry {
             return Err(RegistryError::TimelockNotElapsed);
         }
 
-        // Mark executed before side effects (prevents re-entrance).
+        // Mark executed and record executor before side effects (prevents re-entrance).
         proposal.executed = true;
+        proposal.executor = Some(executor.clone());
         Self::save_proposal(&env, &proposal);
 
         Self::apply_action(&env, &proposal.action)?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
-            (proposal_id, current),
+            (proposal_id, current, executor),
         );
 
         Ok(())
@@ -3237,6 +3244,7 @@ impl LuminaRegistry {
             approvals: Vec::new(env),
             ready_at: u32::MAX,
             executed: false,
+            executor: None,
         };
         Self::save_proposal(env, &proposal);
         env.storage()
@@ -3757,7 +3765,7 @@ mod test {
         client.approve_proposal(&a1, &change_threshold);
         client.approve_proposal(&a2, &change_threshold);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&change_threshold);
+        client.execute_proposal(&a1, &change_threshold);
         (env, client, a1, a2, a3)
     }
 
@@ -3777,7 +3785,7 @@ mod test {
         client.approve_proposal(&a1, &raise);
         client.approve_proposal(&a2, &raise);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&raise);
+        client.execute_proposal(&a1, &raise);
         (env, client, a1, a2, a3)
     }
 
@@ -3908,7 +3916,7 @@ mod test {
         // Advance past timelock — should still fail because threshold not met.
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::ThresholdNotMet))
         );
         // Contract is still active.
@@ -3925,7 +3933,7 @@ mod test {
         client.approve_proposal(&a2, &pid);
 
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         assert!(!client.get_contract(&target).active);
     }
@@ -3944,7 +3952,7 @@ mod test {
         // Advance by one ledger less than required.
         advance_ledger(&env, TIMELOCK_LEDGERS - 1);
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::TimelockNotElapsed))
         );
         assert!(client.get_contract(&target).active);
@@ -3960,7 +3968,7 @@ mod test {
         client.approve_proposal(&a2, &pid);
 
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
         assert!(!client.get_contract(&target).active);
     }
 
@@ -3994,7 +4002,7 @@ mod test {
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         // Still below threshold (need 2), so execution must fail.
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::ThresholdNotMet))
         );
     }
@@ -4015,13 +4023,13 @@ mod test {
         client.approve_proposal(&a2, &pid);
         assert_eq!(client.get_proposal(&pid).ready_at, u32::MAX);
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::ThresholdNotMet))
         );
 
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::ThresholdNotMet))
         );
         assert!(client.get_contract(&target).active);
@@ -4033,12 +4041,12 @@ mod test {
 
         advance_ledger(&env, TIMELOCK_LEDGERS - 1);
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::TimelockNotElapsed))
         );
 
         advance_ledger(&env, 1);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
         assert!(!client.get_contract(&target).active);
 
         // And one admin alone is nowhere near enough for the next decision.
@@ -4047,7 +4055,7 @@ mod test {
         client.approve_proposal(&a2, &pid2);
         advance_ledger(&env, TIMELOCK_LEDGERS + 1);
         assert_eq!(
-            client.try_execute_proposal(&pid2),
+            client.try_execute_proposal(&a1, &pid2),
             Err(Ok(RegistryError::ThresholdNotMet))
         );
         assert!(client.get_contract(&target2).active);
@@ -4073,7 +4081,7 @@ mod test {
         assert_eq!(client.get_proposal(&disable).approvals.len(), 0);
         assert_eq!(client.get_proposal(&disable).ready_at, u32::MAX);
         assert_eq!(
-            client.try_execute_proposal(&disable),
+            client.try_execute_proposal(&a1, &disable),
             Err(Ok(RegistryError::ThresholdNotMet))
         );
 
@@ -4095,7 +4103,7 @@ mod test {
 
         // Executing one does not settle the other: it stays open, executable,
         // and free to reach the opposite conclusion.
-        client.execute_proposal(&enable);
+        client.execute_proposal(&a1, &enable);
         assert!(client.get_proposal(&enable).executed);
         assert!(!client.get_proposal(&disable).executed);
 
@@ -4116,7 +4124,7 @@ mod test {
 
         // The conflicting proposal still executes, and the later execution is
         // the state that sticks.
-        client.execute_proposal(&disable);
+        client.execute_proposal(&a2, &disable);
         assert!(client.get_proposal(&disable).executed);
         client.register_contract(
             &owner,
@@ -4129,11 +4137,11 @@ mod test {
 
         // Neither side can be run a second time to overturn it.
         assert_eq!(
-            client.try_execute_proposal(&enable),
+            client.try_execute_proposal(&a1, &enable),
             Err(Ok(RegistryError::AlreadyExecuted))
         );
         assert_eq!(
-            client.try_execute_proposal(&disable),
+            client.try_execute_proposal(&a2, &disable),
             Err(Ok(RegistryError::AlreadyExecuted))
         );
     }
@@ -4204,7 +4212,7 @@ mod test {
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         let admins = client.get_admins();
         assert!(admins.contains(&new_admin));
@@ -4219,7 +4227,7 @@ mod test {
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         let admins = client.get_admins();
         assert!(!admins.contains(&a3));
@@ -4238,7 +4246,7 @@ mod test {
         client.approve_proposal(&a3, &pid1);
         advance_ledger(&env, TIMELOCK_LEDGERS);
         // Still ok: 3-1=2 >= threshold=2.
-        client.execute_proposal(&pid1);
+        client.execute_proposal(&a1, &pid1);
 
         // Now admins = {a1, a3}, threshold=2.  Removing a3 would leave 1 < 2.
         let pid2 = client.propose_remove_admin(&a1, &a3);
@@ -4246,7 +4254,7 @@ mod test {
         client.approve_proposal(&a3, &pid2);
         advance_ledger(&env, TIMELOCK_LEDGERS);
         assert_eq!(
-            client.try_execute_proposal(&pid2),
+            client.try_execute_proposal(&a1, &pid2),
             Err(Ok(RegistryError::InvalidThreshold))
         );
     }
@@ -4259,7 +4267,7 @@ mod test {
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         assert_eq!(client.get_threshold(), 1);
     }
@@ -4279,7 +4287,7 @@ mod test {
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         // a3 is no longer an admin.
         assert!(!client.get_admins().contains(&a3));
@@ -4296,7 +4304,7 @@ mod test {
         client.approve_proposal(&a1, &pid2);
         client.approve_proposal(&a2, &pid2);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid2);
+        client.execute_proposal(&a1, &pid2);
         assert!(!client.get_contract(&target).active);
     }
 
@@ -4335,12 +4343,36 @@ mod test {
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&a1, &pid),
             Err(Ok(RegistryError::AlreadyExecuted))
         );
+    }
+
+    #[test]
+    fn execute_proposal_records_executor() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+
+        // Before execution, executor should be None.
+        assert_eq!(client.get_proposal(&pid).executor, None);
+
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&a2, &pid);
+
+        // After execution, executor should be recorded.
+        let proposal = client.get_proposal(&pid);
+        assert!(proposal.executed);
+        assert_eq!(proposal.executor, Some(a2.clone()));
+
+        // Contract should be deactivated.
+        assert!(!client.get_contract(&target).active);
     }
 
     // ── Existing registry tests (single-admin setup) ────────────────────────
@@ -4459,7 +4491,7 @@ mod test {
         client.approve_proposal(&admin, &change);
         client.approve_proposal(&second_admin, &change);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&change);
+        client.execute_proposal(&admin, &change);
         assert_eq!(client.get_admins().len(), 2);
         assert_eq!(client.get_threshold(), 2);
     }
@@ -4883,7 +4915,7 @@ mod test {
         let pid = v1.propose_upgrade(&admin, &v2_hash);
         v1.approve_proposal(&admin, &pid);
         advance_ledger(&env, production_timelock);
-        v1.execute_proposal(&pid);
+        v1.execute_proposal(&admin, &pid);
         let (hash, version): (BytesN<32>, u32) =
             registry_upgraded_data(&env, &contract_id).into_val(&env);
 
@@ -4895,6 +4927,44 @@ mod test {
         assert_eq!(hash, v2_hash);
         assert_eq!(version, replaced);
         assert_ne!(version, incoming);
+    }
+
+    #[test]
+    fn proposals_created_before_executor_field_decode_correctly() {
+        // This test verifies backward compatibility: proposals created by v1
+        // (before the executor field existed) should decode correctly as having
+        // executor = None when read by the current version.
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        // Deploy current version and create a proposal
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        
+        let (owner, target) = register_sample(&env, &client);
+        
+        // Create a proposal with current version - it should have executor = None initially
+        let pid = client.propose_deactivate(&admin, &target);
+        let proposal_before = client.get_proposal(&pid);
+        
+        // Before execution, executor should be None
+        assert_eq!(proposal_before.executor, None);
+        assert!(!proposal_before.executed);
+        
+        // Execute the proposal
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&admin, &pid);
+        
+        // After execution, executor should be recorded
+        let proposal_after = client.get_proposal(&pid);
+        assert!(proposal_after.executed);
+        assert_eq!(proposal_after.executor, Some(admin.clone()));
+        
+        // The key point: the Option<Address> field ensures that proposals
+        // created before this field existed (which would have been stored
+        // without it) will decode as None, maintaining compatibility.
     }
 
     #[test]
@@ -4922,7 +4992,7 @@ mod test {
         client.approve_proposal(&a1, &pid);
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
 
         assert!(!client.get_contract(&target).active);
     }
@@ -5046,7 +5116,7 @@ mod test {
     fn pass_proposal(env: &Env, client: &LuminaRegistryClient, admin: &Address, pid: u32) {
         client.approve_proposal(admin, &pid);
         advance_ledger(env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(admin, &pid);
     }
 
     fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
@@ -5288,7 +5358,7 @@ mod test {
         assert!(!client.is_verified(&target));
 
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&admin, &pid);
         assert!(client.is_verified(&target));
         assert_solvency(&env, &client, &token_id);
     }
@@ -5353,7 +5423,7 @@ mod test {
         // The proposal passes governance but reverts on execution rather than
         // taking tokens the registry is not holding for this registration.
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&admin, &pid),
             Err(Ok(RegistryError::InsufficientStake)),
         );
         assert_eq!(client.get_stake(&target), 100);
@@ -5372,7 +5442,7 @@ mod test {
         advance_ledger(&env, TIMELOCK_LEDGERS);
 
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&admin, &pid),
             Err(Ok(RegistryError::InsufficientStake)),
         );
         assert_solvency(&env, &client, &token_id);
@@ -5456,7 +5526,7 @@ mod test {
         advance_ledger(&env, TIMELOCK_LEDGERS);
 
         assert_eq!(
-            client.try_execute_proposal(&pid),
+            client.try_execute_proposal(&admin, &pid),
             Err(Ok(RegistryError::ContractBalanceInsufficient)),
         );
         // No side-effects: stake, history and lock are all untouched.
@@ -5907,7 +5977,7 @@ mod test {
         advance_ledger(&env, TIMELOCK_LEDGERS);
 
         token.set_failing(&true);
-        assert!(client.try_execute_proposal(&pid).is_err());
+        assert!(client.try_execute_proposal(&admin, &pid).is_err());
 
         // No stake debited, no slash recorded, no withdraw lock applied, and
         // — although `execute_proposal` marks the proposal executed before
@@ -5921,7 +5991,7 @@ mod test {
         assert_accounting_matches_token(&client, &token, &[&target]);
 
         token.set_failing(&false);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&admin, &pid);
         assert_eq!(client.get_stake(&target), 600);
         assert_eq!(client.get_slashes(&target).len(), 1);
         assert_eq!(token.balance(&treasury), 400);
@@ -5952,7 +6022,7 @@ mod test {
         client.deactivate(&owner_b, &b);
 
         token.set_failing(&true);
-        assert!(client.try_execute_proposal(&pid).is_err());
+        assert!(client.try_execute_proposal(&admin, &pid).is_err());
         assert!(client.try_withdraw_stake(&owner_b, &b).is_err());
 
         assert_eq!(client.get_stake(&a), 500);
@@ -7200,7 +7270,7 @@ mod test {
         let pid = client.propose_remove_admin(&a1, &a2);
         client.approve_proposal(&a1, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        let res = client.try_execute_proposal(&pid);
+        let res = client.try_execute_proposal(&a1, &pid);
         assert_eq!(res, Err(Ok(RegistryError::AdminSetTooSmall)));
     }
 
@@ -7245,7 +7315,7 @@ mod test {
         let a2 = client.get_admins().get(1).unwrap();
         client.approve_proposal(&a2, &pid);
         advance_ledger(&env, TIMELOCK_LEDGERS);
-        client.execute_proposal(&pid);
+        client.execute_proposal(&a1, &pid);
         assert!(client.is_verified(&target));
 
         // Now that it is verified, proposing true should fail.
