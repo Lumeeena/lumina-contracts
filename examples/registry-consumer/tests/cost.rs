@@ -122,6 +122,7 @@ struct Fixture {
 /// Resources a transaction used, in the units the host meters. These are the
 /// same numbers the network turns into a fee: instructions, memory, and the
 /// ledger entries the transaction had to open.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct Cost {
     instructions: i64,
@@ -241,7 +242,7 @@ fn cross_contract_reads_are_measured_and_priced_in_the_readme() {
     let (scan, active) = measure(&f, |env, probe| {
         probe_client(env, probe).read_active_contracts(&registry)
     });
-    assert!(active.len() >= 1);
+    assert!(!active.is_empty());
 
     // A second registration, so the scan has something more to walk. The
     // difference between the two scans is the marginal cost per entry.

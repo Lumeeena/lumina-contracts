@@ -22,7 +22,6 @@ const TYPE_PACKAGES: [(&str, &str, &[&str]); 1] = [(
     "../registry-v2/src/lib.rs",
     &["ContractEntry", "DataKey"],
 )];
-
 fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
@@ -80,6 +79,7 @@ fn type_body<'a>(source: &'a str, needle: &str) -> Option<&'a str> {
     if !after[..open].trim().is_empty() {
         return None;
     }
+
     let body = &after[open + 1..];
     let close = body.find('}')?;
     Some(&body[..close])
@@ -96,6 +96,7 @@ fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
+
         let line = line.trim_end_matches(',').trim_end();
         let (name_part, type_part) = line.split_once(':')?;
         let name = name_part.trim();
@@ -157,8 +158,8 @@ fn check_v2_types_in_sync() {
     let mut failed = false;
 
     for (canonical, duplicate, type_names) in TYPE_PACKAGES {
-        println!("cargo::rerun-if-changed={}", canonical);
-        println!("cargo::rerun-if-changed={}", duplicate);
+        println!("cargo::rerun-if-changed={canonical}");
+        println!("cargo::rerun-if-changed={duplicate}");
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
         let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
@@ -202,11 +203,10 @@ fn check_v2_types_in_sync() {
                 (None, None) => {}
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `struct {type_name}` in {}. \
+                        "cargo::warning=could not locate `struct {type_name}` in {duplicate}. \
                          The `registry-v2` fixture is supposed to duplicate this type. \
                          Update it (see the \"Upgrade fixture\" section in the README) \
                          or update TYPE_PACKAGES in build.rs if it was renamed.",
-                        duplicate,
                     );
                     failed = true;
                     continue;
@@ -240,29 +240,26 @@ fn check_v2_types_in_sync() {
                 }
                 (None, None) => {
                     println!(
-                        "cargo::warning=could not locate `{type_name}` in {}. \
-                         The `registry-v2` check needs this type to compare against {}. \
+                        "cargo::warning=could not locate `{type_name}` in {canonical}. \
+                         The `registry-v2` check needs this type to compare against {duplicate}. \
                          Update the check in build.rs if the type was renamed or moved.",
-                        canonical, duplicate,
                     );
                     failed = true;
                 }
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `pub enum {type_name}` in {}. \
+                        "cargo::warning=could not locate `pub enum {type_name}` in {duplicate}. \
                          The `registry-v2` fixture is supposed to duplicate this type. \
                          Update it (see the \"Upgrade fixture\" section in the README) \
                          or update TYPE_PACKAGES in build.rs if it was renamed.",
-                        duplicate,
                     );
                     failed = true;
                 }
                 (None, Some(_)) => {
                     println!(
-                        "cargo::warning=could not locate `{type_name}` in {}. \
-                         The `registry-v2` check needs this type to compare against {}. \
+                        "cargo::warning=could not locate `{type_name}` in {canonical}. \
+                         The `registry-v2` check needs this type to compare against {duplicate}. \
                          Update TYPE_PACKAGES in build.rs if it was renamed or moved.",
-                        canonical, duplicate,
                     );
                     failed = true;
                 }

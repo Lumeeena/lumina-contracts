@@ -1,9 +1,9 @@
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
-//! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
+//! Locks the contract's exported interface against accidental change.
 //!
-//! The interface — every exported function signature and every type and error
-//! code those functions expose — is what the indexer, the frontend and every
+//! Every public method on [`crate::LuminaRegistry`] is an on-chain interface
+//! that external consumers, off-chain indexers and the examples/registry-
 //! registrant bind to. A renamed parameter or a new argument is a breaking
 //! change for all of them, and without this test it only surfaces when
 //! something downstream fails.
@@ -29,9 +29,6 @@
 //! decode v1 storage, so if it drifts out of sync with the types it mirrors it
 //! quietly stops testing anything. When a storage type changes, update the
 //! fixture deliberately and regenerate its snapshot:
-//!
-//! 
-//!
 
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
 use std::path::PathBuf;
@@ -75,10 +72,6 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
 /// One line per exported item, sorted so that moving code around in `lib.rs`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
-///
-/// Delegation entry points (`set_manager`, `manager`, `revoke_manager`) are
-/// rendered like any other exported function so that adding or removing them
-/// is caught by the snapshot check.
 fn render_interface(entries: &[ScSpecEntry]) -> String {
     let mut lines: Vec<String> = entries
         .iter()

@@ -117,7 +117,7 @@ fn load_spec() -> Spec {
                     None => String::new(),
                 };
                 spec.functions
-                    .insert(f.name.to_utf8_string_lossy(), format!("({}){}", args, ret));
+                    .insert(f.name.to_utf8_string_lossy(), format!("({args}){ret}"));
             }
             ScSpecEntry::UdtStructV0(s) => {
                 let fields = s
@@ -133,7 +133,7 @@ fn load_spec() -> Spec {
                     .collect::<Vec<_>>()
                     .join(", ");
                 spec.structs
-                    .insert(s.name.to_utf8_string_lossy(), format!("{{{}}}", fields));
+                    .insert(s.name.to_utf8_string_lossy(), format!("{{{fields}}}"));
             }
             // No value enums exist on this contract: a payload-free
             // `#[contracttype] enum` is emitted as a union of void cases, and
@@ -189,7 +189,7 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 31] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 34] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
@@ -206,11 +206,7 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 31] = [
         "category: Category, offset: U32, limit: U32",
         "Vec<ContractEntry>",
     ),
-    (
-        "get_active_category_count",
-        "category: Category",
-        "U32",
-    ),
+    ("get_active_category_count", "category: Category", "U32"),
     (
         "get_contracts_by_categories",
         "categories: Vec<Category>, offset: U32, limit: U32",
@@ -275,6 +271,21 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 31] = [
     (
         "get_contracts_by_owner",
         "owner: Address, offset: U32, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_active_contracts_after",
+        "cursor: Option<Address>, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_contracts_by_category_after",
+        "category: Category, cursor: Option<Address>, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_contracts_by_owner_after",
+        "owner: Address, cursor: Option<Address>, limit: U32",
         "Vec<ContractEntry>",
     ),
 ];

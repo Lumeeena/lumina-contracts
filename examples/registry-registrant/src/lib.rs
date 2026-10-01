@@ -16,8 +16,7 @@
 
 use lumina_registry_interface::Category;
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, String,
-    Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, String, Vec,
 };
 
 #[contractclient(name = "RegistryClient")]

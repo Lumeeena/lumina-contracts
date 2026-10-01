@@ -189,6 +189,17 @@ pub trait RegistryInterface {
         limit: u32,
     ) -> Vec<ContractEntry>;
 
+    /// Cursor form of `get_active_contracts_by_category`, for walking a whole
+    /// category without re-reading it page by page. `cursor` is the
+    /// `contract_id` last returned, or `None` to start; the position is stable
+    /// against registrations added mid-walk.
+    fn get_contracts_by_category_after(
+        env: Env,
+        category: Category,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
+
     /// Count of currently active registrations in a category.
     ///
     /// Walks the category index and counts entries that still load and are
@@ -304,8 +315,19 @@ pub trait RegistryInterface {
     /// One page of active registrations in registration order.
     ///
     /// `offset` indexes the raw index, so a page can come back shorter than
-    /// `limit` while more active registrations follow. See the trait docs.
+    /// `limit` while more active registrations follow. Deprecated in favour of
+    /// `get_active_contracts_after`; see the trait docs.
     fn get_active_contracts(env: Env, offset: u32, limit: u32) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_active_contracts`. Pass the `contract_id` of the
+    /// last entry the previous call returned (or `None` to start) and walk
+    /// until an empty page. Cheaper than offset paging and stable against
+    /// registrations added mid-walk.
+    fn get_active_contracts_after(
+        env: Env,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
 
     /// As `get_active_contracts`, but only the addresses. Cheaper to decode
     /// and much smaller to return, for a consumer that does not read the
@@ -320,10 +342,20 @@ pub trait RegistryInterface {
     fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
 
     /// Every contract registered by `owner`, **including** deactivated ones.
+    /// Deprecated in favour of `get_contracts_by_owner_after`.
     fn get_contracts_by_owner(
         env: Env,
         owner: Address,
         offset: u32,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_contracts_by_owner`, including deactivated entries.
+    /// `cursor` is the `contract_id` last returned, or `None` to start.
+    fn get_contracts_by_owner_after(
+        env: Env,
+        owner: Address,
+        cursor: Option<Address>,
         limit: u32,
     ) -> Vec<ContractEntry>;
 }
@@ -412,16 +444,14 @@ pub enum RegistryError {
     AlreadyVerified = 34,
     /// Staking is already configured with the proposed token and treasury.
     StakingAlreadyConfigured = 35,
-    /// The caller is neither the registered owner nor the owner-appointed manager.
-    NotManager = 36,
     /// Input validation failed.
-    InvalidInput = 37,
+    InvalidInput = 36,
     /// The specified slash record does not exist (invalid index).
-    SlashNotFound = 38,
+    SlashNotFound = 37,
     /// This slash already has a response attached.
-    ResponseAlreadyExists = 39,
+    ResponseAlreadyExists = 38,
     /// The contract's token balance is lower than total tracked stake.
-    ContractBalanceInsufficient = 40,
+    ContractBalanceInsufficient = 39,
 }
 
 /// Byte-compatible with `lumina_registry::Category`.
@@ -447,6 +477,18 @@ pub enum Category {
     /// Anything the vocabulary does not cover yet.
     Other,
 }
+
+/// The maximum number of categories a single registration may claim.
+///
+/// The [`Category`] vocabulary is the natural upper bound, but relying on its
+/// size means the limit silently changes every time a category is added. This
+/// constant makes the cap explicit and independent of the enum's growth.
+///
+/// A registration that claims every category is not categorised in any useful
+/// sense — it is spam in a discovery surface. Claiming more than this cap is
+/// rejected with [`RegistryError::TooManyCategories`] rather than silently
+/// truncated.
+pub const MAX_CATEGORIES_PER_CONTRACT: u32 = 5;
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
 #[contracttype]
@@ -606,3 +648,10 @@ pub enum ProposalAction {
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
 }
+
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_UPGRADE: u32 = 17_280;
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_ADMIN: u32 = 17_280;
+/// Number of ledgers a proposal of a given action must wait before execution.
+pub const TIMELOCK_LEDGERS_STANDARD: u32 = 720;

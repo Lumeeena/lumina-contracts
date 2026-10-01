@@ -214,8 +214,7 @@ fn multiple_contracts_can_register() {
     // Deploy three different contracts
     let protocol_a = f.deploy_example("Protocol A", "First protocol", &[Category::DeFi]);
     let protocol_b = f.deploy_example("Protocol B", "Second protocol", &[Category::Payments]);
-    let protocol_c =
-        f.deploy_example("Protocol C", "Third protocol", &[Category::Infrastructure]);
+    let protocol_c = f.deploy_example("Protocol C", "Third protocol", &[Category::Infrastructure]);
 
     // All should be in the registry
     let registry = f.registry_client();
@@ -274,15 +273,14 @@ fn deployment_emits_event() {
 
     // Check that the contract emitted its deployment event
     let events = f.env.events().all();
-    let contract_events: std::vec::Vec<_> =
-        events.iter().filter(|e| e.0 == example).collect();
+    let contract_events: std::vec::Vec<_> = events.iter().filter(|e| e.0 == example).collect();
 
     // Should have emitted at least one event from the example contract
     assert!(!contract_events.is_empty());
 
     // The last event should be our custom "contract_deployed" event
     let last_event = contract_events.last().unwrap();
-    let topics: Vec<soroban_sdk::Val> = last_event.1.clone().into();
+    let topics: Vec<soroban_sdk::Val> = last_event.1.clone();
 
     // Verify the event topic matches
     assert_eq!(topics.len(), 1);

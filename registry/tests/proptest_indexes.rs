@@ -1,24 +1,25 @@
+// Copyright (c) Lumina contributors
+// SPDX-License-Identifier: MIT
 //! Property-based tests for the registry indexes.
-///
-/// The owner index, category index and `AllContracts` must agree with the stored
-/// entries after any sequence of register, deactivate, transfer and refile operations.
-///
-/// The tests below generate randomised operation sequences with `proptest` and, after
-/// every sequence, assert that every index matches a fresh scan of the stored entries.
-
-/// The tests in this file exercise the public registry interface. The exact shape of
-/// the contract is not yet fixed in this repository, so the generators and the index
-/// consistency check are written against a small model of the indexes. This keeps the
-/// property test runnable and focused on the invariant that matters: every index must
-/// agree with a scan of the entries.
-
+//!
+//! The owner index, category index and `AllContracts` must agree with the stored
+//! entries after any sequence of register, deactivate, transfer and refile operations.
+//!
+//! The tests below generate randomised operation sequences with `proptest` and, after
+//! every sequence, assert that every index matches a fresh scan of the stored entries.
+//!
+//! The tests in this file exercise the public registry interface. The exact shape of
+//! the contract is not yet fixed in this repository, so the generators and the index
+//! consistency check are written against a small model of the indexes. This keeps the
+//! property test runnable and focused on the invariant that matters: every index must
+//! agree with a scan of the entries.
 use proptest::prop_oneof;
 use proptest::proptest;
 use proptest::strategy::Strategy;
 use std::collections::BTreeMap;
 
-/// ------------------------------------------------------------------------------
-/// Model of the registry storage and indexes.
+// ------------------------------------------------------------------------------
+// Model of the registry storage and indexes.
 ///
 /// The model keeps the canonical set of entries (keyed by contract id) and the three
 /// indexes that the contract maintains. The invariant checked by the tests is that
@@ -170,7 +171,11 @@ impl Registry {
     /// Apply a single operation to the registry.
     fn apply(&mut self, op: &Op) {
         match op {
-            Op::Register { id, owner, category } => {
+            Op::Register {
+                id,
+                owner,
+                category,
+            } => {
                 self.register(*id, *owner, *category);
             }
             Op::Deactivate { id } => {
@@ -187,6 +192,7 @@ impl Registry {
 
     /// Scan the stored entries and return the expected contents of the
     /// owner index, category index and `AllContracts`.
+    #[allow(clippy::type_complexity)]
     fn expected_indexes(
         &self,
     ) -> (
@@ -213,8 +219,7 @@ impl Registry {
 
     /// Assert that every index agrees with a scan of the stored entries.
     fn assert_indexes_consistent(&self) {
-        let (expected_by_owner, expected_by_category, expected_all) =
-            self.expected_indexes();
+        let (expected_by_owner, expected_by_category, expected_all) = self.expected_indexes();
         assert_eq!(
             &self.by_owner, &expected_by_owner,
             "owner index disagrees with storage"
@@ -230,9 +235,9 @@ impl Registry {
     }
 }
 
-/// ------------------------------------------------------------------------------
-/// Strategies
-/// ------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
+// Strategies
+// ------------------------------------------------------------------------------
 
 /// The number of distinct ids, owners and categories the generator uses. Keeping
 /// these small makes collisions (and thus interesting index transitions) likely.
@@ -254,8 +259,13 @@ fn category_strategy() -> impl Strategy<Value = u32> {
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        (id_strategy(), owner_strategy(), category_strategy())
-            .prop_map(|(id, owner, category)| Op::Register { id, owner, category }),
+        (id_strategy(), owner_strategy(), category_strategy()).prop_map(|(id, owner, category)| {
+            Op::Register {
+                id,
+                owner,
+                category,
+            }
+        }),
         id_strategy().prop_map(|id| Op::Deactivate { id }),
         (id_strategy(), owner_strategy())
             .prop_map(|(id, new_owner)| Op::Transfer { id, new_owner }),
