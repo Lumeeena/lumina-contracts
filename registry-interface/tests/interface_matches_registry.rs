@@ -181,11 +181,12 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 34] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
     ("get_threshold", "", "Result<U32, RegistryError>"),
+    ("get_slash_threshold", "", "Result<U32, RegistryError>"),
     (
         "get_proposal",
         "proposal_id: U32",
