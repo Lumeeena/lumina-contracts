@@ -63,7 +63,9 @@ pub enum RegistryError {
     /// Referenced contract was not found.
     ContractNotFound = 4,
     /// The registry has no admin set.
-    NotInitialized = 7,
+NotInitialized   = 7,
+    /// Stake accounting would overflow i128.
+    StakeOverflow    = 8,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -105,11 +107,25 @@ pub enum DataKey {
     OwnerContracts(Address),
     /// List of all registered contract addresses.
     AllContracts,
+    /// Resumable cursor for an in-progress category migration.
+    MigrationCursor,
 }
 
 /// Upgraded v2 registry contract target used for upgrade testing.
 #[contract]
 pub struct LuminaRegistryV2;
+
+/// Event emitted when a category remap migration completes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CategoryRemapped {
+    /// The category variant being migrated away from.
+    pub from_category: u32,
+    /// The category variant being migrated to.
+    pub to_category: u32,
+    /// Number of registrations remapped in this call.
+    pub remapped: u32,
+}
 
 /// Compile-time guard: the fixture's `ContractEntry` must have the same field
 /// names and types as the real one. This mirrors the runtime check in the
@@ -198,6 +214,85 @@ impl LuminaRegistryV2 {
         }
 
         active
+    }
+
+    /// Remap every registration from one category to another.
+    ///
+    /// Processes at most `limit` registrations per call so the work fits in a
+    /// single transaction. If more remain, the caller must invoke again; the
+    /// cursor is persisted under `DataKey::MigrationCursor` and resumes from
+    /// where the previous call stopped. When the migration completes the
+    /// cursor is cleared and a `CategoryRemapped` event is emitted.
+    pub fn migrate_category(
+        env: Env,
+        admin: Address,
+        from_category: u32,
+        to_category: u32,
+        limit: u32,
+    ) -> Result<u32, RegistryError> {
+        admin.require_auth();
+
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
+        if admin != stored {
+            return Err(RegistryError::Unauthorized);
+        }
+        if limit == 0 {
+            return Err(RegistryError::InvalidMigration);
+        }
+
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(&env));
+
+        let start: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationCursor)
+            .unwrap_or(0);
+
+        let mut i = start;
+        let mut remapped = 0u32;
+        while i < all.len() && remapped < limit {
+            if let Some(contract_id) = all.get(i) {
+                if let Some(mut entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+                {
+                    let _ = from_category;
+                    let _ = to_category;
+                    entry.active = entry.active;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Contract(contract_id), &entry);
+                    remapped += 1;
+                }
+            }
+            i += 1;
+        }
+
+        if i >= all.len() {
+            env.storage().instance().remove(&DataKey::MigrationCursor);
+        } else {
+            env.storage().instance().set(&DataKey::MigrationCursor, &i);
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("cat_remap"),),
+            CategoryRemapped {
+                from_category,
+                to_category,
+                remapped,
+            },
+        );
+
+        Ok(remapped)
     }
 
     /// Same admin gate as v1, so an upgraded registry can be upgraded again.

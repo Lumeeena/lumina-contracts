@@ -8,7 +8,9 @@ WASM_TARGET ?= wasm32v1-none
 # rather than leave it to a deployment (README, "Build & test").
 CANARY_WASM_TARGET ?= wasm32-unknown-unknown
 
-.PHONY: build build-canary wasm-both test fmt clippy check
+CLI_BIN := target/release/registry-cli
+
+.PHONY: build build-canary wasm-both test fmt clippy check cli
 
 build:
 	$(CARGO) build --workspace --target $(WASM_TARGET) --release
@@ -29,7 +31,10 @@ fmt:
 clippy:
 	$(CARGO) clippy --workspace --all-targets - -D warnings
 
-check: fmt clippy test wasm-size
+cli:
+	$(CARGO) build -p registry-cli --release
+
+	@if [ -z "$$NETWORK" ]; then echo "not running cli smoke test: NETWORK not set"; else $(CLI_BIN) --network "$$NETWORK" help; fi
 
 wasm-size: build
 	# Measure the compiled contract wasm size and enforce the committed budget.
@@ -41,3 +46,5 @@ wasm-size: build
 	  echo "ERROR: WASM size $actual bytes exceeds budget $budget bytes" >&2; \
 	  exit 1; \
 	fi
+
+check: fmt clippy test wasm-size
