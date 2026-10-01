@@ -19,16 +19,8 @@
 //! ```bash
 //! cargo build --target wasm32v1-none --release && UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
 //! ```
-//!
 //! then commit `registry/interface.snap` alongside the change so the diff is
 //! reviewed with it.
-//!
-//! This file also guards the `registry-v2` upgrade fixture, a hand-maintained
-//! copy of the storage types that must stay byte-compatible with the real ones.
-//! The fixture's whole value is proving that independently written v2 types
-//! decode v1 storage, so if it drifts out of sync with the types it mirrors it
-//! quietly stops testing anything. When a storage type changes, update the
-//! fixture deliberately and regenerate its snapshot:
 
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
 use std::path::PathBuf;
@@ -69,7 +61,7 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
     }
 }
 
-/// One line per exported item, sorted so that moving code around in `lib.rs`
+/// One line per exported item, sorted so that moving code around in `lib.r`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
 fn render_interface(entries: &[ScSpecEntry]) -> String {

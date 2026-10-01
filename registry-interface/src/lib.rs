@@ -1,5 +1,7 @@
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
+// Copyright (c) Lumina contributors
+// SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
 // `#[contractclient]` macros emit synthetic items — the `SPEC` constants, the
@@ -23,7 +25,7 @@
 //!
 //! This crate is the third option: a declared trait covering the registry's
 //! read-only surface, and the [`RegistryInterfaceClient`] that
-//! [`soroban_sdk::contractclient`] generates from it.
+//! [scoroban_sdk::contractclient] generates from it.
 //!
 //! ```no_run
 //! use lumina_registry_interface::RegistryInterfaceClient;
@@ -42,13 +44,13 @@
 //! [`ContractEntry`], [`Category`], [`Reputation`] and friends are deliberately
 //! *duplicated* from `lumina-registry` rather than re-exported from it. A
 //! dependency edge on the contract crate would drag the registry's entire
-//! `#[contractimpl]` — every exported entrypoint and its spec — into every
+//! `[contractimpl]` — every exported entrypoint and its spec — into every
 //! consumer's wasm, which is both a size problem and a link problem: two
-//! `#[contractimpl]`s exporting the same symbol do not coexist. `registry-v2`
+//! `[contractimpl]` exporting the same symbol do not coexist. `registry-v2`
 //! does the same thing for the same reason, and says so at length.
 //!
-//! The duplication is a real risk — the two declarations could drift — so it
-//! is *tested* rather than trusted. `tests/interface_matches_registry.rs` reads
+//! The duplication is a real risk — the two declarations could drift — so
+//! it is *tested* rather than trusted. `tests/interface_matches_registry.rs` reads
 //! the registry's compiled spec out of its wasm and asserts that every
 //! function, type and error code declared here matches what the contract
 //! actually exports. Run against a changed registry, it fails with the
@@ -65,13 +67,13 @@
 //!
 //! - a fixed instruction charge for the call itself, before the callee runs
 //!   any code;
-//! - every ledger entry the callee touches, at the callee's TVL — the registry
+//! - every ledger entry the callee touches, at the callee's TUL — the registry
 //!   stores registrations in `persistent` entries, so a read is a persistent
 //!   entry read, which is the expensive kind;
 //! - a fresh 1 MiB memory allocation for the callee's frame, and the memory
 //!   cost of decoding the arguments you passed in and the result you get back.
 //!
-//! The practical consequence: **number of calls is what you pay for.** Two
+//! The practical consequence: ** the number of calls is what you pay for.** Two
 //! `is_*` calls cost strictly more than one `get_contract_profile` that returns
 //! both facts, and a loop over counterparties multiplies the fixed per-call
 //! charge every iteration. The `examples/registry-consumer` crate measures this
@@ -223,19 +225,23 @@ pub trait RegistryInterface {
         limit: u32,
     ) -> Result<Vec<ContractEntry>, RegistryError>;
 
-    /// `(stake_token, treasury)`, or `StakingNotConfiguree` if governance
-    /// has not opened staking yet.
+/// `(stake_token, treasury)`, or `StakingNotConfigured` if governance has
+    /// not opened staking yet.
     fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError>;
 
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
 
-    /// The stake a registration has to hold to stay listed. Zero means the
+/// The stake a registration has to hold to stay listed. Zero means the
     /// threshold is not open — nothing is refused for being under-staked.
     fn get_minimum_stake(env: Env) -> i128;
 
-    /// Currently staked balance. Zero for a registration that never staked,
+    /// Total currently staked balance for a registration — the sum of every
+    /// staker's contribution. Zero for a registration that never staked,
     /// and zero — not an error — for an address that was never registered.
+    ///
+    /// This is the aggregate across all stakers. To read a single staker's
+    /// contribution, use `get_stake_of`.
     fn get_stake(env: Env, contract_id: Address) -> i128;
 
     /// Whether governance has attested this registration. False, not an error,
@@ -273,7 +279,7 @@ pub trait RegistryInterface {
 
     /// The full reputation signal for a registration. Returns zeroed values
     /// rather than erroring for an unregistered address, matching
-    /// `is_registered`'s tolerance.
+    /// `is_registered`s tolerance.
     fn get_reputation(env: Env, contract_id: Address) -> Reputation;
 
     /// A registration joined with its reputation — one call instead of
@@ -341,6 +347,14 @@ pub trait RegistryInterface {
     /// As `get_active_profiles`, plus `has_more`.
     fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
 
+    /// Returns active registrations ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_contracts_by_stake(env: Env, offset: u32, limit: u32) -> ContractPage;
+
+    /// Returns active profiles ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_profiles_by_stake(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
+
     /// Every contract registered by `owner`, **including** deactivated ones.
     /// Deprecated in favour of `get_contracts_by_owner_after`.
     fn get_contracts_by_owner(
@@ -358,6 +372,17 @@ pub trait RegistryInterface {
         cursor: Option<Address>,
         limit: u32,
     ) -> Vec<ContractEntry>;
+
+    /// Registrations whose normalised name starts with `prefix`, up to `limit`.
+    ///
+    /// Matching is case-insensitive: both the stored name and `prefix` are
+    /// lowercased before comparison. An unmatched prefix returns an empty
+    /// list rather than erroring.
+    ///
+    /// On-chain prefix matching is deliberately limited to a prefix scan over
+    /// the name index; anything richer (substring, fuzzy, ranked) belongs in
+    /// the indexer, not in the contract.
+    fn find_by_name_prefix(env: Env, prefix: String, limit: u32) -> Vec<ContractEntry>;
 }
 
 /// Errors the registry's read-only surface can return.
@@ -452,6 +477,8 @@ pub enum RegistryError {
     ResponseAlreadyExists = 38,
     /// The contract's token balance is lower than total tracked stake.
     ContractBalanceInsufficient = 39,
+    /// The stake arithmetic would overflow i128.
+    StakeOverflow = 40,
 }
 
 /// Byte-compatible with `lumina_registry::Category`.
@@ -479,15 +506,6 @@ pub enum Category {
 }
 
 /// The maximum number of categories a single registration may claim.
-///
-/// The [`Category`] vocabulary is the natural upper bound, but relying on its
-/// size means the limit silently changes every time a category is added. This
-/// constant makes the cap explicit and independent of the enum's growth.
-///
-/// A registration that claims every category is not categorised in any useful
-/// sense — it is spam in a discovery surface. Claiming more than this cap is
-/// rejected with [`RegistryError::TooManyCategories`] rather than silently
-/// truncated.
 pub const MAX_CATEGORIES_PER_CONTRACT: u32 = 5;
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -546,6 +564,8 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Whether the registration is currently withdrawal-locked.
+    pub withdraw_locked: bool,
 }
 
 /// Byte-compatible with `lumina_registry::ContractProfile`.
@@ -558,6 +578,10 @@ pub struct ContractProfile {
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Optional URI pointing at richer off-chain metadata.
+    pub metadata_uri: Option<String>,
+    /// The Unix timestamp of when the contract was registered, or 0 if legacy.
+    pub registered_at_ts: u64,
 }
 
 /// Byte-compatible with `lumina_registry::ContractPage`.
@@ -647,6 +671,8 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Remap every registration from one category to another: `(from, to)`.
+    MigrateCategory(Category, Category),
 }
 
 /// Number of ledgers a proposal of a given action must wait before execution.

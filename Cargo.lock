@@ -887,30 +887,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lumina-registry-consumer-example"
-version = "0.1.0"
-dependencies = [
- "lumina-registry-interface",
- "soroban-sdk",
-]
-
-[[package]]
-name = "lumina-registry-interface"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
- "soroban-spec",
-]
-
-[[package]]
-name = "lumina-registry-registrant-example"
-version = "0.1.0"
-dependencies = [
- "lumina-registry-interface",
- "soroban-sdk",
-]
-
-[[package]]
 name = "lumina-registry-v2"
 version = "0.1.0"
 dependencies = [
