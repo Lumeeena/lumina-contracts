@@ -73,6 +73,7 @@ temporary storage.
 | `Verified(contract_id)` | governance trust signal | Changed only by an executed proposal. |
 | `Slashes(contract_id)` | ordered `SlashRecord` history | Appended on slash and deliberately retained after deregistration. |
 | `WithdrawLockedUntil(contract_id)` | ledger sequence | Prevents immediate withdrawal of remaining collateral after a slash. |
+| `UnbondingUntil(contract_id)` | ledger sequence | Set by `request_unbond`; `withdraw_stake` refuses until it elapses. |
 | `Allowlisted(owner)` | admission flag | Consulted only when allowlist mode is enabled. |
 | `RegistrationWindow(owner)` | window start and count | Fixed-window registration rate accounting; its TTL is extended to the configured window. |
 | `Tags(contract_id)` | bounded normalized tags | Owner-managed discovery metadata. |
@@ -93,6 +94,16 @@ first builds a deduplicated union of active entries and then applies `offset`
 and `limit` to that filtered union. `get_contracts_by_owner` also differs: it
 resolves the owner's ordered index without active filtering and therefore
 includes inactive registrations.
+
+The cursor variants — `get_active_contracts_after`,
+`get_contracts_by_category_after` and `get_contracts_by_owner_after` — walk the
+same indexes but resume from the id of the last entry returned instead of a
+numeric offset. They are the recommended way to page a whole list: an offset
+walk re-reads everything before its position on every page, and an insertion
+mid-walk shifts every later page, whereas a cursor is anchored to a
+registration, so entries added while walking are appended and never duplicate
+or skip one already returned. The offset entrypoints are retained for one
+release and documented as deprecated.
 
 ## Registration lifecycle
 
@@ -151,6 +162,11 @@ sets `ready_at` once; it does not execute the action. After the timelock,
 `execute_proposal` is permissionless so execution cannot be withheld by the
 admin set after it has approved the action.
 
+The timelock is per-action rather than a single constant. Each `ProposalAction`
+maps to a duration in `TIMELOCK_LEDGERS`, so a proposal's `ready_at` is set to
+`current ledger + TIMELOCK_LEDGERS(action)` when the threshold is reached.
+`get_proposal` exposes the action's timelock so a UI can show the wait.
+
 Proposal actions cover:
 
 - deactivation and wasm upgrade;
@@ -160,15 +176,35 @@ Proposal actions cover:
 - allowlist, registration rate limit, registration fee, and minimum stake;
 - treasury withdrawal.
 
+The chosen durations are constants, not magic numbers inline, and are grouped
+by risk:
+
+- `Upgrade` and admin-set changes (`AddAdmin`, `RemoveAdmin`,
+  `ChangeThreshold`) keep the long window (`LONG_TIMELOCK_LEDGERS`, 17,280
+  ledgers, approximately 28.8 hours at six seconds per ledger). These change
+  the contract's code or who controls it, so they are the most dangerous
+  actions and must wait the longest.
+- `SetStakeToken`, `SetTreasury`, `SetMinimumStake`, `SetAllowlist`,
+  `SetRegistrationRateLimit`, and `SetRegistrationFee` use a medium window
+  (`MEDIUM_TIMELOCK_LEDGERS`, 5,760 ledgers, approximately 9.6 hours). They
+  change policy or configuration but not code or control, so a shorter wait is
+  safe.
+- `Deactivate`, `SetVerified`, `Slash`, and `WithdrawTreasury` use a short
+  window (`SHORT_TIMELOCK_LEDGERS`, 1,440 ledgers, approximately 2.4 hours).
+  They are routine governance operations with bounded, reversible, or
+  already-constrained effects.
+
+Two proposals of different kinds therefore become executable at different
+times.
+
 Execution checks the threshold and timelock again, marks the proposal executed
 before applying external effects, and relies on Soroban transaction atomicity:
 if an action or token transfer fails, the executed flag and every other write
 from that invocation roll back. Admin-removal and threshold actions also
 validate that the resulting threshold remains satisfiable.
 
-The production timelock is 17,280 ledgers (approximately 28.8 hours at six
-seconds per ledger). Tests use 10 ledgers so they can exercise boundaries
-without archiving fixture storage.
+The production timelocks are the per-action constants above. Tests use 10
+ledgers so they can exercise boundaries without archiving fixture storage.
 
 ## Staking, verification, and slashing
 
@@ -202,8 +238,21 @@ inactive + unlocked + owner -- withdraw --> owner
   from the registry to the treasury, decreases tracked stake, appends a reason
   and ledger to slash history, and locks the remainder for
   `SLASH_LOCK_LEDGERS`.
+- `request_unbond` is an owner action on a deactivated registration. It starts
+  the unbonding timer by writing `UnbondingUntil(contract_id)`.
 - `withdraw_stake` returns the entire remainder only to the owner, only after
-  deactivation, and only after the post-slash lock expires.
+  deactivation, only after the post-slash lock expires, and only after the
+  unbonding period elapses.
+
+The unbonding period exists to close the withdrawal race against governance.
+The slash lock only stops withdrawal *after* a slash lands, so an owner who
+sees a slash coming could otherwise deactivate and withdraw before a proposal
+finishes its timelock. `UNBONDING_LEDGERS` must therefore exceed
+`TIMELOCK_LEDGERS`; if it does not, the window reopens and the queue provides
+no protection. That relationship is asserted by a test rather than the literal
+numbers, so the two constants can be retuned together without silently
+inverting the ordering. A view exposes when unbonding completes so indexers
+and the frontend can display the remaining wait.
 
 The internal bookkeeping invariant across staking transitions is:
 
@@ -231,11 +280,13 @@ properties it checks, with representative test names for quick navigation:
 | Invariant | Representative tests |
 | --- | --- |
 | A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
+| Proposals of different actions become executable at different times. | `different_actions_have_different_timelocks`, `get_proposal_exposes_action_timelock` |
 | Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
 | Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
 | Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |
 | Category membership is non-empty and deduplicated, and category changes do not affect reputation. | `registration_requires_at_least_one_category`, `duplicate_categories_are_collapsed`, `categories_and_reputation_are_independent` |
 | In isolated staking flows, tracked stake equals the registry token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
+| Withdrawal is refused until the unbonding period elapses, and the unbonding period exceeds the governance timelock. | `withdraw_before_unbonding_period_is_refused`, `unbonding_period_exceeds_governance_timelock` |
 | Verification is governance-only and independent from self-service attestations. | `a_registrant_cannot_verify_their_own_contract`, `attesting_does_not_affect_governance_only_verification`, `attesting_does_not_grant_verification_or_privilege_to_the_attester` |
 | Deregistration removes live indexes and state only after safe exit, while retaining slash history and lifetime totals. | `deregister_requires_deactivated_and_unstaked`, `deregister_removes_every_index_reference_and_decrements_the_live_count`, `deregister_keeps_slash_history_for_audit`, `contract_count_is_live_and_total_registered_is_lifetime` |
 | Code upgrades preserve compatible storage and authentication. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_carries_admin_across_swap`, `upgraded_registry_can_be_rolled_back` |
