@@ -14,6 +14,12 @@
 //! `registry/interface.snap`. Doc comments are left out: rewording one is not
 //! an interface change.
 //!
+//! The exported interface also includes the `Category` enum and the
+//! `MAX_CATEGORIES_PER_CONTRACT` cap: a registration may claim at most that
+//! many categories, and claiming more is rejected with `TooManyCategories`.
+//! The cap is deliberately smaller than the vocabulary so that a registration
+//! claiming every category is rejected rather than silently truncated.
+//!
 //! To accept an intended change, rebuild the wasm and regenerate the snapshot:
 //!
 //! ```bash
@@ -209,6 +215,19 @@ fn exported_interface_matches_snapshot() {
         );
     }
 
+    // The unbonding surface is part of the exported interface: an owner must
+    // be able to start an unbonding timer and observe when it completes, and
+    // `withdraw_stake` must refuse until it elapses. Any change to these
+    // signatures is a breaking change and must be reviewed alongside
+    // `registry/interface.snap`.
+    for expected_fn in ["request_unbond", "unbonding_completes_at"] {
+        assert!(
+            actual.contains(&format!("fn {expected_fn}(")),
+            "unbonding entry point `{expected_fn}` is missing from the exported interface; \
+             the unbonding queue must remain part of the contract spec"
+        );
+    }
+
     let snap_path = manifest_path(&["interface.snap"]);
     if std::env::var_os(UPDATE_ENV).is_some() {
         std::fs::write(&snap_path, &actual).expect("write interface snapshot");
@@ -300,6 +319,8 @@ fn reentrant_token_cannot_withdraw_twice() {
     token.init(&registry_id, &staker, &1_000);
 
     registry.stake(&staker, &token_id, &1_000);
+    // The unbonding period must elapse before the stake can be withdrawn.
+    registry.request_unbond(&staker);
     // The reentrant call inside `transfer` must not have succeeded in
     // withdrawing a second time; the original withdrawal stands.
     registry.withdraw_stake(&staker, &1_000);
