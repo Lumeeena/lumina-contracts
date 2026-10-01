@@ -7,7 +7,7 @@
 /// every sequence, assert that every index matches a fresh scan of the stored entries.
 
 /// The tests in this file exercise the public registry interface. The exact shape of
-./// the contract is not yet fixed in this repository, so the generators and the index
+/// the contract is not yet fixed in this repository, so the generators and the index
 /// consistency check are written against a small model of the indexes. This keeps the
 /// property test runnable and focused on the invariant that matters: every index must
 /// agree with a scan of the entries.
@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 /// every index agrees with a scan of the entries.
 /// ------------------------------------------------------------------------------
 
-#derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct Entry {
     id: u32,
     owner: u32,
@@ -34,7 +34,7 @@ struct Entry {
 }
 
 /// The operations that can be applied to the registry.
-#derive(Clone, Debug)]
+#[derive(Clone, Debug)]
 enum Op {
     Register { id: u32, owner: u32, category: u32 },
     Deactivate { id: u32 },
@@ -47,7 +47,7 @@ enum Op {
 /// The `by_id`, `by_owner`, `by_category` and `all` fields play the role of the
 /// contract's storage and indexes. The helper methods are the only way the tests
 /// mutate them, so the invariant check is meaningful.
-#derive(Default, Debug)]
+#[derive(Default, Debug)]
 struct Registry {
     by_id: BTreeMap<u32, Entry>,
     by_owner: BTreeMap<u32, BTreeMap<u32, Entry>>,

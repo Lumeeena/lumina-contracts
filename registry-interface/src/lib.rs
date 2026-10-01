@@ -149,7 +149,7 @@ use soroban_sdk::{contractclient, contracterror, contracttype, Address, Env, Str
 /// successful call's state mutations, so this ordering is the defense.
 /// See the crate-level docs for the full argument. Consumers that only
 /// read the registry are unaffected by any of this.
-[contractclient(name = "RegistryInterfaceClient")]
+#[contractclient(name = "RegistryInterfaceClient")]
 pub trait RegistryInterface {
     /// Which build of the registry is live at this address.
     fn get_version(env: Env) -> u32;
@@ -323,7 +323,7 @@ pub trait RegistryInterface {
 /// variant that is missing here turns a well-defined error into an opaque
 /// decode failure. `tests/interface_matches_registry.rs` pins the whole list
 /// against the contract's spec, so the two cannot drift.
-[contracterror]
+#[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
@@ -406,7 +406,7 @@ pub struct ContractEntry {
 /// The kind of action a proposal carries.
 ///
 /// Duplicated from `lumina-registry`.
-Ncontracttype]
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalAction {
     /// Add an admin.
@@ -476,7 +476,7 @@ pub struct ContractProfile {
 /// The reputation signal for a registration.
 ///
 /// Duplicated from `lumina-registry`.
-Ncontracttype]
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reputation {
     /// The current reputation score.
@@ -492,7 +492,7 @@ pub struct Reputation {
 /// Aggregate registry counters.
 ///
 /// Duplicated from `lumina-registry`.
-Ncontracttype]
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegistryStats {
     /// Lifetime registrations.
@@ -510,7 +510,7 @@ pub struct RegistryStats {
 /// A registration joined with its reputation.
 ///
 /// Duplicated from `lumina-registry`.
-Ncontracttype]
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
     /// The registration entry.
@@ -522,7 +522,7 @@ pub struct ContractProfile {
 /// A page of registration entries.
 ///
 /// Duplicated from `lumina-registry`.
-Ncontracttype]
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractPage {
     /// The entries in this page.

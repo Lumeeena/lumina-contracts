@@ -112,6 +112,9 @@ pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
 
+/// How many ledgers a registration stays valid before it must be renewed.
+pub const EXPIRY_LEDGERS: u32 = 17_280;
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 /// Errors returned by the Lumina Registry contract operations.
@@ -232,6 +235,14 @@ pub enum RegistryError {
     AlreadyVerified = 34,
     /// Staking is already configured with the proposed token and treasury.
     StakingAlreadyConfigured = 35,
+    /// Generic invalid input.
+    InvalidInput = 36,
+    /// The referenced slash record does not exist.
+    SlashNotFound = 37,
+    /// A response already exists for this slash record.
+    ResponseAlreadyExists = 38,
+    /// The contract's token balance is insufficient.
+    ContractBalanceInsufficient = 39,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -3362,7 +3373,7 @@ impl LuminaRegistry {
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
                     (Symbol::new(env, "staking_configured"),),
-                    (prev_token, prev_treasury, token_id, treasury),
+                    (token_id, treasury),
                 );
             }
             ProposalAction::SetVerified(contract_id, verified) => {
