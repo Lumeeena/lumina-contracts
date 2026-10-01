@@ -562,6 +562,8 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Remap every registration from one category to another: `(from, to)`.
+    MigrateCategory(Category, Category),
 }
 
 /// Fixed-window registration counter for one owner.

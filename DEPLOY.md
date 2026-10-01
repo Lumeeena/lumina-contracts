@@ -24,6 +24,13 @@ your own following the steps below.
 - [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) (`stellar`, formerly `soroban`)
 - A funded testnet identity
 
+### CLI configuration
+
+The CLI reads the network and contract id from config so they are not repeated
+per command. Create `lumina-registry.toml` in the working directory (or set
+`LUMINA_REGISTRY_CONFIG` to its path):
+
+
 ```bash
 stellar keys generate lumina-deployer --network testnet --fund
 ```

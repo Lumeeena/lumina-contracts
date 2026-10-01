@@ -28,7 +28,8 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `slash_response_added` | `(contract_id: Address, slash_index: u32, owner: Address)` | When a contract owner adds a response to a slash record. | History | TBD |
 | `verification_set` | `(contract_id: Address, verified: bool)` | When governance grants or revokes verified status for a contract. | History | `governance_can_attest_and_later_revoke_verification` |
 | `category_pruned` | `(category: String, removed: u32)` | When dead references in a category's index are cleaned up. | | `prune_category_drops_dead_references_and_is_safe_to_repeat` |
-| all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
+| `category_remapped` | `(old_category: String, new_category: String, migrated: u32, done: bool)` | When governance remaps one category to another across registrations. | Indexer, History | `migrate_category_moves_registrations_and_is_resumable` |
+| `all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
 | `registry_upgraded` | `(new_wasm_hash: BytesN<32>, version: u32)` | When the registry contract's WASM is upgraded. | | `upgrade_carries_admin_across_swap` |
 | `admin_added` | `(new_admin: Address,)` | When a new governance admin is added via executed proposal. | | `propose_add_admin_adds_a_new_admin` |
 | `admin_removed` | `(admin_to_remove: Address,)` | When a governance admin is removed via executed proposal. | | `propose_remove_admin_removes_the_admin` |
