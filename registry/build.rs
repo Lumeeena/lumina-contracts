@@ -10,7 +10,7 @@
 /// It also guards the hand-maintained `registry-v2` upgrade fixture: the
 /// duplicated v2 storage types must match the real ones field-for-field,
 /// otherwise the fixture silently stops testing anything.
-use std::path::PathBuf;
+ use std::path::PathBuf;
 
 const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
 
@@ -22,12 +22,9 @@ const TYPE_PACKAGES: [(&str, &str, &[&str]); 1] = [(
     "../registry-v2/src/lib.rs",
     &["ContractEntry", "DataKey"],
 )];
-
-fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
-        return;
     }
 
     check_fixtures();
@@ -80,6 +77,7 @@ fn type_body<'a>(source: &'a str, needle: &str) -> Option<&'a str> {
     if !after[..open].trim().is_empty() {
         return None;
     }
+
     let body = &after[open + 1..];
     let close = body.find('}')?;
     Some(&body[..close])
@@ -96,6 +94,7 @@ fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
+
         let line = line.trim_end_matches(',').trim_end();
         let (name_part, type_part) = line.split_once(':')?;
         let name = name_part.trim();
@@ -276,4 +275,3 @@ fn check_v2_types_in_sync() {
              Update the fixture and commit it together with the storage change."
         );
     }
-}
