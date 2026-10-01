@@ -181,7 +181,7 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 30] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
@@ -262,6 +262,21 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 30] = [
     (
         "get_contracts_by_owner",
         "owner: Address, offset: U32, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_active_contracts_after",
+        "cursor: Option<Address>, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_contracts_by_category_after",
+        "category: Category, cursor: Option<Address>, limit: U32",
+        "Vec<ContractEntry>",
+    ),
+    (
+        "get_contracts_by_owner_after",
+        "owner: Address, cursor: Option<Address>, limit: U32",
         "Vec<ContractEntry>",
     ),
     ("get_manager", "contract_id: Address", "Result<Address, RegistryError>"),

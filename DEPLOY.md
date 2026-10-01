@@ -133,17 +133,23 @@ stellar contract invoke \
   --id lumina-registry \
   --source lumina-deployer \
   --network testnet \
-  -- get_active_contracts --offset 0 --limit 10
+  -- get_active_contracts_after --limit 10
 ```
 
-Or browse one category — same offset/limit semantics, same `active` filtering:
+`get_active_contracts_after` takes an optional `--cursor <C...>` set to the
+`contract_id` of the last entry the previous call returned; repeat until the
+result is empty. It is stable if a registration is added mid-walk. The older
+`get_active_contracts --offset 0 --limit 10` is deprecated and kept for one
+release.
+
+Or browse one category:
 
 ```bash
 stellar contract invoke \
   --id lumina-registry \
   --source lumina-deployer \
   --network testnet \
-  -- get_active_contracts_by_category --category DeFi --offset 0 --limit 10
+  -- get_contracts_by_category_after --category DeFi --limit 10
 ```
 
 ### Refile an existing registration
