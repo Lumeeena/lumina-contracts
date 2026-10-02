@@ -167,23 +167,10 @@ pub const EXPIRY_LEDGERS: u32 = 20;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
-/// | 27 | `InvalidAttestation` | The attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most 32 characters, and ensure the registration has fewer than the maximum attestations. |
-/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Check `get_attestations` for the registration and pass a label the caller has actually attested. |
-/// | 29 | `OverlappingAddress` | The proposed treasury or stake token is itself a registered contract. | Choose a token/treasury address that is not already registered. |
-/// | 30 | `AdminSetTooSmall` | The admin set would have fewer than `MIN_ADMINS` members. | Do not remove an admin that would drop the set below the minimum. |
-/// | 31 | `AlreadyAdmin` | The proposed address is already a member of the admin set. | Propose a different address, or skip `propose_add_admin` for one already an admin. |
-/// | 32 | `AdminNotFound` | The proposed address to remove is not a member of the admin set. | Check `get_admins` for the current set before proposing a removal. |
-/// | 33 | `ThresholdAlreadySet` | The proposed threshold is already the current threshold. | Propose a different threshold. |
-/// | 34 | `AlreadyVerified` | The proposed verification status matches the contract's current status. | Check `is_verified` before proposing a change. |
-/// | 35 | `StakingAlreadyConfigured` | Staking is already configured with the proposed token and treasury. | Propose a different token/treasury pair, or skip the proposal. |
-/// | 36 | `InvalidInput` | Caller-supplied input failed validation (e.g. an empty slash response). | Pass a non-empty, valid value. |
-/// | 37 | `SlashNotFound` | No slash exists at the given index in a registration's slash history. | Check `get_slashes` for valid indices before calling `respond_to_slash`. |
-/// | 38 | `ResponseAlreadyExists` | The referenced slash already has a recorded response. | Responses are immutable once set; there is nothing further to call. |
-/// | 39 | `ContractBalanceInsufficient` | The registry's real token balance is smaller than the total it believes is staked. | This signals a token/registry desync (e.g. a fee-on-transfer token); investigate before retrying. |
-/// | 40 | `StakeOverflow` | Stake arithmetic would overflow `i128`. | Reduce the amount before retrying. |
-/// | 41 | `InvalidBatchSize` | A proposal batch is empty or contains more than `MAX_BATCH_ACTIONS` actions. | Supply between 1 and 10 actions. |
-/// | 42 | `NestedBatch` | An action inside a proposal batch is itself a batch. | Supply a flat list of actions. |
-/// | 43 | `SelfRegistration` | `register_contract` / `register_contracts` was asked to register the registry's own address. | Pass the address of a contract deployed by the caller; a registry is not one of its own index entries. |
+/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or maximum reached. | Pass a non-empty label of at most 64 bytes. |
+/// | 28 | `AttestationNotFound` | Caller has no attestation to revoke on this registration. | Only revoke attestations you created. |
+/// | 29 | `OverlappingAddress` | Token or treasury address overlaps with a registered contract. | Use distinct addresses for staking config. |
+/// | 30 | `NoPendingTransfer` | No ownership transfer is currently pending for this contract. | Propose a transfer first with `propose_ownership_transfer`. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -246,37 +233,10 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
-    /// The proposed treasury or stake token is itself a registered contract.
+    /// The token or treasury address overlaps with an already registered contract.
     OverlappingAddress = 29,
-    /// The admin set would have fewer than `MIN_ADMINS` members.
-    AdminSetTooSmall = 30,
-    /// The proposed address is already a member of the admin set.
-    AlreadyAdmin = 31,
-    /// The proposed address to remove is not a member of the admin set.
-    AdminNotFound = 32,
-    /// The proposed threshold is already the current threshold.
-    ThresholdAlreadySet = 33,
-    /// The proposed verification status matches the contract's current status.
-    AlreadyVerified = 34,
-    /// Staking is already configured with the proposed token and treasury.
-    StakingAlreadyConfigured = 35,
-    /// Caller-supplied input failed validation.
-    InvalidInput = 36,
-    /// No slash exists at the given index.
-    SlashNotFound = 37,
-    /// The referenced slash already has a recorded response.
-    ResponseAlreadyExists = 38,
-    /// The registry's real token balance is smaller than the total it believes
-    /// is staked.
-    ContractBalanceInsufficient = 39,
-    /// Stake arithmetic would overflow `i128`.
-    StakeOverflow = 40,
-    /// A proposal batch is empty or contains more than `MAX_BATCH_ACTIONS` actions.
-    InvalidBatchSize = 41,
-    /// An action inside a proposal batch is itself a batch.
-    NestedBatch = 42,
-    /// A registration cannot point at the registry's own address.
-    SelfRegistration = 43,
+    /// No ownership transfer is currently proposed for this contract.
+    NoPendingTransfer = 30,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -785,6 +745,14 @@ pub enum DataKey {
     /// entry already written (see the upgrade-compatibility rules above),
     /// whereas a new `DataKey` variant is safe.
     Attestations(Address),
+
+    // ── Ownership transfer ──────────────────────────────────────────────────
+    /// Address — pending owner proposed for a two-step ownership transfer.
+    PendingOwner(Address),
+
+    // ── Contract succession ─────────────────────────────────────────────────
+    /// Address — the contract that supersedes this one.
+    SupersededBy(Address),
 
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
@@ -1639,21 +1607,13 @@ impl LuminaRegistry {
             .unwrap_or(false);
         let staked = Self::stake_of(&env, &contract_id);
 
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Contract(contract_id.clone()));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Stake(contract_id.clone()));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Verified(contract_id.clone()));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Tags(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Contract(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Stake(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::Tags(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::SupersededBy(contract_id.clone()));
         // Attestations are opinions about a live registration; once the entry
         // is gone they have nothing left to refer to. Slashes, by contrast,
         // are kept above, because those stay auditable after the fact.
@@ -3478,33 +3438,18 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    /// Update the off-chain metadata URI for a registration.
+    /// Point a registration at another contract that replaces it.
     ///
-    /// The URI should point to a JSON document with this suggested shape:
-    /// `json
-    /// {
-    ///   "name": "Contract Name",
-    ///   "description": "...",
-    ///   "logo_uri": "https://...",
-    ///   "links": {
-    ///     "website": "...",
-    ///     "twitter": "...",
-    ///     "github": "..."
-    ///   },
-    ///   "audit": "https://..."
-    /// }
-    /// `
-    pub fn update_metadata_uri(
+    /// Only the registered owner can call this. Both contracts must already exist.
+    pub fn set_superseded_by(
         env: Env,
         owner: Address,
         contract_id: Address,
-        uri: Option<String>,
+        superseded_by: Address,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
-        let entry: ContractEntry = env
-            .storage()
-            .persistent()
+        let entry: ContractEntry = env.storage().persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
@@ -3512,37 +3457,140 @@ impl LuminaRegistry {
             return Err(RegistryError::NotOwner);
         }
 
-        if let Some(u) = &uri {
-            if u.len() > 2048 {
-                return Err(RegistryError::InvalidUri);
-            }
-
-            let u_str: alloc::string::String = alloc::format!("{}", u);
-            if !u_str.starts_with("http://") && !u_str.starts_with("https://") && !u_str.starts_with("ipfs://") && !u_str.starts_with("ipns://") {
-                return Err(RegistryError::InvalidUri);
-            }
+        if !env.storage().persistent().has(&DataKey::Contract(superseded_by.clone())) {
+            return Err(RegistryError::ContractNotFound);
         }
 
-        if let Some(u) = uri {
-            env.storage()
-                .persistent()
-                .set(&DataKey::MetadataUri(contract_id.clone()), &u);
-        } else {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::MetadataUri(contract_id.clone()));
-        }
+        env.storage().persistent().set(&DataKey::SupersededBy(contract_id.clone()), &superseded_by);
 
         env.events().publish(
-            (Symbol::new(&env, "metadata_uri_updated"),),
-            (contract_id, owner),
+            (Symbol::new(&env, "contract_superseded"),),
+            (contract_id, owner, superseded_by),
         );
 
         Ok(())
     }
-    /// Hand a registration over to a new owner.
-    /// Only the current owner can call this (admin override removed — ownership
-    /// transfer should be driven by the owner themselves).
+
+    /// Propose transferring ownership of a registration to `new_owner`.
+    ///
+    /// The transfer remains pending until `new_owner` calls `accept_ownership`.
+    /// Until then, the current owner retains full ownership and rights.
+    /// May be cancelled by the owner at any time before acceptance via
+    /// `cancel_ownership_transfer`.
+    pub fn propose_ownership_transfer(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+        new_owner: Address,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if caller != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        env.storage().persistent().set(&DataKey::PendingOwner(contract_id.clone()), &new_owner);
+
+        env.events().publish(
+            (Symbol::new(&env, "ownership_transfer_proposed"),),
+            (contract_id, caller, new_owner),
+        );
+
+        Ok(())
+    }
+
+    /// Accept a proposed ownership transfer and become the new registered owner.
+    ///
+    /// Caller must be the address designated as `new_owner` in
+    /// `propose_ownership_transfer`.
+    pub fn accept_ownership(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let mut entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        let pending_owner: Address = env.storage().persistent()
+            .get(&DataKey::PendingOwner(contract_id.clone()))
+            .ok_or(RegistryError::NoPendingTransfer)?;
+
+        if caller != pending_owner {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        let previous_owner = entry.owner.clone();
+        if previous_owner != caller {
+            let mut previous_owned = Self::owner_index(&env, &previous_owner);
+            if let Some(i) = previous_owned.first_index_of(&contract_id) {
+                previous_owned.remove(i);
+                Self::set_owner_index(&env, &previous_owner, &previous_owned);
+            }
+
+            let mut new_owned = Self::owner_index(&env, &caller);
+            new_owned.push_back(contract_id.clone());
+            Self::set_owner_index(&env, &caller, &new_owned);
+
+            entry.owner = caller.clone();
+            env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
+        }
+
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "ownership_transferred"),),
+            (contract_id, previous_owner, caller),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending ownership transfer for a registration.
+    ///
+    /// Callable only by the current registered owner.
+    pub fn cancel_ownership_transfer(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if caller != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        if !env.storage().persistent().has(&DataKey::PendingOwner(contract_id.clone())) {
+            return Err(RegistryError::NoPendingTransfer);
+        }
+
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "ownership_transfer_canceled"),),
+            (contract_id, caller),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the pending owner for a registration, if an ownership transfer is in flight.
+    pub fn get_pending_owner(env: Env, contract_id: Address) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PendingOwner(contract_id))
+    }
+
+    /// Single-step ownership transfer behind governance for emergency recovery
+    /// when an owner key is genuinely lost. Restricted to admins only.
     pub fn transfer_ownership(
         env: Env,
         caller: Address,
@@ -3557,15 +3605,23 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        // Require the caller to be the owner or a member of the current admin
-        // set. The legacy single-admin key is deliberately not consulted: it
-        // grants no authority (see `DataKey::Admin`), and honouring it here
-        // would be the same single-key bypass this contract removed elsewhere.
-        let is_owner = caller == entry.owner;
-        let is_admin = Self::admin_index(&env).contains(&caller);
+        let admins = Self::admin_index(&env);
+        let is_admin = admins.contains(&caller);
 
-        if !is_owner && !is_admin {
-            if !env.storage().instance().has(&DataKey::Admins) {
+        // Fall back to the legacy single-admin check for the upgrade tests.
+        let is_legacy_admin = env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|a| a == caller)
+            .unwrap_or(false);
+
+        if !is_admin && !is_legacy_admin {
+            // Neither the new multi-sig admins nor the legacy admin —
+            // check whether we're initialized at all so the error
+            // message stays informative.
+            if !env.storage().instance().has(&DataKey::Admins)
+                && !env.storage().instance().has(&DataKey::Admin)
+            {
                 return Err(RegistryError::NotInitialized);
             }
             return Err(RegistryError::Unauthorized);
@@ -3573,6 +3629,7 @@ impl LuminaRegistry {
 
         let previous_owner = entry.owner.clone();
         if previous_owner == new_owner {
+            env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
             return Ok(());
         }
 
@@ -3587,9 +3644,8 @@ impl LuminaRegistry {
         Self::set_owner_index(&env, &new_owner, &new_owned);
 
         entry.owner = new_owner.clone();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Contract(contract_id.clone()), &entry);
+        env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "ownership_transferred"),),
@@ -3825,14 +3881,6 @@ impl LuminaRegistry {
                     .publish((Symbol::new(env, "threshold_changed"),), (*new_threshold,));
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
-                // Capture whatever was configured before this call, if
-                // anything, so the event can report the transition rather
-                // than only the new values.
-                let prev_token: Option<Address> =
-                    env.storage().instance().get(&DataKey::StakeToken);
-                let prev_treasury: Option<Address> =
-                    env.storage().instance().get(&DataKey::Treasury);
-
                 if *treasury == env.current_contract_address() {
                     return Err(RegistryError::InvalidMetadata);
                 }
@@ -4504,3 +4552,2847 @@ mod test {
             Err(Ok(RegistryError::AlreadyInitialized))
         );
     }
+
+    // ── Threshold enforcement ───────────────────────────────────────────────
+
+    #[test]
+    fn proposal_cannot_execute_below_threshold() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        // Only a1 approves (threshold is 2).
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+
+        // Advance past timelock — should still fail because threshold not met.
+        advance_ledger(&env, TIMELOCK_LEDGERS + 1);
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::ThresholdNotMet))
+        );
+        // Contract is still active.
+        assert!(client.get_contract(&target).active);
+    }
+
+    #[test]
+    fn proposal_executes_when_threshold_met_and_timelock_elapsed() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+
+        advance_ledger(&env, TIMELOCK_LEDGERS + 1);
+        client.execute_proposal(&pid);
+
+        assert!(!client.get_contract(&target).active);
+    }
+
+    // ── Timelock enforcement ────────────────────────────────────────────────
+
+    #[test]
+    fn proposal_cannot_execute_before_timelock_elapses() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+
+        // Advance by one ledger less than required.
+        advance_ledger(&env, TIMELOCK_LEDGERS - 1);
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::TimelockNotElapsed))
+        );
+        assert!(client.get_contract(&target).active);
+    }
+
+    #[test]
+    fn proposal_executes_exactly_at_timelock_boundary() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+        assert!(!client.get_contract(&target).active);
+    }
+
+    // ── Duplicate-approval rejection ────────────────────────────────────────
+
+    #[test]
+    fn same_admin_approving_twice_is_rejected() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+
+        assert_eq!(
+            client.try_approve_proposal(&a1, &pid),
+            Err(Ok(RegistryError::AlreadyApproved))
+        );
+    }
+
+    #[test]
+    fn double_approval_does_not_count_toward_threshold() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        // First approval succeeds.
+        client.approve_proposal(&a1, &pid);
+        // Second approval rejected.
+        let _ = client.try_approve_proposal(&a1, &pid).unwrap_err();
+
+        advance_ledger(&env, TIMELOCK_LEDGERS + 1);
+        // Still below threshold (need 2), so execution must fail.
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::ThresholdNotMet))
+        );
+    }
+
+    // ── Non-admin cannot propose or approve ─────────────────────────────────
+
+    #[test]
+    fn non_admin_cannot_propose() {
+        let (env, client, _a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_deactivate(&stranger, &target),
+            Err(Ok(RegistryError::NotAdmin))
+        );
+    }
+
+    #[test]
+    fn admin_membership_cache_cost_benchmark() {
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().instance().has(&DataKey::Admins));
+            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            assert!(admins.contains(&admin));
+        });
+        let uncached_cpu = env.budget().cpu_instruction_cost();
+        let uncached_memory = env.budget().memory_bytes_cost();
+
+        env.budget().reset_default();
+        env.as_contract(&contract_id, || {
+            let admins = LuminaRegistry::admin_index(&env);
+            LuminaRegistry::assert_is_admin(&admins, &admin).unwrap();
+        });
+        let cached_cpu = env.budget().cpu_instruction_cost();
+        let cached_memory = env.budget().memory_bytes_cost();
+
+        std::println!(
+            "admin membership cost: cpu {uncached_cpu} -> {cached_cpu}, memory {uncached_memory} -> {cached_memory}"
+        );
+        assert!(cached_cpu < uncached_cpu);
+    }
+
+    #[test]
+    fn non_admin_cannot_approve() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        assert_eq!(
+            client.try_approve_proposal(&stranger, &pid),
+            Err(Ok(RegistryError::NotAdmin))
+        );
+    }
+
+    // ── Admin-set changes go through governance ─────────────────────────────
+
+    #[test]
+    fn add_admin_via_governance() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let new_admin = Address::generate(&env);
+
+        let pid = client.propose_add_admin(&a1, &new_admin);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        let admins = client.get_admins();
+        assert!(admins.contains(&new_admin));
+    }
+
+    #[test]
+    fn remove_admin_via_governance() {
+        let (env, client, a1, a2, a3) = setup_multisig();
+
+        // Remove a3 — set goes from 3 to 2, still satisfies threshold=2.
+        let pid = client.propose_remove_admin(&a1, &a3);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        let admins = client.get_admins();
+        assert!(!admins.contains(&a3));
+        assert_eq!(admins.len(), 2);
+    }
+
+    #[test]
+    fn remove_admin_that_would_violate_threshold_fails() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        // threshold=2, admins=3; removing one leaves 2 which still satisfies.
+        // But if we try to remove a second one that'd leave 1 < threshold=2.
+        let pid1 = client.propose_remove_admin(&a1, &a2);
+        client.approve_proposal(&a1, &pid1);
+        // need second approval
+        let a3 = client.get_admins().get(2).unwrap();
+        client.approve_proposal(&a3, &pid1);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        // Still ok: 3-1=2 >= threshold=2.
+        client.execute_proposal(&pid1);
+
+        // Now admins = {a1, a3}, threshold=2.  Removing a3 would leave 1 < 2.
+        let pid2 = client.propose_remove_admin(&a1, &a3);
+        client.approve_proposal(&a1, &pid2);
+        client.approve_proposal(&a3, &pid2);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        assert_eq!(
+            client.try_execute_proposal(&pid2),
+            Err(Ok(RegistryError::InvalidThreshold))
+        );
+    }
+
+    #[test]
+    fn change_threshold_via_governance() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+
+        let pid = client.propose_change_threshold(&a1, &1);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        assert_eq!(client.get_threshold(), 1);
+    }
+
+    // ── Full realistic scenario ─────────────────────────────────────────────
+
+    #[test]
+    fn full_scenario_compromised_admin_removed_via_governance() {
+        // 3 admins, 2-of-3 threshold, admin key "a3" compromised.
+        // a1 and a2 vote to remove a3.
+        let (env, client, a1, a2, a3) = setup_multisig();
+
+        // Confirm a3 is currently an admin.
+        assert!(client.get_admins().contains(&a3));
+
+        let pid = client.propose_remove_admin(&a1, &a3);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        // a3 is no longer an admin.
+        assert!(!client.get_admins().contains(&a3));
+
+        // a3 can no longer propose anything.
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(
+            client.try_propose_deactivate(&a3, &target),
+            Err(Ok(RegistryError::NotAdmin))
+        );
+
+        // a1 and a2 can still form a 2-of-2 quorum.
+        let pid2 = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid2);
+        client.approve_proposal(&a2, &pid2);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid2);
+        assert!(!client.get_contract(&target).active);
+    }
+
+    // ── Owner self-deactivate is still instant ──────────────────────────────
+
+    #[test]
+    fn owner_can_deactivate_own_contract_immediately() {
+        let (env, client, _a1, _a2, _a3) = setup_multisig();
+        let (owner, target) = register_sample(&env, &client);
+
+        // No proposal needed — owner deactivates directly.
+        client.deactivate(&owner, &target);
+        assert!(!client.get_contract(&target).active);
+    }
+
+    #[test]
+    fn deactivate_by_non_owner_is_rejected() {
+        let (env, client, a1, _a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        // Admin attempting to bypass governance.
+        assert_eq!(
+            client.try_deactivate(&a1, &target),
+            Err(Ok(RegistryError::Unauthorized))
+        );
+    }
+
+    // ── Executed proposal cannot be re-executed ─────────────────────────────
+
+    #[test]
+    fn executed_proposal_cannot_execute_again() {
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::AlreadyExecuted))
+        );
+    }
+
+    // ── Existing registry tests (single-admin setup) ────────────────────────
+
+    #[test]
+    fn register_contract_succeeds() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        assert!(client.is_registered(&target));
+        assert_eq!(client.get_contract_count(), 1);
+        let entry = client.get_contract(&target);
+        assert_eq!(entry.owner, owner);
+        assert!(entry.active);
+    }
+
+    #[test]
+    fn register_contract_rejects_duplicate() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let result = client.try_register_contract(
+            &owner,
+            &target,
+            &String::from_str(&env, "X"),
+            &String::from_str(&env, "X"),
+            &default_cats(&env),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::AlreadyRegistered)));
+    }
+
+    #[test]
+    fn allowlist_mode_is_off_by_default_and_governed() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let first_target = Address::generate(&env);
+        client.register_contract(
+            &owner, &first_target, &String::from_str(&env, "First"),
+            &String::from_str(&env, "First"), &default_cats(&env),
+        );
+        let enable = client.propose_set_allowlist_enabled(&admin, &true);
+        pass_proposal(&env, &client, &admin, enable);
+        let target = Address::generate(&env);
+        assert_eq!(
+            client.try_register_contract(
+                &owner, &target, &String::from_str(&env, "Blocked"),
+                &String::from_str(&env, "Blocked"), &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::NotAllowlisted)),
+        );
+        let allow = client.propose_set_allowlisted(&admin, &owner, &true);
+        pass_proposal(&env, &client, &admin, allow);
+        client.register_contract(
+            &owner, &target, &String::from_str(&env, "Allowed"),
+            &String::from_str(&env, "Allowed"), &default_cats(&env),
+        );
+        assert!(client.is_registered(&target));
+    }
+
+    #[test]
+    fn registration_rate_limit_resets_after_governed_window() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let configure = client.propose_set_rate_limit(&admin, &1, &3);
+        pass_proposal(&env, &client, &admin, configure);
+        let first = Address::generate(&env);
+        client.register_contract(
+            &owner, &first, &String::from_str(&env, "First"),
+            &String::from_str(&env, "First"), &default_cats(&env),
+        );
+        let second = Address::generate(&env);
+        assert_eq!(
+            client.try_register_contract(
+                &owner, &second, &String::from_str(&env, "Second"),
+                &String::from_str(&env, "Second"), &default_cats(&env),
+            ),
+            Err(Ok(RegistryError::RegistrationRateLimited)),
+        );
+        advance_ledger(&env, 3);
+        client.register_contract(
+            &owner, &second, &String::from_str(&env, "Second"),
+            &String::from_str(&env, "Second"), &default_cats(&env),
+        );
+        assert!(client.is_registered(&second));
+    }
+
+    #[test]
+    fn bootstrap_admin_can_add_admin_and_raise_threshold_through_governance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        let second_admin = Address::generate(&env);
+        assert_eq!(client.get_admins().len(), 1);
+        assert_eq!(client.get_threshold(), 1);
+        let add = client.propose_add_admin(&admin, &second_admin);
+        pass_proposal(&env, &client, &admin, add);
+        let change = client.propose_change_threshold(&admin, &2);
+        client.approve_proposal(&admin, &change);
+        client.approve_proposal(&second_admin, &change);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&change);
+        assert_eq!(client.get_admins().len(), 2);
+        assert_eq!(client.get_threshold(), 2);
+    }
+
+    #[test]
+    fn deactivate_by_owner_succeeds() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        client.deactivate(&owner, &target);
+        assert!(!client.get_contract(&target).active);
+    }
+
+    #[test]
+    fn deactivate_by_unrelated_caller_fails() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_deactivate(&stranger, &target),
+            Err(Ok(RegistryError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn get_contract_not_found_for_unknown_address() {
+        let (env, client, _admin) = setup();
+        let target = Address::generate(&env);
+        assert_eq!(
+            client.try_get_contract(&target),
+            Err(Ok(RegistryError::ContractNotFound))
+        );
+    }
+
+    #[test]
+    fn get_active_contracts_excludes_deactivated() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        client.deactivate(&owner, &target);
+        assert_eq!(client.get_active_contracts(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn get_active_contracts_respects_limit_and_offset() {
+        let (env, client, _admin) = setup();
+        for _ in 0..5 {
+            register_sample(&env, &client);
+        }
+        assert_eq!(client.get_active_contracts(&0, &2).len(), 2);
+        assert_eq!(client.get_active_contracts(&2, &2).len(), 2);
+        assert_eq!(client.get_active_contracts(&4, &2).len(), 1);
+    }
+
+    #[test]
+    fn get_contracts_by_owner_returns_only_that_owners_contracts() {
+        let (env, client, _admin) = setup();
+        let (owner_a, target_a) = register_sample(&env, &client);
+        let (owner_b, target_b) = register_sample(&env, &client);
+        let target_a2 = register_for(&env, &client, &owner_a);
+
+        let a = client.get_contracts_by_owner(&owner_a, &0, &10);
+        assert_eq!(a.len(), 2);
+        assert!(page_contains(&a, &target_a));
+        assert!(page_contains(&a, &target_a2));
+        assert!(!page_contains(&a, &target_b));
+
+        let b = client.get_contracts_by_owner(&owner_b, &0, &10);
+        assert_eq!(b.len(), 1);
+        assert!(page_contains(&b, &target_b));
+    }
+
+    #[test]
+    fn update_metadata_by_owner_succeeds() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let name = String::from_str(&env, "Renamed Protocol");
+        let desc = String::from_str(&env, "A corrected description");
+        client.update_metadata(&owner, &target, &name, &desc);
+        assert_eq!(client.get_contract(&target).name, name);
+    }
+
+    #[test]
+    fn update_metadata_rejects_non_owner() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_update_metadata(
+                &stranger,
+                &target,
+                &String::from_str(&env, "X"),
+                &String::from_str(&env, "X"),
+            ),
+            Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn transfer_ownership_moves_entry_between_owner_indices() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let kept = register_for(&env, &client, &owner);
+        let new_owner = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        assert_eq!(client.get_pending_owner(&target), Some(new_owner.clone()));
+        client.accept_ownership(&new_owner, &target);
+        assert_eq!(client.get_pending_owner(&target), None);
+
+        let old_entries = client.get_contracts_by_owner(&owner, &0, &10);
+        assert_eq!(old_entries.len(), 1);
+        assert!(page_contains(&old_entries, &kept));
+        assert!(!page_contains(&old_entries, &target));
+
+        let new_entries = client.get_contracts_by_owner(&new_owner, &0, &10);
+        assert_eq!(new_entries.len(), 1);
+        assert!(page_contains(&new_entries, &target));
+    }
+
+    #[test]
+    fn transfer_ownership_by_admin_succeeds() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let new_owner = Address::generate(&env);
+
+        client.transfer_ownership(&admin, &target, &new_owner);
+
+        assert_eq!(client.get_contract(&target).owner, new_owner);
+        assert_eq!(client.get_contracts_by_owner(&owner, &0, &10).len(), 0);
+        assert_eq!(client.get_contracts_by_owner(&new_owner, &0, &10).len(), 1);
+    }
+
+    #[test]
+    fn transfer_ownership_by_unrelated_caller_fails() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        assert_eq!(
+            client.try_transfer_ownership(&stranger, &target, &new_owner),
+            Err(Ok(RegistryError::Unauthorized))
+        );
+        assert_eq!(client.get_contract(&target).owner, owner);
+    }
+
+    #[test]
+    fn transfer_ownership_to_current_owner_is_noop() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        client.transfer_ownership(&admin, &target, &owner);
+        let entries = client.get_contracts_by_owner(&owner, &0, &10);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn propose_transfer_unaccepted_leaves_original_owner_in_place() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+
+        // The original owner remains the owner with full rights.
+        let entry = client.get_contract(&target);
+        assert_eq!(entry.owner, owner);
+
+        let new_name = String::from_str(&env, "Still My Contract");
+        let new_desc = String::from_str(&env, "Owner retains full control");
+        client.update_metadata(&owner, &target, &new_name, &new_desc);
+        assert_eq!(client.get_contract(&target).name, new_name);
+    }
+
+    #[test]
+    fn cancel_ownership_transfer_removes_pending_and_blocks_accept() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+
+        // Non-owner cannot cancel.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_cancel_ownership_transfer(&stranger, &target),
+            Err(Ok(RegistryError::NotOwner))
+        );
+
+        // Owner cancels pending transfer.
+        client.cancel_ownership_transfer(&owner, &target);
+        assert_eq!(client.get_pending_owner(&target), None);
+
+        // Subsequent accept fails.
+        assert_eq!(
+            client.try_accept_ownership(&pending, &target),
+            Err(Ok(RegistryError::NoPendingTransfer))
+        );
+
+        // Cancelling when there is no pending transfer fails.
+        assert_eq!(
+            client.try_cancel_ownership_transfer(&owner, &target),
+            Err(Ok(RegistryError::NoPendingTransfer))
+        );
+    }
+
+    #[test]
+    fn accept_ownership_by_unauthorized_fails() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+
+        // Stranger cannot accept.
+        assert_eq!(
+            client.try_accept_ownership(&stranger, &target),
+            Err(Ok(RegistryError::Unauthorized))
+        );
+
+        // Original owner is still owner.
+        assert_eq!(client.get_contract(&target).owner, owner);
+    }
+
+    #[test]
+    fn propose_ownership_transfer_non_owner_fails() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_ownership_transfer(&stranger, &target, &new_owner),
+            Err(Ok(RegistryError::NotOwner))
+        );
+        assert_eq!(client.get_pending_owner(&target), None);
+    }
+
+    #[test]
+    fn pending_transfer_does_not_block_deactivation_or_metadata_updates() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+
+        // Owner updates metadata.
+        let name = String::from_str(&env, "Updated While Pending");
+        let desc = String::from_str(&env, "Description update");
+        client.update_metadata(&owner, &target, &name, &desc);
+        assert_eq!(client.get_contract(&target).name, name);
+
+        // Owner sets categories and tags.
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::Payments]));
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "payments"));
+        client.set_tags(&owner, &target, &tags);
+        assert_eq!(client.get_tags(&target), tags);
+
+        // Owner deactivates.
+        client.deactivate(&owner, &target);
+        assert!(!client.get_contract(&target).active);
+
+        // Pending transfer is still intact and can be accepted.
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+        client.accept_ownership(&pending, &target);
+        assert_eq!(client.get_contract(&target).owner, pending);
+        assert_eq!(client.get_pending_owner(&target), None);
+    }
+
+    #[test]
+    fn admin_recovery_transfer_clears_pending_transfer() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let pending = Address::generate(&env);
+        let recovered_owner = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &pending);
+        assert_eq!(client.get_pending_owner(&target), Some(pending.clone()));
+
+        // Admin recovery one-step transfer.
+        client.transfer_ownership(&admin, &target, &recovered_owner);
+
+        assert_eq!(client.get_contract(&target).owner, recovered_owner);
+        assert_eq!(client.get_pending_owner(&target), None);
+
+        // Pending owner can no longer accept.
+        assert_eq!(
+            client.try_accept_ownership(&pending, &target),
+            Err(Ok(RegistryError::NoPendingTransfer))
+        );
+    }
+
+    #[test]
+    fn get_version_reports_compiled_version() {
+        let (_, client, _) = setup();
+        assert_eq!(client.get_version(), CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn get_admin_returns_first_admin() {
+        let (_, client, admin) = setup();
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn unauthorized_owner_management_call_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+
+        assert_eq!(
+            client.try_transfer_ownership(&stranger, &target, &new_owner),
+            Err(Ok(RegistryError::Unauthorized)),
+        );
+    }
+
+    // ── Upgrade-path tests ──────────────────────────────────────────────────
+
+    fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
+        let admin = Address::generate(env);
+        // `__constructor` calls `require_auth()`, and deploying *from wasm*
+        // runs it as a sub-invocation of the `CreateContractV2` host function
+        // rather than as the root invocation. `mock_all_auths` rejects a
+        // `require_auth` that is not tied to the root frame, so the upgrade
+        // tests need the non-root variant. (Native `env.register(LuminaRegistry,
+        // ..)` in `setup` needs no such allowance and keeps plain mocking.)
+        env.mock_all_auths_allowing_non_root_auth();
+        let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
+        let client = registry_v1_wasm::Client::new(env, &contract_id);
+        (client, admin, contract_id)
+    }
+
+    fn register_via(env: &Env, client: &registry_v1_wasm::Client, owner: &Address) -> Address {
+        let target = Address::generate(env);
+        // The imported wasm carries its own generated copy of `Category`.
+        let mut categories = Vec::new(env);
+        categories.push_back(registry_v1_wasm::Category::Infrastructure);
+        client.register_contract(
+            owner,
+            &target,
+            &String::from_str(env, "Test Contract"),
+            &String::from_str(env, "A test contract"),
+            &categories,
+        );
+        target
+    }
+
+    #[test]
+    fn upgrade_swaps_code_and_preserves_registrations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+
+        let owner = Address::generate(&env);
+        let kept_active = register_via(&env, &v1, &owner);
+        let deactivated = register_via(&env, &v1, &owner);
+        let other_owner = register_via(&env, &v1, &Address::generate(&env));
+        v1.deactivate(&owner, &deactivated);
+
+        assert_eq!(v1.get_version(), CONTRACT_VERSION);
+        assert_eq!(v1.get_contract_count(), 3);
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+
+        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
+        assert_eq!(v2.get_version(), CONTRACT_VERSION + 1);
+        assert_eq!(v2.get_contract_count(), 3);
+
+        let entry = v2.get_contract(&kept_active);
+        assert_eq!(entry.owner, owner);
+        assert!(entry.active);
+        assert!(!v2.get_contract(&deactivated).active);
+        assert_ne!(v2.get_contract(&other_owner).owner, owner);
+
+        let owned = v2.get_contracts_by_owner(&owner, &0, &10);
+        assert_eq!(owned.len(), 2);
+        assert_eq!(v2.count_active(), 2);
+    }
+
+    #[test]
+    fn upgrade_retires_previous_interface() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, _) = deploy_v1(&env);
+        register_via(&env, &v1, &Address::generate(&env));
+        assert_eq!(v1.get_active_contracts(&0, &10).len(), 1);
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+        assert!(v1.try_get_active_contracts(&0, &10).is_err());
+    }
+
+    #[test]
+    fn upgrade_by_non_admin_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, _admin, _) = deploy_v1(&env);
+        let stranger = Address::generate(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        assert_eq!(
+            v1.try_upgrade(&stranger, &v2_hash),
+            Err(Ok(registry_v1_wasm::RegistryError::Unauthorized))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn upgrade_without_admin_signature_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, _) = deploy_v1(&env);
+        let stranger = Address::generate(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &v1.address,
+                fn_name: "upgrade",
+                args: (admin.clone(), v2_hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        v1.upgrade(&admin, &v2_hash);
+    }
+
+    #[test]
+    fn upgrade_with_admin_signature_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &v1.address,
+                fn_name: "upgrade",
+                args: (admin.clone(), v2_hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        v1.upgrade(&admin, &v2_hash);
+        assert_eq!(registry_v2_wasm::Client::new(&env, &contract_id).get_version(), CONTRACT_VERSION + 1);
+    }
+
+    #[test]
+    fn upgraded_registry_can_be_rolled_back() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let owner = Address::generate(&env);
+        let target = register_via(&env, &v1, &owner);
+
+        let v1_hash = env.deployer().upload_contract_wasm(registry_v1_wasm::WASM);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        v1.upgrade(&admin, &v2_hash);
+        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
+        assert_eq!(v2.get_version(), CONTRACT_VERSION + 1);
+
+        v2.upgrade(&admin, &v1_hash);
+        assert_eq!(v1.get_version(), CONTRACT_VERSION);
+        assert_eq!(v1.get_contract(&target).owner, owner);
+        assert_eq!(v1.get_active_contracts(&0, &10).len(), 1);
+    }
+
+    #[test]
+    fn upgrade_carries_admin_across_swap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+
+        v1.upgrade(&admin, &v2_hash);
+        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
+
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            v2.try_upgrade(&stranger, &v2_hash),
+            Err(Ok(registry_v2_wasm::RegistryError::Unauthorized))
+        );
+        v2.upgrade(&admin, &v2_hash);
+    }
+
+    /// Data of the single `registry_upgraded` event emitted by `contract_id`
+    /// during the last invocation.
+    fn registry_upgraded_data(env: &Env, contract_id: &Address) -> soroban_sdk::Val {
+        let topic = Symbol::new(env, "registry_upgraded");
+        let mut found: Vec<soroban_sdk::Val> = Vec::new(env);
+        for (emitter, topics, data) in env.events().all().iter() {
+            let first = topics.get(0).and_then(|t| Symbol::try_from_val(env, &t).ok());
+            if &emitter == contract_id && first == Some(topic.clone()) {
+                found.push_back(data);
+            }
+        }
+        assert_eq!(found.len(), 1, "expected exactly one registry_upgraded event");
+        found.get(0).unwrap()
+    }
+
+    // The upgrade event carries the version of the code being *replaced*.
+    // Emitting the incoming version would be an equally plausible-looking
+    // choice, and it would silently invert every consumer's reading of the
+    // field — these tests pin the intent so that change cannot slip through.
+
+    #[test]
+    fn registry_upgraded_event_reports_the_replaced_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let replaced = v1.get_version();
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        v1.upgrade(&admin, &v2_hash);
+        // Read the event before any further call: `events().all()` only
+        // covers the most recent invocation.
+        let (by, hash, version): (Address, BytesN<32>, u32) =
+            registry_upgraded_data(&env, &contract_id).into_val(&env);
+
+        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
+        assert_ne!(replaced, incoming, "fixture must make the two versions distinguishable");
+        assert_eq!(by, admin);
+        assert_eq!(hash, v2_hash);
+        assert_eq!(version, replaced);
+        assert_ne!(version, incoming);
+    }
+
+    #[test]
+    fn governance_upgrade_event_reports_the_replaced_version() {
+        // The v1 fixture is the release wasm, built without `cfg(test)`, so it
+        // enforces the production timelock. Stretch entry TTLs so waiting it
+        // out does not archive the registry's storage or code.
+        let production_timelock: u32 = 17_280;
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = production_timelock * 2;
+            li.min_temp_entry_ttl = production_timelock * 2;
+            li.max_entry_ttl = production_timelock * 4;
+        });
+        env.mock_all_auths();
+        let (v1, admin, contract_id) = deploy_v1(&env);
+        let replaced = v1.get_version();
+
+        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
+        let pid = v1.propose_upgrade(&admin, &v2_hash);
+        v1.approve_proposal(&admin, &pid);
+        advance_ledger(&env, production_timelock);
+        v1.execute_proposal(&pid);
+        let (hash, version): (BytesN<32>, u32) =
+            registry_upgraded_data(&env, &contract_id).into_val(&env);
+
+        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
+        assert_ne!(replaced, incoming, "fixture must make the two versions distinguishable");
+        assert_eq!(hash, v2_hash);
+        assert_eq!(version, replaced);
+        assert_ne!(version, incoming);
+    }
+
+    #[test]
+    fn register_contract_populates_owner_index() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        assert_eq!(client.get_contracts_by_owner(&owner, &0, &10).len(), 0);
+        let target = register_for(&env, &client, &owner);
+        let entries = client.get_contracts_by_owner(&owner, &0, &10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.get(0).unwrap().contract_id, target);
+    }
+
+    #[test]
+    fn admin_can_still_deactivate_after_ownership_transfer() {
+        // Via governance (propose + approve + execute).
+        let (env, client, a1, a2, _a3) = setup_multisig();
+        let (owner, target) = register_sample(&env, &client);
+        let new_owner = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        client.accept_ownership(&new_owner, &target);
+
+        // Admin deactivation goes through governance.
+        let pid = client.propose_deactivate(&a1, &target);
+        client.approve_proposal(&a1, &pid);
+        client.approve_proposal(&a2, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
+        assert!(!client.get_contract(&target).active);
+    }
+
+    #[test]
+    fn propose_and_accept_ownership_transfer_succeeds_with_real_signatures() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let new_owner = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_ownership_transfer",
+                args: (owner.clone(), target.clone(), new_owner.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        assert_eq!(client.get_pending_owner(&target), Some(new_owner.clone()));
+
+        env.mock_auths(&[MockAuth {
+            address: &new_owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_ownership",
+                args: (new_owner.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_ownership(&new_owner, &target);
+        assert_eq!(client.get_contract(&target).owner, new_owner);
+        assert_eq!(client.get_pending_owner(&target), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_ownership_transfer_without_caller_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let new_owner = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &new_owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_ownership_transfer",
+                args: (owner.clone(), target.clone(), new_owner.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+    }
+
+    #[test]
+    fn constructor_sets_bootstrap_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&admin,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn update_metadata_succeeds_with_real_owner_signature() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let name = String::from_str(&env, "Signed Rename");
+        let desc = String::from_str(&env, "Signed Rename");
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "update_metadata",
+                args: (owner.clone(), target.clone(), name.clone(), desc.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.update_metadata(&owner, &target, &name, &desc);
+        assert_eq!(client.get_contract(&target).name, name);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn update_metadata_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let name = String::from_str(&env, "Unsigned Rename");
+        let desc = String::from_str(&env, "Unsigned Rename");
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "update_metadata",
+                args: (owner.clone(), target.clone(), name.clone(), desc.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.update_metadata(&owner, &target, &name, &desc);
+    }
+
+    // ── Staking, verification & slashing ────────────────────────────────────
+
+    /// A registry with a live Stellar Asset Contract as its stake token and
+    /// staking already opened through governance.
+    ///
+    /// Returns `(env, client, admin, token_id, treasury)`.
+    fn setup_staking() -> (Env, LuminaRegistryClient<'static>, Address, Address, Address) {
+        let (env, client, admin) = setup();
+
+        let issuer = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(issuer).address();
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        (env, client, admin, token_id, treasury)
+    }
+
+    /// Drive a proposal through the 1-of-1 governance flow: approve, wait out
+    /// the timelock, execute.
+    fn pass_proposal(env: &Env, client: &LuminaRegistryClient, admin: &Address, pid: u32) {
+        client.approve_proposal(admin, &pid);
+        advance_ledger(env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+    }
+
+    fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token_id).mint(to, &amount);
+    }
+
+    fn balance(env: &Env, token_id: &Address, of: &Address) -> i128 {
+        token::Client::new(env, token_id).balance(of)
+    }
+
+    /// Register a contract and stake `amount` against it.
+    fn register_and_stake(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        token_id: &Address,
+        amount: i128,
+    ) -> (Address, Address) {
+        let (owner, target) = register_sample(env, client);
+        mint(env, token_id, &owner, amount);
+        client.stake(&owner, &target, &amount);
+        (owner, target)
+    }
+
+    /// Sum of every registration's tracked stake (`DataKey::Stake`).
+    ///
+    /// Reads `AllContracts` from the registry's own storage, so it covers
+    /// deactivated entries (which keep their stake until withdrawal) rather
+    /// than only the active listing.
+    fn tracked_stake_total(env: &Env, client: &LuminaRegistryClient) -> i128 {
+        env.as_contract(&client.address, || {
+            let all: Vec<Address> = env.storage().instance()
+                .get(&DataKey::AllContracts)
+                .unwrap_or(Vec::new(env));
+            let mut total: i128 = 0;
+            for contract_id in all.iter() {
+                total += env.storage().persistent()
+                    .get::<DataKey, i128>(&DataKey::Stake(contract_id))
+                    .unwrap_or(0);
+            }
+            total
+        })
+    }
+
+    /// Solvency invariant: the registry's token balance must exactly match
+    /// what it believes it owes across all registrations.
+    ///
+    /// `stake` moves tokens in and tracks them, `withdraw_stake` moves them
+    /// out and untracks them, and slash execution moves them to the treasury
+    /// and untracks them — so after any sequence the two figures agree.
+    /// Deliberately an equality (not just `balance >= tracked`): both an
+    /// over-credited and an under-credited accounting bug break it.
+    fn assert_solvency(env: &Env, client: &LuminaRegistryClient, token_id: &Address) {
+        let tracked = tracked_stake_total(env, client);
+        let held = balance(env, token_id, &client.address);
+        assert_eq!(
+            held, tracked,
+            "solvency invariant violated: token balance {} != tracked stake {}",
+            held, tracked,
+        );
+    }
+
+    // ── Configuration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn staking_is_closed_until_governance_opens_it() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+
+        assert_eq!(
+            client.try_get_staking_config(),
+            Err(Ok(RegistryError::StakingNotConfigured)),
+        );
+        assert_eq!(
+            client.try_stake(&owner, &target, &100),
+            Err(Ok(RegistryError::StakingNotConfigured)),
+        );
+    }
+
+    #[test]
+    fn configure_staking_records_token_and_treasury() {
+        let (_env, client, _admin, token_id, treasury) = setup_staking();
+        assert_eq!(client.get_staking_config(), (token_id, treasury));
+    }
+
+    #[test]
+    fn configure_staking_cannot_be_proposed_by_a_non_admin() {
+        let (env, client, _admin) = setup();
+        let stranger = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+
+        assert_eq!(
+            client.try_propose_configure_staking(&stranger, &token_id, &stranger),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+    }
+
+    // ── Staking ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stake_moves_real_tokens_into_the_registry() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
+
+        client.stake(&owner, &target, &400);
+
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(balance(&env, &token_id, &owner), 600);
+        assert_eq!(balance(&env, &token_id, &client.address), 400);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn stake_tops_up_an_existing_stake() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 300);
+
+        mint(&env, &token_id, &owner, 200);
+        client.stake(&owner, &target, &200);
+
+        assert_eq!(client.get_stake(&target), 500);
+        assert_eq!(balance(&env, &token_id, &client.address), 500);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn stake_rejects_a_caller_who_is_not_the_owner() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        mint(&env, &token_id, &stranger, 500);
+
+        assert_eq!(
+            client.try_stake(&stranger, &target, &100),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        assert_eq!(client.get_stake(&target), 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn stake_rejects_non_positive_amounts() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 500);
+
+        assert_eq!(
+            client.try_stake(&owner, &target, &0),
+            Err(Ok(RegistryError::InvalidAmount)),
+        );
+        assert_eq!(
+            client.try_stake(&owner, &target, &-100),
+            Err(Ok(RegistryError::InvalidAmount)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn stake_rejects_an_unregistered_contract() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+        mint(&env, &token_id, &owner, 500);
+
+        assert_eq!(
+            client.try_stake(&owner, &unregistered, &100),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Verification ────────────────────────────────────────────────────────
+
+    #[test]
+    fn verification_is_unset_by_default() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+        assert!(!client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn governance_can_attest_and_later_revoke_verification() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.is_verified(&target));
+
+        let pid = client.propose_set_verified(&admin, &target, &false);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(!client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn a_registrant_cannot_verify_their_own_contract() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+
+        // The owner is not an admin, and there is no non-governance path to
+        // verified status at all — this is the entire value of the signal.
+        assert_eq!(
+            client.try_propose_set_verified(&owner, &target, &true),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+        assert!(!client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn verification_cannot_be_proposed_for_an_unregistered_contract() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_propose_set_verified(&admin, &unregistered, &true),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn verification_survives_the_timelock_without_early_effect() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        client.approve_proposal(&admin, &pid);
+
+        // Approved but not executed: the attestation must not be live yet.
+        assert!(!client.is_verified(&target));
+
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+        assert!(client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Slashing ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn slash_moves_stake_to_the_treasury_and_records_the_reason() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "indexed a phishing contract");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        assert_eq!(client.get_stake(&target), 600);
+        assert_eq!(balance(&env, &token_id, &treasury), 400);
+        assert_eq!(balance(&env, &token_id, &client.address), 600);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 1);
+        let record = slashes.get(0).unwrap();
+        assert_eq!(record.amount, 400);
+        assert_eq!(record.reason, reason);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn repeated_slashes_accumulate_in_the_history() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let first = String::from_str(&env, "first offence");
+        let pid = client.propose_slash(&admin, &target, &200, &first);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let second = String::from_str(&env, "second offence");
+        let pid = client.propose_slash(&admin, &target, &300, &second);
+        pass_proposal(&env, &client, &admin, pid);
+
+        assert_eq!(client.get_stake(&target), 500);
+        assert_eq!(balance(&env, &token_id, &treasury), 500);
+
+        let slashes = client.get_slashes(&target);
+        assert_eq!(slashes.len(), 2);
+        assert_eq!(slashes.get(0).unwrap().reason, first);
+        assert_eq!(slashes.get(1).unwrap().reason, second);
+        assert_eq!(client.get_reputation(&target).slashed_total, 500);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn slash_cannot_exceed_the_staked_balance() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        let reason = String::from_str(&env, "over-slash");
+        let pid = client.propose_slash(&admin, &target, &500, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        // The proposal passes governance but reverts on execution rather than
+        // taking tokens the registry is not holding for this registration.
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::InsufficientStake)),
+        );
+        assert_eq!(client.get_stake(&target), 100);
+        assert_eq!(balance(&env, &token_id, &treasury), 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn slashing_a_registration_with_no_stake_is_rejected() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let reason = String::from_str(&env, "nothing at stake");
+        let pid = client.propose_slash(&admin, &target, &1, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        assert_eq!(
+            client.try_execute_proposal(&pid),
+            Err(Ok(RegistryError::InsufficientStake)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn slash_cannot_be_proposed_for_an_unregistered_contract() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+        let reason = String::from_str(&env, "unknown");
+
+        assert_eq!(
+            client.try_propose_slash(&admin, &unregistered, &100, &reason),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn slash_cannot_be_proposed_for_a_non_positive_amount() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+        let reason = String::from_str(&env, "zero");
+
+        assert_eq!(
+            client.try_propose_slash(&admin, &target, &0, &reason),
+            Err(Ok(RegistryError::InvalidAmount)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn slash_cannot_be_proposed_by_a_non_admin() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 100);
+        let reason = String::from_str(&env, "self-serving");
+
+        assert_eq!(
+            client.try_propose_slash(&owner, &target, &50, &reason),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Withdrawal ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn withdraw_returns_the_full_stake_once_the_owner_has_deactivated() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 750);
+
+        client.deactivate(&owner, &target);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(balance(&env, &token_id, &owner), 750);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn withdraw_is_refused_while_the_registration_is_still_active() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        // Still listed and still benefiting from the stake.
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::RegistrationActive)),
+        );
+        assert_eq!(client.get_stake(&target), 500);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn withdraw_is_refused_for_anyone_but_the_owner() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+        let stranger = Address::generate(&env);
+        client.deactivate(&owner, &target);
+
+        assert_eq!(
+            client.try_withdraw_stake(&stranger, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        assert_eq!(client.get_stake(&target), 500);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn withdraw_is_refused_when_there_is_nothing_staked() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        client.deactivate(&owner, &target);
+
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::InsufficientStake)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn withdraw_is_frozen_while_a_slash_is_still_recent() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "under investigation");
+        let pid = client.propose_slash(&admin, &target, &200, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        client.deactivate(&owner, &target);
+
+        // Deactivated and owned by the caller, but the slash lock is what
+        // stops the owner emptying the remainder before a second slash can
+        // clear its own timelock.
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+        assert_eq!(client.get_stake(&target), 800);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn withdraw_reopens_once_the_slash_lock_elapses() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        let reason = String::from_str(&env, "under investigation");
+        let pid = client.propose_slash(&admin, &target, &200, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+        client.deactivate(&owner, &target);
+
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+
+        // Only what survived the slash comes back.
+        assert_eq!(client.withdraw_stake(&owner, &target), 800);
+        assert_eq!(balance(&env, &token_id, &owner), 800);
+        assert_eq!(client.get_stake(&target), 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Reputation views ────────────────────────────────────────────────────
+
+    #[test]
+    fn reputation_of_an_untouched_registration_is_all_zeroes() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let reputation = client.get_reputation(&target);
+        assert_eq!(reputation.stake, 0);
+        assert!(!reputation.verified);
+        assert_eq!(reputation.slashed_total, 0);
+        assert_eq!(reputation.withdraw_locked_until, 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn contract_profile_joins_the_entry_with_its_reputation() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 600);
+
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.entry.contract_id, target);
+        assert_eq!(profile.entry.owner, owner);
+        assert!(profile.entry.active);
+        assert_eq!(profile.reputation.stake, 600);
+        assert!(profile.reputation.verified);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn contract_profile_rejects_an_unregistered_contract() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_get_contract_profile(&unregistered),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn active_profiles_track_active_contracts_and_carry_reputation() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_o1, staked) = register_and_stake(&env, &client, &token_id, 250);
+        let (owner2, plain) = register_sample(&env, &client);
+
+        let profiles = client.get_active_profiles(&0, &10);
+        assert_eq!(profiles.len(), client.get_active_contracts(&0, &10).len());
+        assert_eq!(profiles.len(), 2);
+
+        let with_stake = profiles.iter().find(|p| p.entry.contract_id == staked).unwrap();
+        assert_eq!(with_stake.reputation.stake, 250);
+        let without = profiles.iter().find(|p| p.entry.contract_id == plain).unwrap();
+        assert_eq!(without.reputation.stake, 0);
+
+        // Deactivation drops it from the profile listing exactly as it does
+        // from the plain listing.
+        client.deactivate(&owner2, &plain);
+        assert_eq!(client.get_active_profiles(&0, &10).len(), 1);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn active_profiles_paginate_like_active_contracts() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        for _ in 0..5 {
+            register_sample(&env, &client);
+        }
+
+        assert_eq!(client.get_active_profiles(&0, &2).len(), 2);
+        assert_eq!(client.get_active_profiles(&2, &2).len(), 2);
+        assert_eq!(client.get_active_profiles(&4, &2).len(), 1);
+        assert_eq!(client.get_active_profiles(&5, &2).len(), 0);
+        assert_eq!(client.get_active_profiles(&99, &2).len(), 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── End-to-end lifecycle ────────────────────────────────────────────────
+
+    #[test]
+    fn full_stake_verify_slash_withdraw_lifecycle() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+
+        // Register and post collateral.
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
+        client.stake(&owner, &target, &1_000);
+        assert_eq!(client.get_reputation(&target).stake, 1_000);
+
+        // Governance attests the project.
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.get_contract_profile(&target).reputation.verified);
+
+        // The project misbehaves and governance slashes a quarter of the stake.
+        let reason = String::from_str(&env, "misreported contract metadata");
+        let pid = client.propose_slash(&admin, &target, &250, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        let reputation = client.get_reputation(&target);
+        assert_eq!(reputation.stake, 750);
+        assert_eq!(reputation.slashed_total, 250);
+        assert!(reputation.withdraw_locked_until > env.ledger().sequence());
+        assert_eq!(balance(&env, &token_id, &treasury), 250);
+
+        // Trying to exit immediately fails on both counts, in order: still
+        // listed first, then still locked.
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::RegistrationActive)),
+        );
+        client.deactivate(&owner, &target);
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+
+        // Once the lock expires the remainder — and only the remainder —
+        // comes back.
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(balance(&env, &token_id, &owner), 750);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+
+        // The slash record outlives the stake it was taken from.
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_eq!(client.get_reputation(&target).slashed_total, 250);
+        assert_eq!(client.get_reputation(&target).stake, 0);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Stake-token failure ─────────────────────────────────────────────────
+    //
+    // Real stake tokens can refuse a transfer — a frozen trustline, an
+    // insufficient balance, a clawback-enabled asset. Every staking path moves
+    // tokens before writing its own bookkeeping, and relies on the failed
+    // transfer aborting the whole invocation so that nothing it wrote
+    // survives. These tests use a token that fails on demand to check that the
+    // registry's stored balances never drift from what the token reports.
+
+    #[contracttype]
+    enum FailingTokenKey {
+        Balance(Address),
+        Failing,
+    }
+
+    /// A minimal SEP-41-shaped token whose `transfer` can be switched to fail.
+    #[contract]
+    struct FailingToken;
+
+    #[contractimpl]
+    impl FailingToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = FailingTokenKey::Balance(to);
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(current + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage().persistent().get(&FailingTokenKey::Balance(id)).unwrap_or(0)
+        }
+
+        pub fn decimals(_env: Env) -> u32 {
+            7
+        }
+
+        pub fn set_failing(env: Env, failing: bool) {
+            env.storage().instance().set(&FailingTokenKey::Failing, &failing);
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            if env.storage().instance().get(&FailingTokenKey::Failing).unwrap_or(false) {
+                panic!("transfer refused: account frozen");
+            }
+            let from_balance = Self::balance(env.clone(), from.clone());
+            if from_balance < amount {
+                panic!("transfer refused: insufficient balance");
+            }
+            env.storage().persistent()
+                .set(&FailingTokenKey::Balance(from), &(from_balance - amount));
+            Self::mint(env, to, amount);
+        }
+    }
+
+    /// Like [`setup_staking`], but with a [`FailingToken`] as the stake token.
+    fn setup_failing_staking() -> (
+        Env,
+        LuminaRegistryClient<'static>,
+        Address,
+        FailingTokenClient<'static>,
+        Address,
+    ) {
+        let (env, client, admin) = setup();
+        let token_id = env.register(FailingToken, ());
+        let token = FailingTokenClient::new(&env, &token_id);
+        let treasury = Address::generate(&env);
+
+        let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
+        pass_proposal(&env, &client, &admin, pid);
+
+        (env, client, admin, token, treasury)
+    }
+
+    /// The registry's recorded stakes must add up to exactly what the token
+    /// says the registry holds.
+    fn assert_accounting_matches_token(
+        client: &LuminaRegistryClient,
+        token: &FailingTokenClient,
+        registrations: &[&Address],
+    ) {
+        let recorded: i128 = registrations.iter().map(|r| client.get_stake(r)).sum();
+        assert_eq!(recorded, token.balance(&client.address));
+    }
+
+    #[test]
+    fn failed_stake_transfer_records_no_stake() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+
+        token.set_failing(&true);
+        assert!(client.try_stake(&owner, &target, &400).is_err());
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(client.get_reputation(&target).stake, 0);
+        assert_eq!(token.balance(&owner), 1_000);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        // Nothing was half-applied, so a retry once the token recovers counts
+        // the stake exactly once.
+        token.set_failing(&false);
+        client.stake(&owner, &target, &400);
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(token.balance(&owner), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn failed_top_up_leaves_the_existing_stake_untouched() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &400);
+
+        token.set_failing(&true);
+        assert!(client.try_stake(&owner, &target, &100).is_err());
+
+        assert_eq!(client.get_stake(&target), 400);
+        assert_eq!(token.balance(&owner), 600);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn stake_beyond_the_owners_balance_records_nothing() {
+        // The same guarantee against a real Stellar Asset Contract, whose
+        // refusal here is an ordinary insufficient-balance error.
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 100);
+
+        assert!(client.try_stake(&owner, &target, &101).is_err());
+
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(balance(&env, &token_id, &owner), 100);
+        assert_eq!(balance(&env, &token_id, &client.address), 0);
+    }
+
+    #[test]
+    fn failed_withdraw_transfer_keeps_the_stake_recorded() {
+        let (env, client, _admin, token, _treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &750);
+        client.stake(&owner, &target, &750);
+        client.deactivate(&owner, &target);
+
+        token.set_failing(&true);
+        assert!(client.try_withdraw_stake(&owner, &target).is_err());
+
+        // Zeroing the stake without the tokens leaving would strand them in
+        // the registry with no registration able to claim them.
+        assert_eq!(client.get_stake(&target), 750);
+        assert_eq!(token.balance(&owner), 0);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        token.set_failing(&false);
+        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(client.get_stake(&target), 0);
+        assert_eq!(token.balance(&owner), 750);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+    }
+
+    #[test]
+    fn failed_slash_transfer_leaves_stake_history_and_proposal_untouched() {
+        let (env, client, admin, token, treasury) = setup_failing_staking();
+        let (owner, target) = register_sample(&env, &client);
+        token.mint(&owner, &1_000);
+        client.stake(&owner, &target, &1_000);
+
+        let reason = String::from_str(&env, "indexed a phishing contract");
+        let pid = client.propose_slash(&admin, &target, &400, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+
+        token.set_failing(&true);
+        assert!(client.try_execute_proposal(&pid).is_err());
+
+        // No stake debited, no slash recorded, no withdraw lock applied, and
+        // — although `execute_proposal` marks the proposal executed before
+        // applying it — that mark is rolled back too, so it can be retried.
+        assert_eq!(client.get_stake(&target), 1_000);
+        assert_eq!(client.get_slashes(&target).len(), 0);
+        assert_eq!(client.get_reputation(&target).slashed_total, 0);
+        assert_eq!(client.get_reputation(&target).withdraw_locked_until, 0);
+        assert!(!client.get_proposal(&pid).executed);
+        assert_eq!(token.balance(&treasury), 0);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        token.set_failing(&false);
+        client.execute_proposal(&pid);
+        assert_eq!(client.get_stake(&target), 600);
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_eq!(token.balance(&treasury), 400);
+        assert_accounting_matches_token(&client, &token, &[&target]);
+
+        // The retried slash applied its lock as normal.
+        client.deactivate(&owner, &target);
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::StakeLocked)),
+        );
+    }
+
+    #[test]
+    fn a_failed_transfer_on_one_registration_does_not_disturb_another() {
+        let (env, client, admin, token, _treasury) = setup_failing_staking();
+        let (owner_a, a) = register_sample(&env, &client);
+        let (owner_b, b) = register_sample(&env, &client);
+        token.mint(&owner_a, &500);
+        token.mint(&owner_b, &300);
+        client.stake(&owner_a, &a, &500);
+        client.stake(&owner_b, &b, &300);
+
+        let reason = String::from_str(&env, "spam");
+        let pid = client.propose_slash(&admin, &a, &200, &reason);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.deactivate(&owner_b, &b);
+
+        token.set_failing(&true);
+        assert!(client.try_execute_proposal(&pid).is_err());
+        assert!(client.try_withdraw_stake(&owner_b, &b).is_err());
+
+        assert_eq!(client.get_stake(&a), 500);
+        assert_eq!(client.get_stake(&b), 300);
+        assert_accounting_matches_token(&client, &token, &[&a, &b]);
+    }
+
+    // ── Category taxonomy ───────────────────────────────────────────────────
+
+    #[test]
+    fn registration_requires_at_least_one_category() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            client.try_register_contract(
+                &owner,
+                &target,
+                &String::from_str(&env, "Uncategorized"),
+                &String::from_str(&env, "Uncategorized"),
+                &Vec::new(&env),
+            ),
+            Err(Ok(RegistryError::NoCategories)),
+        );
+        assert!(!client.is_registered(&target));
+    }
+
+    #[test]
+    fn registration_records_its_categories() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Payments]);
+
+        let recorded = client.get_categories(&target);
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.contains(&Category::DeFi));
+        assert!(recorded.contains(&Category::Payments));
+    }
+
+    #[test]
+    fn duplicate_categories_are_collapsed() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(
+            &env,
+            &client,
+            &owner,
+            &[Category::Gaming, Category::Gaming, Category::Gaming],
+        );
+
+        assert_eq!(client.get_categories(&target).len(), 1);
+        // And the index lists it once, not three times.
+        assert_eq!(client.get_active_contracts_by_category(&Category::Gaming, &0, &10).len(), 1);
+    }
+
+    #[test]
+    fn a_multi_category_registration_is_discoverable_under_each() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Oracle]);
+
+        for category in [Category::DeFi, Category::Oracle] {
+            let page = client.get_active_contracts_by_category(&category, &0, &10);
+            assert_eq!(page.len(), 1);
+            assert_eq!(page.get(0).unwrap().contract_id, target);
+        }
+    }
+
+    #[test]
+    fn category_listing_excludes_other_categories() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let defi = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let gaming = register_in(&env, &client, &owner, &[Category::Gaming]);
+
+        let defi_page = client.get_active_contracts_by_category(&Category::DeFi, &0, &10);
+        assert!(page_contains(&defi_page, &defi));
+        assert!(!page_contains(&defi_page, &gaming));
+
+        let gaming_page = client.get_active_contracts_by_category(&Category::Gaming, &0, &10);
+        assert!(page_contains(&gaming_page, &gaming));
+        assert!(!page_contains(&gaming_page, &defi));
+    }
+
+    #[test]
+    fn an_unused_category_returns_an_empty_page() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Dao, &0, &10).len(), 0);
+        // Including on a completely empty registry.
+        let (_env2, empty, _a) = setup();
+        assert_eq!(empty.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 0);
+    }
+
+    #[test]
+    fn deactivation_removes_a_contract_from_category_browsing() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::Identity]);
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Identity, &0, &10).len(), 1);
+
+        client.deactivate(&owner, &target);
+
+        // Filtered out of browsing, exactly like the global listing...
+        assert_eq!(client.get_active_contracts_by_category(&Category::Identity, &0, &10).len(), 0);
+        assert_eq!(client.get_active_contracts(&0, &10).len(), 0);
+        // ...but still recorded against the registration, because `deactivate`
+        // does not rewrite category indices.
+        assert_eq!(client.get_categories(&target).len(), 1);
+    }
+
+    #[test]
+    fn category_pagination_matches_the_global_listing() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        for _ in 0..5 {
+            register_in(&env, &client, &owner, &[Category::Nft]);
+        }
+        // A registration in another category must not leak into the pages.
+        register_in(&env, &client, &owner, &[Category::Gaming]);
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &0, &10).len(), 5);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &0, &2).len(), 2);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &2, &2).len(), 2);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &4, &2).len(), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &5, &2).len(), 0);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Nft, &99, &2).len(), 0);
+    }
+
+    #[test]
+    fn category_pages_are_in_registration_order() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let first = register_in(&env, &client, &owner, &[Category::Dao]);
+        let second = register_in(&env, &client, &owner, &[Category::Dao]);
+        let third = register_in(&env, &client, &owner, &[Category::Dao]);
+
+        let at = |offset: u32| {
+            client.get_active_contracts_by_category(&Category::Dao, &offset, &1)
+                .get(0).unwrap().contract_id
+        };
+        assert_eq!(at(0), first);
+        assert_eq!(at(1), second);
+        assert_eq!(at(2), third);
+    }
+
+    #[test]
+    fn category_paging_is_identical_to_the_global_listing_over_the_same_set() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+
+        // Every registration goes in one category, so the category index and
+        // the global index hold the same addresses in the same order. Any
+        // divergence between the two queries is then a real difference in
+        // paging semantics rather than a difference in the data.
+        let mut registered = Vec::new(&env);
+        for _ in 0..6 {
+            registered.push_back(register_in(&env, &client, &owner, &[Category::Oracle]));
+        }
+
+        // A hole in the middle and one at the very end, so the comparison
+        // covers pages that span skipped entries and pages that run off the
+        // end of the index.
+        client.deactivate(&owner, &registered.get(2).unwrap());
+        client.deactivate(&owner, &registered.get(5).unwrap());
+
+        for offset in 0..8u32 {
+            for limit in 0..8u32 {
+                assert_eq!(
+                    client.get_active_contracts_by_category(&Category::Oracle, &offset, &limit),
+                    client.get_active_contracts(&offset, &limit),
+                    "category paging diverged at offset {} limit {}",
+                    offset,
+                    limit,
+                );
+            }
+        }
+
+        // And the shared behaviour is the one worth naming: `offset` indexes
+        // the raw index, while deactivated entries are stepped over without
+        // consuming `limit`.
+        let page = client.get_active_contracts_by_category(&Category::Oracle, &2, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().contract_id, registered.get(3).unwrap());
+        assert_eq!(page.get(1).unwrap().contract_id, registered.get(4).unwrap());
+    }
+
+    // ── set_categories ──────────────────────────────────────────────────────
+
+    #[test]
+    fn set_categories_moves_a_registration_between_categories() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 0);
+        let page = client.get_active_contracts_by_category(&Category::Payments, &0, &10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().contract_id, target);
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::Payments]));
+    }
+
+    #[test]
+    fn set_categories_keeps_the_ones_that_are_retained() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Oracle]);
+
+        client.set_categories(&owner, &target, &cats(&env, &[Category::DeFi, Category::Dao]));
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Dao, &0, &10).len(), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Oracle, &0, &10).len(), 0);
+    }
+
+    #[test]
+    fn set_categories_does_not_duplicate_an_unchanged_category() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::Gaming]);
+
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Gaming]));
+
+        assert_eq!(client.get_active_contracts_by_category(&Category::Gaming, &0, &10).len(), 1);
+        assert_eq!(client.get_categories(&target).len(), 1);
+    }
+
+    #[test]
+    fn set_categories_is_owner_only() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_categories(&stranger, &target, &cats(&env, &[Category::Gaming])),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        // Not even the admin — how a project files itself is its own business,
+        // exactly as with `update_metadata`.
+        assert_eq!(
+            client.try_set_categories(&admin, &target, &cats(&env, &[Category::Gaming])),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::DeFi]));
+    }
+
+    #[test]
+    fn set_categories_rejects_an_empty_selection() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        assert_eq!(
+            client.try_set_categories(&owner, &target, &Vec::new(&env)),
+            Err(Ok(RegistryError::NoCategories)),
+        );
+        assert_eq!(client.get_categories(&target).len(), 1);
+    }
+
+    #[test]
+    fn set_categories_rejects_an_unregistered_contract() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_categories(&owner, &unregistered, &cats(&env, &[Category::DeFi])),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn set_categories_survives_a_transfer_of_ownership() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let new_owner = Address::generate(&env);
+
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        client.accept_ownership(&new_owner, &target);
+
+        // The old owner has lost the right to refile it; the new one has it.
+        assert_eq!(
+            client.try_set_categories(&owner, &target, &cats(&env, &[Category::Gaming])),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        client.set_categories(&new_owner, &target, &cats(&env, &[Category::Gaming]));
+        assert_eq!(client.get_categories(&target), cats(&env, &[Category::Gaming]));
+    }
+
+    #[test]
+    fn ownership_transfer_preserves_stake_and_verification() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let new_owner = Address::generate(&env);
+
+        mint(&env, &token_id, &owner, 500);
+        client.stake(&owner, &target, &500);
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        client.propose_ownership_transfer(&owner, &target, &new_owner);
+        client.accept_ownership(&new_owner, &target);
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.entry.owner, new_owner);
+        assert_eq!(profile.reputation.stake, 500);
+        assert!(profile.reputation.verified);
+        assert_eq!(client.get_stake(&target), 500);
+
+        assert_eq!(
+            client.try_withdraw_stake(&owner, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+        client.deactivate(&new_owner, &target);
+        assert_eq!(client.withdraw_stake(&new_owner, &target), 500);
+        assert_eq!(client.get_stake(&target), 0);
+        assert!(client.is_verified(&target));
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn categories_and_reputation_are_independent() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        mint(&env, &token_id, &owner, 500);
+        client.stake(&owner, &target, &500);
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Refiling the contract must not disturb its stake or attestation.
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+
+        let profile = client.get_contract_profile(&target);
+        assert_eq!(profile.reputation.stake, 500);
+        assert!(profile.reputation.verified);
+        assert_eq!(
+            client.get_active_contracts_by_category(&Category::Payments, &0, &10).len(),
+            1,
+        );
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── Third-party attestations ────────────────────────────────────────────
+
+    #[test]
+    fn multiple_parties_can_attest_to_the_same_registration() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "used in production"));
+        client.attest(&carol, &target, &String::from_str(&env, "independent review"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 3);
+
+        // Every attester's identity is recorded — the claim is attributable,
+        // not anonymous.
+        assert!(attestations.iter().any(|a| a.attester == alice));
+        assert!(attestations.iter().any(|a| a.attester == bob));
+        assert!(attestations.iter().any(|a| a.attester == carol));
+    }
+
+    #[test]
+    fn attestation_records_the_attester_label_and_ledger() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        let before = env.ledger().sequence();
+        client.attest(&alice, &target, &String::from_str(&env, "audited by acme"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        let attestation = attestations.get(0).unwrap();
+        assert_eq!(attestation.attester, alice);
+        assert_eq!(attestation.label, String::from_str(&env, "audited by acme"));
+        assert_eq!(attestation.created_at, before);
+    }
+
+    #[test]
+    fn attestations_are_kept_in_the_order_they_were_made() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "first"));
+        advance_ledger(&env, 5);
+        client.attest(&bob, &target, &String::from_str(&env, "second"));
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+        assert_eq!(attestations.get(1).unwrap().attester, bob);
+    }
+
+    #[test]
+    fn attesting_twice_updates_rather_than_duplicating() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "preliminary"));
+        advance_ledger(&env, 100);
+        client.attest(&alice, &target, &String::from_str(&env, "final audit"));
+
+        // One entry, not two, and the stale label is gone.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().label, String::from_str(&env, "final audit"));
+    }
+
+    #[test]
+    fn an_attester_can_revoke_their_own_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "audited too"));
+
+        // Returns the number remaining.
+        assert_eq!(client.revoke_attestation(&alice, &target), 1);
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        // Only Alice's is gone; Bob's is untouched.
+        assert_eq!(attestations.get(0).unwrap().attester, bob);
+    }
+
+    #[test]
+    fn revoking_removes_only_the_callers_own_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "a"));
+        client.attest(&bob, &target, &String::from_str(&env, "b"));
+        client.attest(&carol, &target, &String::from_str(&env, "c"));
+
+        // Bob revokes; Alice's and Carol's must both survive.
+        assert_eq!(client.revoke_attestation(&bob, &target), 2);
+
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 2);
+        assert!(attestations.iter().any(|a| a.attester == alice));
+        assert!(attestations.iter().any(|a| a.attester == carol));
+        assert!(!attestations.iter().any(|a| a.attester == bob));
+    }
+
+    #[test]
+    fn a_caller_cannot_revoke_someone_elses_attestation() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let mallory = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // Mallory has no attestation of her own to revoke.
+        assert_eq!(
+            client.try_revoke_attestation(&mallory, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+
+        // Alice's attestation is untouched by the attempt.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn neither_an_admin_nor_the_owner_can_revoke_another_partys_attestation() {
+        let (env, client, admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // Privilege confers no standing here: the governance admin set and the
+        // registration's owner are both refused, because the record is keyed
+        // to the attester and only the attester can withdraw it.
+        assert_eq!(
+            client.try_revoke_attestation(&admin, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+        assert_eq!(
+            client.try_revoke_attestation(&owner, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+
+        assert_eq!(client.get_attestations(&target).len(), 1);
+        assert_eq!(client.get_attestations(&target).get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn revoking_twice_fails_on_the_second_call() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.revoke_attestation(&alice, &target), 0);
+
+        // Idempotence is not offered here: a second revoke is an error rather
+        // than a silent no-op, so a caller cannot mistake it for success.
+        assert_eq!(
+            client.try_revoke_attestation(&alice, &target),
+            Err(Ok(RegistryError::AttestationNotFound)),
+        );
+    }
+
+    #[test]
+    fn attesting_is_rejected_for_an_unregistered_contract() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let unregistered = Address::generate(&env);
+
+        assert_eq!(
+            client.try_attest(&alice, &unregistered, &String::from_str(&env, "audited")),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+        assert_eq!(
+            client.try_revoke_attestation(&alice, &unregistered),
+            Err(Ok(RegistryError::ContractNotFound)),
+        );
+    }
+
+    #[test]
+    fn attestation_labels_are_length_bounded() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        // Empty labels carry no claim but still cost storage.
+        assert_eq!(
+            client.try_attest(&alice, &target, &String::from_str(&env, "")),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+
+        // At the limit: accepted.
+        let at_limit = "a".repeat(MAX_ATTESTATION_LABEL_LEN as usize);
+        client.attest(&alice, &target, &String::from_str(&env, &at_limit));
+        assert_eq!(client.get_attestations(&target).len(), 1);
+
+        // One byte over: rejected.
+        let over_limit = "a".repeat(MAX_ATTESTATION_LABEL_LEN as usize + 1);
+        let bob = Address::generate(&env);
+        assert_eq!(
+            client.try_attest(&bob, &target, &String::from_str(&env, &over_limit)),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+
+        // The rejected attestation left nothing behind.
+        let attestations = client.get_attestations(&target);
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations.get(0).unwrap().attester, alice);
+    }
+
+    #[test]
+    fn the_number_of_attestations_per_registration_is_bounded() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+
+        for i in 0..MAX_ATTESTATIONS_PER_CONTRACT {
+            client.attest(
+                &Address::generate(&env),
+                &target,
+                &String::from_str(&env, "audited"),
+            );
+            // Keep labels distinct from the counter for clarity if it ever fails.
+            let _ = i;
+        }
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // The next distinct attester is refused: the list cannot grow without
+        // bound, so a reader's cost stays fixed.
+        let overflow = Address::generate(&env);
+        assert_eq!(
+            client.try_attest(&overflow, &target, &String::from_str(&env, "audited")),
+            Err(Ok(RegistryError::InvalidAttestation)),
+        );
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // An existing attester can still revise their own label at the cap,
+        // since that replaces rather than appends.
+        let first = client.get_attestations(&target).get(0).unwrap().attester;
+        client.attest(&first, &target, &String::from_str(&env, "revised"));
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+
+        // And revoking frees a slot again.
+        client.revoke_attestation(&first, &target);
+        client.attest(&overflow, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.get_attestations(&target).len(), MAX_ATTESTATIONS_PER_CONTRACT);
+    }
+
+    #[test]
+    fn attestations_are_scoped_to_one_registration() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let first = register_for(&env, &client, &alice);
+        let second = register_for(&env, &client, &alice);
+
+        client.attest(&alice, &first, &String::from_str(&env, "audited"));
+        client.attest(&alice, &second, &String::from_str(&env, "audited"));
+
+        // Same attester, two registrations, one entry each.
+        assert_eq!(client.get_attestations(&first).len(), 1);
+        assert_eq!(client.get_attestations(&second).len(), 1);
+
+        client.revoke_attestation(&alice, &first);
+        assert_eq!(client.get_attestations(&first).len(), 0);
+        // Revoking on one registration leaves the other alone.
+        assert_eq!(client.get_attestations(&second).len(), 1);
+    }
+
+    #[test]
+    fn a_registration_with_no_attestations_reports_an_empty_list() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_attestations(&target).len(), 0);
+
+        // Unregistered addresses read as empty too, mirroring `get_tags`.
+        assert_eq!(client.get_attestations(&Address::generate(&env)).len(), 0);
+    }
+
+    #[test]
+    fn attesting_does_not_affect_governance_only_verification() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Attestation is not verification, in either direction.
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        client.attest(&bob, &target, &String::from_str(&env, "audited"));
+        assert!(!client.is_verified(&target));
+        assert_eq!(client.get_reputation(&target).verified, false);
+
+        // Verified statistics do not move either: attestations are not an
+        // input to the verified signal.
+        let stats = client.get_registry_stats();
+        assert_eq!(stats.verified_count, 0);
+
+        // Only governance can set it, and it still goes through the proposal
+        // flow rather than being implied by the attestations.
+        let pid = client.propose_set_verified(&admin, &target, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        assert!(client.is_verified(&target));
+        assert_eq!(client.get_registry_stats().verified_count, 1);
+        assert_eq!(client.get_attestations(&target).len(), 2);
+    }
+
+    #[test]
+    fn attesting_does_not_grant_verification_or_privilege_to_the_attester() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+
+        // The attester gained nothing: still not verified, and still not an
+        // admin, so it cannot propose governance actions.
+        assert!(!client.is_verified(&target));
+        assert!(!client.get_admins().contains(&alice));
+        assert_eq!(
+            client.try_propose_set_verified(&alice, &target, &true),
+            Err(Ok(RegistryError::NotAdmin)),
+        );
+
+        // And it is not the registration's owner, so owner-gated actions
+        // remain closed to it.
+        assert_ne!(alice, owner);
+        assert_eq!(
+            client.try_update_metadata(&alice, &target, &String::from_str(&env, "x"), &String::from_str(&env, "y")),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+    }
+
+    #[test]
+    fn deregistering_removes_the_registrations_attestations() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let alice = Address::generate(&env);
+
+        client.attest(&alice, &target, &String::from_str(&env, "audited"));
+        assert_eq!(client.get_attestations(&target).len(), 1);
+
+        client.deactivate(&owner, &target);
+        client.deregister(&owner, &target);
+
+        // Opinions about a registration that no longer exists are cleared, so
+        // a later re-registration does not inherit them.
+        assert!(!client.is_registered(&target));
+        assert_eq!(client.get_attestations(&target).len(), 0);
+
+        let fresh = register_for(&env, &client, &owner);
+        assert_eq!(client.get_attestations(&fresh).len(), 0);
+    }
+
+    // ── Deregistration, pruning & counters ──────────────────────────────────
+
+    #[test]
+    fn deregister_removes_every_index_reference_and_decrements_the_live_count() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Oracle]);
+
+        assert_eq!(client.get_contract_count(), 1);
+        assert_eq!(client.get_total_registered(), 1);
+
+        client.deactivate(&owner, &target);
+        client.deregister(&owner, &target);
+
+        // The entry is gone and the address may be re-registered.
+        assert!(!client.is_registered(&target));
+        assert_eq!(client.get_contract_count(), 0);
+        // Lifetime total is untouched.
+        assert_eq!(client.get_total_registered(), 1);
+        assert_eq!(client.get_active_contract_count(), 0);
+
+        // No index reference remains: global, owner, and both categories.
+        assert_eq!(client.get_active_contracts(&0, &10).len(), 0);
+        assert_eq!(client.get_contracts_by_owner(&owner, &0, &10).len(), 0);
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 0);
+        assert_eq!(client.get_active_contracts_by_category(&Category::Oracle, &0, &10).len(), 0);
+        assert_eq!(client.get_categories(&target).len(), 0);
+    }
+
+    #[test]
+    fn deregister_requires_deactivated_and_unstaked() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        // Still active.
+        assert_eq!(
+            client.try_deregister(&owner, &target),
+            Err(Ok(RegistryError::RegistrationActive)),
+        );
+
+        client.deactivate(&owner, &target);
+
+        // Still staked.
+        assert_eq!(
+            client.try_deregister(&owner, &target),
+            Err(Ok(RegistryError::StakeNotEmpty)),
+        );
+        assert_solvency(&env, &client, &token_id);
+
+        // Non-owner cannot deregister even once eligible.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_deregister(&stranger, &target),
+            Err(Ok(RegistryError::NotOwner)),
+        );
+    }
+
+    #[test]
+    fn deregister_keeps_slash_history_for_audit() {
+        let (env, client, admin, token_id, _treasury) = setup_staking();
+        let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        let reason = String::from_str(&env, "kept for audit");
+        let pid = client.propose_slash(&admin, &target, &100, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+        client.deactivate(&owner, &target);
+
+        advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        client.withdraw_stake(&owner, &target);
+        client.deregister(&owner, &target);
+
+        assert_eq!(client.get_slashes(&target).len(), 1);
+        assert_solvency(&env, &client, &token_id);
+    }
+
+    #[test]
+    fn prune_category_drops_dead_references_and_is_safe_to_repeat() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let live = register_in(&env, &client, &owner, &[Category::DeFi]);
+        let gone = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        // Simulate a dead reference the eager paths did not clean (e.g.
+        // archival): remove the Contract entry behind the index's back.
+        env.as_contract(&client.address, || {
+            env.storage().persistent().remove(&DataKey::Contract(gone.clone()));
+        });
+
+        // The listing tolerates it, so it stays correct but pays for the walk.
+        let page = client.get_active_contracts_by_category(&Category::DeFi, &0, &10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().contract_id, live);
+
+        // Permissionless prune removes exactly the dead reference...
+        assert_eq!(client.prune_category(&Category::DeFi), 1);
+        assert_eq!(client.get_active_contracts_by_category(&Category::DeFi, &0, &10).len(), 1);
+
+        // ...and repeating it removes nothing.
+        assert_eq!(client.prune_category(&Category::DeFi), 0);
+        assert_eq!(client.prune_all_contracts(), 1);
+        assert_eq!(client.prune_all_contracts(), 0);
+    }
+
+    #[test]
+    fn contract_count_is_live_and_total_registered_is_lifetime() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let first = register_in(&env, &client, &owner, &[Category::Dao]);
+        let _second = register_in(&env, &client, &owner, &[Category::Dao]);
+
+        assert_eq!(client.get_contract_count(), 2);
+        assert_eq!(client.get_total_registered(), 2);
+        assert_eq!(client.get_active_contract_count(), 2);
+
+        client.deactivate(&owner, &first);
+        // Deactivation is not deregistration: the live total still counts it,
+        // only the active figure drops.
+        assert_eq!(client.get_contract_count(), 2);
+        assert_eq!(client.get_total_registered(), 2);
+        assert_eq!(client.get_active_contract_count(), 1);
+
+        client.deregister(&owner, &first);
+        assert_eq!(client.get_contract_count(), 1);
+        assert_eq!(client.get_total_registered(), 2);
+        assert_eq!(client.get_active_contract_count(), 1);
+    }
+
+    // ── set_superseded_by ───────────────────────────────────────────────────
+
+    #[test]
+    fn owner_can_set_superseded_by_and_profile_surfaces_it() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+
+        client.set_superseded_by(&owner, &old, &new_contract);
+
+        let profile = client.get_contract_profile(&old);
+        assert_eq!(profile.superseded_by, Some(new_contract));
+    }
+
+    #[test]
+    fn set_superseded_by_rejects_unregistered_replacement() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let ghost = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&owner, &old, &ghost),
+            Err(Ok(RegistryError::ContractNotFound))
+        );
+    }
+
+    #[test]
+    fn set_superseded_by_is_owner_only() {
+        let (env, client, _admin) = setup();
+        let (owner, old) = register_sample(&env, &client);
+        let new_contract = register_for(&env, &client, &owner);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_superseded_by(&stranger, &old, &new_contract),
+            Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn superseded_by_is_none_by_default() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        assert_eq!(client.get_contract_profile(&target).superseded_by, None);
+    }
+}

@@ -208,6 +208,10 @@ pub trait RegistryInterface {
     /// or that was never registered.
     fn get_tags(env: Env, contract_id: Address) -> Vec<String>;
 
+    /// Third-party attestations on a registered contract. Empty for one that has none,
+    /// or that was never registered.
+    fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation>;
+
     /// One page of active registrations filed under `category`, in
     /// registration order.
 ///
@@ -233,10 +237,10 @@ pub trait RegistryInterface {
     ) -> Vec<ContractEntry>;
 
     /// One page of active registrations filed under **any** of `categories` —
-/// the union, deduplicated, in registration order.
-///
-/// Errors with `NoCategories` if `categories` is empty. Paging semantics
-/// as for `get_active_contracts_by_category`.
+    /// the union, deduplicated, in registration order.
+    ///
+    /// Errors with `NoCategories` if `categories` is empty. Paging semantics
+    /// as for `get_active_contracts_by_category`.
     fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
@@ -260,8 +264,7 @@ pub trait RegistryInterface {
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
 
-    /// The stake a registration has to hold to stay listed. Zero means the
-/// threshold is not open — nothing is refused for being under-staked.
+    /// Minimum stake threshold. Zero means no minimum.
     fn get_minimum_stake(env: Env) -> i128;
 
     /// Currently staked balance. Zero for a registration that never staked,
@@ -438,20 +441,8 @@ pub trait RegistryInterface {
     /// from registration, not an opaque storage failure.
     fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry>;
 
-    /// Cursor form of `get_contracts_by_owner`, including deactivated entries.
-    /// `cursor` is the `contract_id` last returned, or `None` to start.
-    fn get_contracts_by_owner_after(
-        env: Env,
-        owner: Address,
-        cursor: Option<Address>,
-        limit: u32,
-    ) -> Vec<ContractEntry>;
-
-    /// Whether an address is in the governance admin set.
-    fn is_admin(env: Env, address: Address) -> bool;
-
-    /// The admins that have approved a governance proposal.
-    fn get_proposal_approvals(env: Env, proposal_id: u32) -> Result<Vec<Address>, RegistryError>;
+    /// Retrieve the pending owner for a registration, if an ownership transfer is in flight.
+    fn get_pending_owner(env: Env, contract_id: Address) -> Option<Address>;
 }
 
 /// The maximum number of contracts a single owner may register.
@@ -541,8 +532,15 @@ pub enum RegistryError {
     InsufficientFee = 26,
     /// Tag count or length exceeds bounds.
     InvalidTags = 26,
-    /// The caller has no slashed stake available to claim.
-    NothingToClaim = 27,
+    /// Attestation label is empty, too long, or the registration already has
+    /// the maximum number of attestations.
+    InvalidAttestation = 27,
+    /// The caller has no attestation to revoke on this registration.
+    AttestationNotFound = 28,
+    /// The token or treasury address overlaps with an already registered contract.
+    OverlappingAddress = 29,
+    /// No ownership transfer is currently proposed for this contract.
+    NoPendingTransfer = 30,
 }
 
 /// A single attestation recorded against a contract.
@@ -737,7 +735,19 @@ pub struct Reputation {
     pub active: bool,
 }
 
-/// A registration joined with its reputation.
+/// Byte-compatible with `lumina_registry::Attestation`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attestation {
+    /// The account that made the attestation.
+    pub attester: Address,
+    /// Human-readable label.
+    pub label: String,
+    /// Ledger at which the attestation was recorded.
+    pub created_at: u32,
+}
+
+/// Byte-compatible with `lumina_registry::ContractProfile`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
@@ -841,10 +851,10 @@ pub enum ProposalAction {
     ConfigureRegistrationRateLimit(u32, u32),
     /// Set the registration fee in the stake token; zero disables it.
     SetRegistrationFee(i128),
-    /// Set the slash split between treasury and the staker reward pool, in
-    /// basis points: `(treasury_bps, staker_pool_bps)`. The two must sum to
-    /// 10_000.
-    ConfigureSlashSplit(u32, u32),
+    /// Set the minimum stake threshold; zero disables it.
+    ConfigureMinimumStake(i128),
+    /// Withdraw from the treasury.
+    WithdrawFromTreasury(i128),
 }
 
 /// Number of ledgers a proposal of a given action must wait before execution.
