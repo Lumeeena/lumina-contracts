@@ -1,48 +1,5 @@
-// Copyright (c) Lumina contributors
-// SPDX-License-Identifier: MIT
-//! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
-//!
-//! The interface — every exported function signature and every type and error
-//! code those functions expose — is what the indexer, the frontend and every
-//! registrant bind to. A renamed parameter or a new argument is a breaking
-//! change for all of them, and without this test it only surfaces when
-//! something downstream fails.
-//!
-//! The test reads the contract spec out of the *built* wasm (the same
-//! `contractspecv0` section `stellar contract bindings` and `contractimport!`
-//! consume), renders it as plain text, and compares it with the checked-in
-//! `registry/interface.snap`. Doc comments are left out: rewording one is not
-//! an interface change.
-//!
-//! The exported interface also includes the `Category` enum and the
-//! `MAX_CATEGORIES_PER_CONTRACT` cap: a registration may claim at most that
-//! many categories, and claiming more is rejected with `TooManyCategories`.
-//! The cap is deliberately smaller than the vocabulary so that a registration
-//! claiming every category is rejected rather than silently truncated.
-//!
-//! To accept an intended change, rebuild the wasm and regenerate the snapshot:
-//!
-//! ```bash
 //! cargo build --target wasm32v1-none --release && UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
-//! ```
 //!
-//! then commit `registry/interface.snap` alongside the change so the diff is
-//! reviewed with it.
-//!
-//! This file also guards the `registry-v2` upgrade fixture, a hand-maintained
-//! copy of the storage types that must stay byte-compatible with the real ones.
-//! The fixture's whole value is proving that independently written v2 types
-//! decode v1 storage, so if it drifts out of sync with the types it mirrors it
-//! quietly stops testing anything. When a storage type changes, update the
-//! fixture deliberately and regenerate its snapshot:
-//!
-//! 
-//!
-//! The interface snapshot also covers the delegation surface: `set_manager`,
-//! `manager`, and `revoke_manager` are exported so that an owner can delegate
-//! metadata and category management without exposing stake withdrawal or
-//! ownership transfer. Managers are intentionally limited to the metadata and
-//! category entry points; the value-moving entry points remain owner-only.
 
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
@@ -51,7 +8,7 @@ use std::path::PathBuf;
 const UPDATE_ENV: &str = "UPDATE_INTERFACE_SNAPSHOT";
 
 fn manifest_path(parts: &[&str]) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut path = PathBuf&#39;::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(parts);
     path
 }
@@ -84,7 +41,7 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
     }
 }
 
-/// One line per exported item, sorted so that moving code around in `lib.rs`
+/// One line per exported item, sorted so that moving code around in `lib.r`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
 ///
@@ -96,10 +53,9 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
         .iter()
         .map(|entry| match entry {
             ScSpecEntry::FunctionV0(f) => {
-                let args = f
-                    .inputs
+                let args = f.inputs
                     .iter()
-                    .map(|i| {
+.map(|i| {
                         format!(
                             "{}: {}",
                             i.name.to_utf8_string_lossy(),
@@ -127,7 +83,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("struct {} {{ {} }}", s.name.to_utf8_string_lossy(), fields)
+                format!("struct {} { {} }", s.name.to_utf8_string_lossy(), fields)
             }
             ScSpecEntry::UdtUnionV0(u) => {
                 let cases = u
@@ -147,7 +103,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("union {} {{ {} }}", u.name.to_utf8_string_lossy(), cases)
+                format!("union {} { {} }", u.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtEnumV0(e) => {
                 let cases = e
@@ -156,7 +112,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("enum {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("enum {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtErrorEnumV0(e) => {
                 let cases = e
@@ -165,7 +121,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("error {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("error {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
         })
         .collect();
@@ -207,6 +163,14 @@ fn exported_interface_matches_snapshot() {
         );
     }
 
+    for expected_fn in ["get_proposals"] {
+        assert!(
+            actual.contains(&format!("fn {expected_fn}(")),
+            "proposal listing entry point `{expected_fn}` is missing from the exported interface; \
+             a UI cannot enumerate pending proposals without it"
+        );
+    }
+
     // The unbonding surface is part of the exported interface: an owner must
     // be able to start an unbonding timer and observe when it completes, and
     // `withdraw_stake` must refuse until it elapses. Any change to these
@@ -221,7 +185,7 @@ fn exported_interface_matches_snapshot() {
     }
 
     let snap_path = manifest_path(&["interface.snap"]);
-    if std::env::var_os(UPDATE_ENV).is_some() {
+    if std::env::var_osS(UPDATE_ENV).is_some() {
         std::fs::write(&snap_path, &actual).expect("write interface snapshot");
         return;
     }
@@ -295,7 +259,7 @@ fn reentrant_token_cannot_withdraw_twice() {
                 // Attempt the reentrant double withdrawal. With
                 // checks-effects-interactions ordering this must fail because
                 // the stake was already zeroed before `transfer` was called.
-                let _ = client.try_withdraw_stake(&staker, &amount);
+                let _ = client.try_withdraw_stake(&staker, &amount, &amount);
             }
         }
     }
@@ -315,6 +279,6 @@ fn reentrant_token_cannot_withdraw_twice() {
     registry.request_unbond(&staker);
     // The reentrant call inside `transfer` must not have succeeded in
     // withdrawing a second time; the original withdrawal stands.
-    registry.withdraw_stake(&staker, &1_000);
+    registry.withdraw_stake(&staker, &1_000, &1_000);
     assert_eq!(registry.stake_of(&staker), 0);
 }

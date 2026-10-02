@@ -13,14 +13,17 @@
 //! Lumina Registry v2 — the upgrade target used by the registry's upgrade tests.
 //!
 //! This crate exists so `registry`'s test suite can perform a *real* Soroban
-//! upgrade: deploy v1 from its wasm, register contracts, call `upgrade()` with
-//! this crate's wasm hash, and then prove that the swapped-in code both sees the
-//! v1 storage and exposes functionality v1 never had.
+//! upgrade: deploy the current release from its wasm, register contracts, drive
+//! `propose_upgrade` → `approve_proposal` → `execute_proposal` with this crate's
+//! wasm hash, and then prove that the swapped-in code both sees the v1 storage
+//! and exposes functionality v1 never had.
 //!
 //! It is deliberately **not** a full re-implementation of the registry. It
-//! carries only what the upgrade test needs to observe, plus `upgrade()` itself
-//! so an upgraded registry stays upgradeable. It is not deployed anywhere; a
-//! real v2 would be the registry crate itself with `CONTRACT_VERSION` bumped.
+//! carries only what the upgrade test needs to observe. It deliberately does
+//! **not** export an `upgrade` entrypoint: code changes are governance-only
+//! (#36), and a fixture with a single-signer upgrade would model the very path
+//! that was removed. It is not deployed anywhere; a real v2 would be the
+//! registry crate itself with `CONTRACT_VERSION` bumped.
 //!
 //! ## Why the types are duplicated rather than imported
 //!
@@ -71,7 +74,9 @@ pub enum RegistryError {
     /// Referenced contract was not found.
     ContractNotFound = 4,
     /// The registry has no admin set.
-    NotInitialized = 7,
+NotInitialized   = 7,
+    /// Stake accounting would overflow i128.
+    StakeOverflow    = 8,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -122,6 +127,18 @@ pub enum DataKey {
 /// Upgraded v2 registry contract target used for upgrade testing.
 #[contract]
 pub struct LuminaRegistryV2;
+
+/// Event emitted when a category remap migration completes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CategoryRemapped {
+    /// The category variant being migrated away from.
+    pub from_category: u32,
+    /// The category variant being migrated to.
+    pub to_category: u32,
+    /// Number of registrations remapped in this call.
+    pub remapped: u32,
+}
 
 /// Compile-time guard: the fixture's `ContractEntry` must have the same field
 /// names and types as the real one. This mirrors the runtime check in the

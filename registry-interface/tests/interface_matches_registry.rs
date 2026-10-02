@@ -203,11 +203,11 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
         "categories: Vec<Category>, offset: U32, limit: U32",
         "Result<Vec<ContractEntry>, RegistryError>",
     ),
-    ("get_minimum_stake", "", "I128"),
+("get_minimum_stake", "", "I128"),
     (
         "get_staking_config",
         "",
-        "Result<(Address, Address), RegistryError>",
+        "Result<(Address, Address, U32), RegistryError>",
     ),
     ("get_registration_fee", "", "I128"),
     ("get_stake", "contract_id: Address", "I128"),
