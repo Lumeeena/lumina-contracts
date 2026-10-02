@@ -34,7 +34,7 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `admin_added` | `(new_admin: Address,)` | When a new governance admin is added via executed proposal. | | `propose_add_admin_adds_a_new_admin` |
 | `admin_removed` | `(admin_to_remove: Address,)` | When a governance admin is removed via executed proposal. | | `propose_remove_admin_removes_the_admin` |
 | `threshold_changed` | `(new_threshold: u32,)` | When the multisig approval threshold is changed. | | `propose_change_threshold_changes_the_threshold` |
-| `staking_configured` | `(token_id: Address, treasury: Address)` | When governance configures the staking token and treasury. | | `configure_staking_records_token_and_treasury` |
+| `staking_configured` | `(token_id: Address, treasury: Address, decimals: u32)` | When governance configures the staking token and treasury. | | `configure_staking_records_token_and_treasury` |
 | `allowlist_mode_changed` | `(enabled: bool,)` | When governance enables or disables the owner allowlist. | | `allowlist_mode_can_be_toggled` |
 | `owner_allowlisted` | `(owner: Address, allowed: bool)` | When governance adds or removes an owner from the allowlist. | | `owner_can_be_added_to_allowlist` |
 | `registration_rate_limit_changed` | `(limit: u32, window: u32)` | When governance updates the rate limit parameters. | | `registration_rate_limit_can_be_changed` |

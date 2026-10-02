@@ -8,7 +8,7 @@ use std::path::PathBuf;
 const UPDATE_ENV: &str = "UPDATE_INTERFACE_SNAPSHOT";
 
 fn manifest_path(parts: &[&str]) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut path = PathBuf&#39;::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(parts);
     path
 }
@@ -55,7 +55,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
             ScSpecEntry::FunctionV0(f) => {
                 let args = f.inputs
                     .iter()
-                    .map(|i| {
+.map(|i| {
                         format!(
                             "{}: {}",
                             i.name.to_utf8_string_lossy(),
@@ -83,7 +83,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("struct {} {{ {} }}", s.name.to_utf8_string_lossy(), fields)
+                format!("struct {} { {} }", s.name.to_utf8_string_lossy(), fields)
             }
             ScSpecEntry::UdtUnionV0(u) => {
                 let cases = u
@@ -103,7 +103,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("union {} {{ {} }}", u.name.to_utf8_string_lossy(), cases)
+                format!("union {} { {} }", u.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtEnumV0(e) => {
                 let cases = e
@@ -112,7 +112,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("enum {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("enum {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtErrorEnumV0(e) => {
                 let cases = e
@@ -121,7 +121,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("error {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("error {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
         })
         .collect();
@@ -185,7 +185,7 @@ fn exported_interface_matches_snapshot() {
     }
 
     let snap_path = manifest_path(&["interface.snap"]);
-    if std::env::var_os(UPDATE_ENV).is_some() {
+    if std::env::var_osS(UPDATE_ENV).is_some() {
         std::fs::write(&snap_path, &actual).expect("write interface snapshot");
         return;
     }

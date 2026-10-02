@@ -167,8 +167,8 @@ pub const EXPIRY_LEDGERS: u32 = 20;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
-/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most `MAX_ATTESTATION_LABEL_LEN` bytes, or revoke an existing attestation first. |
-/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only the attester can revoke their own attestation; check `get_attestations` first. |
+/// | 27 | `InvalidAttestation` | The attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most 32 characters, and ensure the registration has fewer than the maximum attestations. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Check `get_attestations` for the registration and pass a label the caller has actually attested. |
 /// | 29 | `OverlappingAddress` | The proposed treasury or stake token is itself a registered contract. | Choose a token/treasury address that is not already registered. |
 /// | 30 | `AdminSetTooSmall` | The admin set would have fewer than `MIN_ADMINS` members. | Do not remove an admin that would drop the set below the minimum. |
 /// | 31 | `AlreadyAdmin` | The proposed address is already a member of the admin set. | Propose a different address, or skip `propose_add_admin` for one already an admin. |
