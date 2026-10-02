@@ -59,7 +59,7 @@ temporary storage.
 | `AllowlistEnabled`, `RegistrationRateLimit`, `RegistrationRateWindow` | registration policy | Optional admission and fixed-window controls. |
 | `RegistrationFee` | fee denominated in the stake token | Zero keeps registration free. |
 | `TotalStaked`, `VerifiedCount` | maintained aggregate counters | Support constant-cost statistics. |
-| `Admin` | original single-admin address | Retained solely for storage and upgrade compatibility. |
+| `Admin` | original single-admin address | Deprecated compatibility slot. No longer written by `initialize` / `__constructor` and **not consulted for authorization**; `get_admin` reads it only as a fallback for pre-multisig deployments. |
 
 ### Persistent storage
 
@@ -73,10 +73,12 @@ temporary storage.
 | `Verified(contract_id)` | governance trust signal | Changed only by an executed proposal. |
 | `Slashes(contract_id)` | ordered `SlashRecord` history | Appended on slash and deliberately retained after deregistration. |
 | `WithdrawLockedUntil(contract_id)` | ledger sequence | Prevents immediate withdrawal of remaining collateral after a slash. |
+| `UnbondingUntil(contract_id)` | ledger sequence | Set by `request_unbond`; `withdraw_stake` refuses until it elapses. |
 | `Allowlisted(owner)` | admission flag | Consulted only when allowlist mode is enabled. |
 | `RegistrationWindow(owner)` | window start and count | Fixed-window registration rate accounting; its TTL is extended to the configured window. |
 | `Tags(contract_id)` | bounded normalized tags | Owner-managed discovery metadata. |
 | `Attestations(contract_id)` | bounded third-party claims | Separate from governance verification; removed on deregistration. |
+| `NameIndex(prefix)` | ordered contract addresses | Name-prefix discovery index keyed on the normalised name prefix; maintained on registration, metadata update, and deregistration. |
 
 `ContractEntry` is intentionally small and stable: contract address, owner,
 name, description, registration ledger, and active flag. Reputation is joined
@@ -94,6 +96,24 @@ and `limit` to that filtered union. `get_contracts_by_owner` also differs: it
 resolves the owner's ordered index without active filtering and therefore
 includes inactive registrations.
 
+`find_by_name_prefix(prefix, limit)` resolves the normalised prefix against
+`NameIndex` and returns matching entries. Matching is case-insensitive because
+both the stored key and the query are normalised (trimmed and lowercased)
+before lookup. An unmatched prefix yields an empty list rather than an error.
+On-chain prefix matching is deliberately limited to a single normalised
+prefix: richer name search, ranking, and fuzzy matching belong in the indexer,
+which can build a full-text index off the registration events.
+
+The cursor variants — `get_active_contracts_after`,
+`get_contracts_by_category_after` and `get_contracts_by_owner_after` — walk the
+same indexes but resume from the id of the last entry returned instead of a
+numeric offset. They are the recommended way to page a whole list: an offset
+walk re-reads everything before its position on every page, and an insertion
+mid-walk shifts every later page, whereas a cursor is anchored to a
+registration, so entries added while walking are appended and never duplicate
+or skip one already returned. The offset entrypoints are retained for one
+release and documented as deprecated.
+
 ## Registration lifecycle
 
 1. `register_contract` authenticates the owner, applies the optional
@@ -103,9 +123,9 @@ includes inactive registrations.
    owner's index, and each category index, then advances the live and lifetime
    counters.
 3. The owner may update metadata, tags, and categories. Ownership transfer can
-   be authorized by the current owner, a current multisig admin, or the legacy
-   single admin retained for upgrade compatibility; it moves the address from
-   the previous owner's index to the new owner's index.
+   be authorized by the current owner or a current multisig admin; it moves the
+   address from the previous owner's index to the new owner's index. The legacy
+   single-admin slot carries no authority and is not accepted here.
 4. `deactivate` is an immediate owner action. It clears only `active`; listing
    views filter the entry out while its metadata, reputation, and history
    remain available. Governance may deactivate somebody else's registration
@@ -114,6 +134,9 @@ includes inactive registrations.
    entry, and zero remaining stake. It removes live metadata and index
    references but preserves slash history for auditability. The address may
    then be registered again as a fresh entry.
+
+Metadata updates that change the name move the address between `NameIndex`
+buckets so prefix lookups stay consistent with the current `ContractEntry`.
 
 `register_contracts` performs a bounded batch in one atomic Soroban invocation,
 so a validation or token-transfer failure leaves no partial batch behind. Its
@@ -143,6 +166,10 @@ Ready (ready_at = current ledger)
       | TIMELOCK_LEDGERS elapse
       v
 Anyone executes ----> Executed (cannot execute twice)
+      |
+      | PROPOSAL_EXPIRY_LEDGERS elapse without execution
+      v
+Expired (must be re-proposed)
 ```
 
 Only an address in `Admins` can create or approve a proposal. Approvals are
@@ -150,6 +177,11 @@ stored as addresses and duplicate approval is rejected. Reaching the threshold
 sets `ready_at` once; it does not execute the action. After the timelock,
 `execute_proposal` is permissionless so execution cannot be withheld by the
 admin set after it has approved the action.
+
+The timelock is per-action rather than a single constant. Each `ProposalAction`
+maps to a duration in `TIMELOCK_LEDGERS`, so a proposal's `ready_at` is set to
+`current ledger + TIMELOCK_LEDGERS(action)` when the threshold is reached.
+`get_proposal` exposes the action's timelock so a UI can show the wait.
 
 Proposal actions cover:
 
@@ -160,15 +192,46 @@ Proposal actions cover:
 - allowlist, registration rate limit, registration fee, and minimum stake;
 - treasury withdrawal.
 
+The chosen durations are constants, not magic numbers inline, and are grouped
+by risk:
+
+- `Upgrade` and admin-set changes (`AddAdmin`, `RemoveAdmin`,
+  `ChangeThreshold`) keep the long window (`LONG_TIMELOCK_LEDGERS`, 17,280
+  ledgers, approximately 28.8 hours at six seconds per ledger). These change
+  the contract's code or who controls it, so they are the most dangerous
+  actions and must wait the longest.
+- `SetStakeToken`, `SetTreasury`, `SetMinimumStake`, `SetAllowlist`,
+  `SetRegistrationRateLimit`, and `SetRegistrationFee` use a medium window
+  (`MEDIUM_TIMELOCK_LEDGERS`, 5,760 ledgers, approximately 9.6 hours). They
+  change policy or configuration but not code or control, so a shorter wait is
+  safe.
+- `Deactivate`, `SetVerified`, `Slash`, and `WithdrawTreasury` use a short
+  window (`SHORT_TIMELOCK_LEDGERS`, 1,440 ledgers, approximately 2.4 hours).
+  They are routine governance operations with bounded, reversible, or
+  already-constrained effects.
+
+Two proposals of different kinds therefore become executable at different
+times.
+
 Execution checks the threshold and timelock again, marks the proposal executed
 before applying external effects, and relies on Soroban transaction atomicity:
 if an action or token transfer fails, the executed flag and every other write
 from that invocation roll back. Admin-removal and threshold actions also
 validate that the resulting threshold remains satisfiable.
 
-The production timelock is 17,280 ledgers (approximately 28.8 hours at six
-seconds per ledger). Tests use 10 ledgers so they can exercise boundaries
-without archiving fixture storage.
+The production timelocks are the per-action constants above. Tests use 10
+ledgers so they can exercise boundaries without archiving fixture storage.
+
+The production expiry window is 518,400 ledgers (approximately 36 days at six
+seconds per ledger), measured from `ready_at`. It is deliberately far longer
+than the timelock: the timelock protects against haste, while the expiry
+protects against staleness. A proposal that reaches threshold but is never
+executed within this window becomes invalid and must be re-proposed, so a
+decision cannot be executed against an admin set or policy context that has
+since changed. `execute_proposal` refuses an expired proposal with a named
+error, and `get_proposal` exposes the expiry so a UI can surface it. Tests use
+a short window so they can exercise the boundary without archiving fixture
+storage.
 
 ## Staking, verification, and slashing
 
@@ -202,8 +265,27 @@ inactive + unlocked + owner -- withdraw --> owner
   from the registry to the treasury, decreases tracked stake, appends a reason
   and ledger to slash history, and locks the remainder for
   `SLASH_LOCK_LEDGERS`.
+- `request_unbond` is an owner action on a deactivated registration. It starts
+  the unbonding timer by writing `UnbondingUntil(contract_id)`.
 - `withdraw_stake` returns the entire remainder only to the owner, only after
-  deactivation, and only after the post-slash lock expires.
+  deactivation, only after the post-slash lock expires, and only after the
+  unbonding period elapses.
+
+The unbonding period exists to close the withdrawal race against governance.
+The slash lock only stops withdrawal *after* a slash lands, so an owner who
+sees a slash coming could otherwise deactivate and withdraw before a proposal
+finishes its timelock. `UNBONDING_LEDGERS` must therefore exceed
+`TIMELOCK_LEDGERS`; if it does not, the window reopens and the queue provides
+no protection. That relationship is asserted by a test rather than the literal
+numbers, so the two constants can be retuned together without silently
+inverting the ordering. A view exposes when unbonding completes so indexers
+and the frontend can display the remaining wait.
+
+Withdrawing below the minimum does not leave an under-collateralised listing
+active. When a non-zero `MinimumStake` is configured, a withdrawal that would
+drop a registration's recorded stake below the minimum clears its `active`
+flag as part of the same invocation, so the listing is deactivated rather than
+silently remaining visible while under-collateralised.
 
 The internal bookkeeping invariant across staking transitions is:
 
@@ -231,14 +313,18 @@ properties it checks, with representative test names for quick navigation:
 | Invariant | Representative tests |
 | --- | --- |
 | A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
+| A proposal that is never executed within the expiry window is refused and must be re-proposed. | `proposal_executes_inside_expiry_window`, `expired_proposal_cannot_execute`, `get_proposal_reports_expiry` |
+| Proposals of different actions become executable at different times. | `different_actions_have_different_timelocks`, `get_proposal_exposes_action_timelock` |
 | Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
 | Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
 | Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |
 | Category membership is non-empty and deduplicated, and category changes do not affect reputation. | `registration_requires_at_least_one_category`, `duplicate_categories_are_collapsed`, `categories_and_reputation_are_independent` |
 | In isolated staking flows, tracked stake equals the registry token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
+| Withdrawal is refused until the unbonding period elapses, and the unbonding period exceeds the governance timelock. | `withdraw_before_unbonding_period_is_refused`, `unbonding_period_exceeds_governance_timelock` |
 | Verification is governance-only and independent from self-service attestations. | `a_registrant_cannot_verify_their_own_contract`, `attesting_does_not_affect_governance_only_verification`, `attesting_does_not_grant_verification_or_privilege_to_the_attester` |
+| Name-prefix search is case-insensitive, returns every matching registration, and returns an empty list for an unmatched prefix. | `find_by_name_prefix_is_case_insensitive`, `find_by_name_prefix_returns_all_matches`, `find_by_name_prefix_unmatched_returns_empty` |
 | Deregistration removes live indexes and state only after safe exit, while retaining slash history and lifetime totals. | `deregister_requires_deactivated_and_unstaked`, `deregister_removes_every_index_reference_and_decrements_the_live_count`, `deregister_keeps_slash_history_for_audit`, `contract_count_is_live_and_total_registered_is_lifetime` |
-| Code upgrades preserve compatible storage and authentication. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_carries_admin_across_swap`, `upgraded_registry_can_be_rolled_back` |
+| Code upgrades are governance-only and preserve compatible storage. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_retires_previous_interface`, `propose_upgrade_by_non_admin_is_rejected`, `governance_upgrade_event_reports_the_replaced_version` |
 
 Additional interface tests in
 [`registry-interface/tests/interface_matches_registry.rs`](./registry-interface/tests/interface_matches_registry.rs)
@@ -248,8 +334,10 @@ storage compatibility across a wasm upgrade.
 
 ## Upgrade boundaries
 
-`upgrade` swaps the wasm while preserving the contract address and storage.
-That makes storage encoding part of the long-lived protocol:
+An upgrade is a governance proposal (`propose_upgrade` → `approve_proposal` →
+`execute_proposal`) that swaps the wasm while preserving the contract address
+and storage. There is no single-signer upgrade entrypoint, so no one key can
+change the code. That makes storage encoding part of the long-lived protocol:
 
 - Adding a new `DataKey` variant is compatible; renaming or repurposing an
   existing variant is not.
@@ -259,6 +347,10 @@ That makes storage encoding part of the long-lived protocol:
   read-time composition over modifying `ContractEntry`.
 - `CONTRACT_VERSION` must change with exported-interface or storage-shape
   changes.
+
+`PROPOSAL_EXPIRY_LEDGERS` is a documented constant rather than a stored value:
+changing its length is an exported-behavior change and must be accompanied by
+an update to this document and the interface snapshot.
 
 Before changing the architecture, run `make check`. For changes to exported
 functions or contract types, also update the interface snapshot and verify the

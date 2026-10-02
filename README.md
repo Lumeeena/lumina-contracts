@@ -110,7 +110,7 @@ calls against the table above.
 registry.register_contract(owner, contract_id, "My Protocol", "A DeFi protocol on Stellar", vec![Category::DeFi])
 ```
 
-`get_active_contracts(offset, limit)` returns a paginated list of active registrations for discovery.
+`get_active_contracts_after(cursor, limit)` walks the active registrations for discovery. Pass the `contract_id` of the last entry the previous call returned (`None` to start) and repeat until the page is empty. The cursor is anchored to a registration, so entries added mid-walk are neither duplicated nor skipped. The older `get_active_contracts(offset, limit)` is retained for one release but **deprecated**: it re-reads the index up to `offset` on every page, and a registration inserted mid-walk shifts every later page.
 
 **Example**: See [examples/registry-registrant](./examples/registry-registrant/) for a complete working contract that registers itself during deployment. The example demonstrates integration patterns and includes tests you can copy to your own project.
 
@@ -124,7 +124,8 @@ browsing rather than only a flat list:
 
 | Method | Who can call it |
 | --- | --- |
-| `get_active_contracts_by_category(category, offset, limit)` | anyone — same paging semantics as `get_active_contracts` |
+| `get_contracts_by_category_after(category, cursor, limit)` | anyone — cursor over one category; preferred over the offset form |
+| `get_active_contracts_by_category(category, offset, limit)` | anyone — deprecated offset form, same paging semantics as `get_active_contracts` |
 | `get_categories(contract_id)` | anyone |
 | `set_categories(owner, contract_id, categories)` | the registered owner only |
 | `prune_category(category)` | anyone — removes dead index references, returns the count removed |
@@ -155,12 +156,31 @@ Registrations are also manageable after the fact:
 
 | Method | Who can call it |
 | --- | --- |
-| `get_contracts_by_owner(owner, offset, limit)` | anyone — paginated, includes the owner's deactivated entries |
+| `get_contracts_by_owner_after(owner, cursor, limit)` | anyone — cursor form, includes the owner's deactivated entries |
+| `get_contracts_by_owner(owner, offset, limit)` | anyone — deprecated offset form, includes the owner's deactivated entries |
 | `update_metadata(owner, contract_id, name, description)` | the registered owner only |
 | `set_manager(owner, contract_id, manager)` | the registered owner only — grants the manager a subset of rights |
 | `transfer_ownership(caller, contract_id, new_owner)` | the current owner or the admin |
 | `deactivate(caller, contract_id)` | the current owner or the admin |
-| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and unstaked |
+| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and fully unstaked |
+| `stake(staker, contract_id, amount)` | anyone — a third party may stake on a registration's behalf |
+| `withdraw_stake(staker, contract_id, amount)` | the staker only — each staker withdraws only their own stake |
+| `get_stake(contract_id)` | anyone — total staked across all stakers |
+| `get_stake_of(contract_id, staker)` | anyone — the amount a single staker has on a registration |
+
+### Staking
+
+Stake is tracked per `(registration, staker)` rather than per registration
+alone, so a backer who wants to vouch for a project can do so without owning
+it. The total reported for a registration (`get_stake`) is the sum of every
+staker's balance.
+
+Slashing policy: when a registration is slashed, the penalty is applied
+**pro-rata across all stakers** — each staker loses the same fraction of their
+stake, so no staker is preferred over another and the relative weights of the
+backers are preserved. The slash record stores the total amount taken; the
+per-staker reductions are reflected in each staker's balance, and each staker
+can still withdraw whatever remains of their own contribution.
 
 Counters: `get_contract_count` is the live total (deactivated included,
 deregistered excluded), `get_total_registered` is the lifetime total
@@ -199,13 +219,18 @@ orphan existing registrations at a new address:
 | Method | Who can call it |
 | --- | --- |
 | `get_version()` | anyone — which build is live at this address |
-| `get_admin()` | anyone |
-| `upgrade(admin, new_wasm_hash)` | the admin only |
+| `get_admin()` / `get_admins()` | anyone |
+| `propose_upgrade(proposer, new_wasm_hash)` | any admin — opens an upgrade proposal |
+| `approve_proposal(admin, proposal_id)` | any admin — counts toward the threshold |
+| `execute_proposal(proposal_id)` | anyone, once threshold **and** timelock are met |
 | `get_manager(contract_id)` | anyone — the delegated manager for a registration, if set |
 
-`upgrade` swaps the contract's code and keeps its address and storage, so a new
-version must stay compatible with the storage shapes documented on `DataKey` and
-`ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
+There is **no single-signer upgrade path**. Changing the code is governance-only:
+`propose_upgrade` by an admin, enough `approve_proposal` calls to reach the
+threshold, then `execute_proposal` after the timelock. The swap keeps the
+contract's address and storage, so a new version must stay compatible with the
+storage shapes documented on `DataKey` and `ContractEntry` in
+[registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
 ### Storage keys and their lifetimes

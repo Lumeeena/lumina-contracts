@@ -10,6 +10,7 @@
 // reason only; human-written API is documented by review, and the doc comments
 // below are the standard the crate is held to.
 #![allow(missing_docs)]
+extern crate alloc;
 //! Lumina Registry — on-chain contract registry for the Lumina indexer.
 //!
 //! Projects deploy their Soroban contracts and register them here so that
@@ -75,7 +76,7 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 7;
+pub const CONTRACT_VERSION: u32 = 8;
 
 /// Minimum number of admins required for multi-sig governance.
 pub const MIN_ADMINS: u32 = 2;
@@ -111,6 +112,20 @@ pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 /// Test configuration for slash lock ledgers.
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
+
+/// How many ledgers a registration stays valid before it must be renewed.
+pub const EXPIRY_LEDGERS: u32 = 17_280;
+/// How many ledgers a registration stays current after `register_contract` or
+/// `renew`. Roughly one year at ~6 s per ledger.
+///
+/// Tests use a much smaller value so the ledger can be advanced past an
+/// expiry within a single test without archiving instance storage.
+#[cfg(not(test))]
+pub const EXPIRY_LEDGERS: u32 = 5_256_000;
+
+/// Test configuration for registration expiry.
+#[cfg(test)]
+pub const EXPIRY_LEDGERS: u32 = 20;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -154,7 +169,17 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
 /// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most `MAX_ATTESTATION_LABEL_LEN` bytes, or revoke an existing attestation first. |
 /// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only the attester themselves can revoke; check `get_attestations` for the caller's address. |
-/// | 29 | `NotManager` | The caller is neither the registered owner nor the owner-appointed manager. | Call from the owner's address, or have the owner appoint the caller via `set_manager`. |
+/// | 29 | `OverlappingAddress` | The proposed treasury or stake token is itself a registered contract. | Choose a token/treasury address that is not already registered. |
+/// | 30 | `AdminSetTooSmall` | The admin set would have fewer than `MIN_ADMINS` members. | Do not remove an admin that would drop the set below the minimum. |
+/// | 31 | `AlreadyAdmin` | The proposed address is already a member of the admin set. | Propose a different address, or skip `propose_add_admin` for one already an admin. |
+/// | 32 | `AdminNotFound` | The proposed address to remove is not a member of the admin set. | Check `get_admins` for the current set before proposing a removal. |
+/// | 33 | `ThresholdAlreadySet` | The proposed threshold is already the current threshold. | Propose a different threshold. |
+/// | 34 | `AlreadyVerified` | The proposed verification status matches the contract's current status. | Check `is_verified` before proposing a change. |
+/// | 35 | `StakingAlreadyConfigured` | Staking is already configured with the proposed token and treasury. | Propose a different token/treasury pair, or skip the proposal. |
+/// | 36 | `InvalidInput` | Caller-supplied input failed validation (e.g. an empty slash response). | Pass a non-empty, valid value. |
+/// | 37 | `SlashNotFound` | No slash exists at the given index in a registration's slash history. | Check `get_slashes` for valid indices before calling `respond_to_slash`. |
+/// | 38 | `ResponseAlreadyExists` | The referenced slash already has a recorded response. | Responses are immutable once set; there is nothing further to call. |
+/// | 39 | `ContractBalanceInsufficient` | The registry's real token balance is smaller than the total it believes is staked. | This signals a token/registry desync (e.g. a fee-on-transfer token); investigate before retrying. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -217,7 +242,7 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
-    /// The proposed treasury or stake-token address is itself a registered
+/// The proposed treasury or stake-token address is itself a registered
     /// contract.
     OverlappingAddress = 29,
     /// The admin set would have fewer than `MIN_ADMINS` members.
@@ -232,14 +257,40 @@ pub enum RegistryError {
     AlreadyVerified = 34,
     /// Staking is already configured with the proposed token and treasury.
     StakingAlreadyConfigured = 35,
+    /// Generic invalid input.
+    InvalidInput = 36,
+    /// The referenced slash record does not exist.
+    SlashNotFound = 37,
+    /// A response already exists for this slash record.
+    ResponseAlreadyExists = 38,
+    /// The contract's token balance is insufficient.
+    /// Caller-supplied input failed validation (e.g. an empty slash response).
+    InvalidInput = 36,
+    /// No slash exists at the given index in a registration's slash history.
+    SlashNotFound = 37,
+    /// The referenced slash already has a recorded response.
+    ResponseAlreadyExists = 38,
+    /// The registry's real token balance is smaller than the total it
+    /// believes is staked, so a transfer that depends on that balance cannot
+    /// proceed safely.
+    ContractBalanceInsufficient = 39,
+    /// The stake arithmetic would overflow `i128`.
+    ///
+    /// Note: the workspace profile enables `overflow-checks`, so an unchecked
+    /// `+`/`-` would trap rather than wrap. That profile setting is a backstop
+    /// for arithmetic we have not audited, not the mechanism that protects
+    /// stake accounting — the stake and slash paths use explicit checked
+    /// arithmetic and return this error instead.
+    StakeOverflow       = 40,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
 //
 // ## Upgrade-compatibility rules
 //
-// `upgrade()` replaces the contract's code but leaves every ledger entry it
-// has already written exactly as it is.  When changing these types:
+// A wasm upgrade (executed through `propose_upgrade` → `approve_proposal` →
+// `execute_proposal`) replaces the contract's code but leaves every ledger
+// entry it has already written exactly as it is.  When changing these types:
 //
 // - Adding a `DataKey` variant is safe; renaming or repurposing one is not
 //   (encoded by variant *name*).
@@ -358,6 +409,8 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Whether the registration is currently withdrawal-locked.
+    pub withdraw_locked: bool,
 }
 
 /// A registration joined with its reputation — what a discovery client wants.
@@ -370,6 +423,10 @@ pub struct ContractProfile {
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Optional URI pointing at richer off-chain metadata.
+    pub metadata_uri: Option<String>,
+    /// The Unix timestamp of when the contract was registered, or 0 if legacy.
+    pub registered_at_ts: u64,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -445,6 +502,15 @@ pub const MAX_ATTESTATIONS_PER_CONTRACT: u32 = 20;
 /// Maximum length of an attestation label, in bytes.
 pub const MAX_ATTESTATION_LABEL_LEN: u32 = 64;
 
+/// Upper bound for a registration name. This is small enough for UI cards and
+/// large enough for a short human-readable project label without letting a
+/// caller force unbounded storage or rendering cost onto every consumer.
+pub const MAX_NAME_LEN: u32 = 64;
+
+/// Upper bound for a registration description. The limit is intentionally high
+/// enough for a summary while still keeping storage and rendering costs bounded.
+pub const MAX_DESCRIPTION_LEN: u32 = 512;
+
 /// Entry for batch registration.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -510,6 +576,8 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Remap every registration from one category to another: `(from, to)`.
+    MigrateCategory(Category, Category),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -602,6 +670,8 @@ pub enum DataKey {
     /// Incremented on `register_contract`, decremented on `deregister`.
     /// See `get_contract_count` / `get_total_registered` for which figure to read.
     ContractCount,
+    /// u32 — number of active registrations (active: true).
+    ActiveCount,
     /// u32 — lifetime registrations ever made. Incremented on
     /// `register_contract` and never decremented, so it survives `deregister`.
     /// Added alongside deregistration to keep the old "registrations ever made"
@@ -613,6 +683,8 @@ pub enum DataKey {
     Contract(Address),
     /// Vec<Address> — list of contracts registered by a specific owner.
     OwnerContracts(Address),
+    /// u64 — the Unix timestamp of when the contract was registered.
+    ContractTimestamp(Address),
     /// Vec<Address> — insertion-ordered list of every registered contract.
     AllContracts,
     Expiry(Address),
@@ -628,6 +700,10 @@ pub enum DataKey {
     PreviousTreasury,
     /// i128 — currently staked balance for a registration.
     Stake(Address),
+    /// i128 — stake posted by one staker against one registration.
+    /// Keyed by (registration, staker) so third parties can back a
+    /// registration without owning it, and each withdraws only their own.
+    StakeOf(Address, Address),
     /// bool — governance-attested verified status.
     Verified(Address),
     /// Vec<SlashRecord> — every slash ever levied, oldest first.
@@ -638,6 +714,8 @@ pub enum DataKey {
     MinimumStake,
 
     // ── Category taxonomy ───────────────────────────────────────────────────
+    /// u32 — number of active registrations in a category.
+    CategoryCount(Category),
     /// Vec<Category> — the categories a registration declared, deduplicated.
     Categories(Address),
     /// Vec<Address> — insertion-ordered registrations in one category.
@@ -666,6 +744,12 @@ pub enum DataKey {
     // ── Tags ────────────────────────────────────────────────────────────────
     /// Vec<String> — owner-set normalized tags for a registration.
     Tags(Address),
+    /// Option<Address> — replacement contract that supersedes this one.
+    SupersededBy(Address),
+
+    // ── Metadata ────────────────────────────────────────────────────────────
+    /// String — off-chain metadata URI (e.g., ipfs:// or https://).
+    MetadataUri(Address),
 
     // ── Succession ──────────────────────────────────────────────────────────
     /// Address — the contract that supersedes this registration, if any.
@@ -682,13 +766,20 @@ pub enum DataKey {
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
     TotalStaked,
+    /// Vec<Address> — insertion-ordered stakers backing one registration.
+    /// Needed to enumerate whose stake a slash takes, and to report the
+    /// per-registration total as the sum over stakers.
+    Stakers(Address),
     /// u32 — count of verified registrations.
     VerifiedCount,
 
     // ── Legacy key kept for upgrade compatibility ────────────────────────
-    /// Single-admin key written by the original v1 initialize.  Retained so
-    /// that the registry-v2 upgrade tests, which read `DataKey::Admin` from
-    /// instance storage, continue to decode correctly after an upgrade.
+    /// Single-admin key written by the original v1 `initialize`.  Retained so
+    /// old deployments still decode it, but it is **deprecated and grants no
+    /// authority**: no entrypoint authorizes against it.  Current
+    /// `__constructor` / `initialize` no longer write it, and `get_admin`
+    /// consults it only as a fallback for a registry that predates the admin
+    /// set.
     Admin,
 }
 
@@ -710,9 +801,9 @@ impl LuminaRegistry {
         env.storage().instance().set(&DataKey::Threshold, &1u32);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
         env.storage().instance().set(&DataKey::ContractCount, &0u32);
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &bootstrap_admin);
+        // Deliberately does *not* write `DataKey::Admin`: it is a deprecated
+        // compatibility slot that grants no authority (see its docs). The
+        // bootstrap admin already lives in `DataKey::Admins`.
     }
 
     // ── Initialization ──────────────────────────────────────────────────────
@@ -749,10 +840,10 @@ impl LuminaRegistry {
             .instance()
             .set(&DataKey::TotalRegistered, &0u32);
 
-        // Write the legacy Admin key with the first admin so the v2 upgrade
-        // tests (which read DataKey::Admin) continue to pass unchanged.
-        let first_admin = admins.get(0).ok_or(RegistryError::InvalidThreshold)?;
-        env.storage().instance().set(&DataKey::Admin, &first_admin);
+        // Deliberately does *not* write `DataKey::Admin`: it is a deprecated
+        // compatibility slot that grants no authority (see its docs). The
+        // first admin is already in `DataKey::Admins`, which `get_admin`
+        // returns for a fresh deployment.
 
         Ok(())
     }
@@ -1390,10 +1481,16 @@ impl LuminaRegistry {
             return Err(RegistryError::Unauthorized);
         }
 
+        let was_active = entry.active;
         entry.active = false;
         env.storage()
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
+
+        if was_active {
+            let categories = Self::categories_of(&env, &contract_id);
+            Self::decrement_active_counts(&env, &categories);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "contract_deactivated"),),
@@ -1632,51 +1729,15 @@ impl LuminaRegistry {
         removed
     }
 
-    // ── Legacy upgrade kept for backward-compatibility with existing tests ───
-
-    /// Direct upgrade, kept for the upgrade-path tests in this crate (which
-    /// deploy v1 wasm via `contractimport!` and then call `upgrade` with the
-    /// old single-admin signature).
-    ///
-    /// For new deployments, use `propose_upgrade` / `approve_proposal` /
-    /// `execute_proposal` instead.
-    pub fn upgrade(
-        env: Env,
-        admin: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<(), RegistryError> {
-        admin.require_auth();
-
-        // Accept either the old single-admin key or membership in the new set.
-        let is_old_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|a| a == admin)
-            .unwrap_or(false);
-        let is_new_admin = Self::admin_index(&env).contains(&admin);
-
-        if !is_old_admin && !is_new_admin {
-            return Err(RegistryError::Unauthorized);
-        }
-
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-
-        // `CONTRACT_VERSION` is the version being *replaced*, not the incoming
-        // one: the new wasm only takes over once this invocation returns, and
-        // this code cannot know what version the new wasm carries. Consumers
-        // read this field as "upgraded away from vN" — do not "fix" it to the
-        // new version. Pinned by `registry_upgraded_event_reports_the_replaced_version`.
-        env.events().publish(
-            (Symbol::new(&env, "registry_upgraded"),),
-            (admin, new_wasm_hash, CONTRACT_VERSION),
-        );
-
-        Ok(())
-    }
-
     // ── Registry ────────────────────────────────────────────────────────────
+    //
+    // There is deliberately no single-signer `upgrade` entrypoint. Changing the
+    // code is governance-only: `propose_upgrade` → `approve_proposal` →
+    // `execute_proposal`. A direct `upgrade(admin, hash)` used to exist next to
+    // the proposal flow and accepted either the current admin set or the legacy
+    // `DataKey::Admin` slot, which handed a single key exactly the power the
+    // multi-sig admin set was introduced to remove. It has been deleted; see
+    // #36.
 
     /// Register a Soroban contract for Lumina indexing.
     /// Anyone can register — the owner must authorize the call.
@@ -1716,6 +1777,8 @@ impl LuminaRegistry {
             return Err(RegistryError::AlreadyRegistered);
         }
 
+        Self::validate_contract_metadata(&name, &description)?;
+
         let categories = Self::dedup_categories(&env, &categories)?;
 
         Self::consume_registration_rate(&env, &owner)?;
@@ -1742,6 +1805,11 @@ impl LuminaRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
+
+        let ts: u64 = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractTimestamp(contract_id.clone()), &ts);
 
         env.storage().persistent().set(&DataKey::Expiry(contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
         let mut owned = Self::owner_index(&env, &owner);
@@ -1776,6 +1844,7 @@ impl LuminaRegistry {
             .set(&DataKey::TotalRegistered, &(total + 1));
 
         Self::index_categories(&env, &contract_id, &categories);
+        Self::increment_active_counts(&env, &categories);
 
         env.events().publish(
             (Symbol::new(&env, "contract_registered"),),
@@ -1827,6 +1896,7 @@ impl LuminaRegistry {
             {
                 return Err(RegistryError::AlreadyRegistered);
             }
+            Self::validate_contract_metadata(&entry.name, &entry.description)?;
             Self::dedup_categories(&env, &entry.categories)?;
         }
 
@@ -1890,6 +1960,7 @@ impl LuminaRegistry {
 
             let categories = Self::dedup_categories(&env, &entry.categories)?;
             Self::index_categories(&env, &entry.contract_id, &categories);
+            Self::increment_active_counts(&env, &categories);
 
             env.events().publish(
                 (Symbol::new(&env, "contract_registered"),),
@@ -1934,9 +2005,11 @@ impl LuminaRegistry {
 
         let categories = Self::dedup_categories(&env, &categories)?;
 
+        let previous_categories = Self::categories_of(&env, &contract_id);
+
         // Drop the registration from any category it is leaving, so a stale
         // index cannot resurface it under a category it no longer claims.
-        for previous in Self::categories_of(&env, &contract_id).iter() {
+        for previous in previous_categories.iter() {
             if !categories.contains(previous) {
                 let mut index = Self::category_index(&env, &previous);
                 if let Some(i) = index.first_index_of(&contract_id) {
@@ -1945,10 +2018,21 @@ impl LuminaRegistry {
                         .persistent()
                         .set(&DataKey::ByCategory(previous), &index);
                 }
+                if entry.active {
+                    Self::change_category_count(&env, &previous, -1);
+                }
             }
         }
 
         Self::index_categories(&env, &contract_id, &categories);
+
+        if entry.active {
+            for new_cat in categories.iter() {
+                if !previous_categories.contains(new_cat) {
+                    Self::change_category_count(&env, &new_cat, 1);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "categories_updated"),),
@@ -2227,17 +2311,22 @@ impl LuminaRegistry {
     /// stake without re-registering.
     ///
     /// Additive — calling it again tops the stake up.
+    ///
+    /// Any address may stake, not just the registered owner: a backer who
+    /// wants to vouch for a project can post collateral on its behalf. Stake
+    /// is tracked per `(registration, staker)`, so each staker withdraws only
+    /// their own and the registration's total is the sum over all stakers.
     pub fn stake(
         env: Env,
-        owner: Address,
+        staker: Address,
         contract_id: Address,
         amount: i128,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        staker.require_auth();
 
         Self::validate_positive_amount(amount)?;
 
-        let entry: ContractEntry = env
+let entry: ContractEntry = env
             .storage()
             .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
@@ -2246,14 +2335,15 @@ impl LuminaRegistry {
         if owner != entry.owner {
             return Err(RegistryError::NotOwner);
         }
+        }
 
         let (token_id, _) = Self::staking_config(&env)?;
 
-        // Moves real tokens into the registry's own balance. `owner` has
+        // Moves real tokens into the registry's own balance. `staker` has
         // already authorized this invocation, and the token's own
         // `from.require_auth()` runs as a sub-invocation of it.
         token::Client::new(&env, &token_id).transfer(
-            &owner,
+            &staker,
             &env.current_contract_address(),
             &amount,
         );
@@ -2263,6 +2353,15 @@ impl LuminaRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Stake(contract_id.clone()), &staked);
+
+let mut stakers = Self::stakers_of(&env, &contract_id);
+        if !stakers.contains(&staker) {
+            stakers.push_back(staker.clone());
+            env.storage().persistent().set(&DataKey::Stakers(contract_id.clone()), &stakers);
+        }
+        let previous = Self::stake_of_staker(&env, &contract_id, &staker);
+        env.storage().persistent()
+            .set(&DataKey::StakeOf(contract_id.clone(), staker.clone()), &(previous + amount));
 
         let total_staked: i128 = env
             .storage()
@@ -2292,7 +2391,7 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
-            (contract_id, owner, amount, staked),
+            (contract_id, staker, amount, staked),
         );
 
         Ok(())
@@ -2302,7 +2401,7 @@ impl LuminaRegistry {
     ///
     /// "Good standing" is three conditions, all checked here:
     ///
-    /// 1. the caller is the registered owner;
+    /// 1. the caller has stake of their own on the registration;
     /// 2. the registration is **deactivated** — you get your collateral back
     ///    by leaving, not while still listed and benefiting from the stake;
     /// 3. no slash has landed within the last [`SLASH_LOCK_LEDGERS`] ledgers,
@@ -2312,10 +2411,10 @@ impl LuminaRegistry {
     /// Returns the amount returned to the owner.
     pub fn withdraw_stake(
         env: Env,
-        owner: Address,
+        staker: Address,
         contract_id: Address,
     ) -> Result<i128, RegistryError> {
-        owner.require_auth();
+        staker.require_auth();
 
         let entry: ContractEntry = env
             .storage()
@@ -2323,9 +2422,6 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
         if entry.active {
             return Err(RegistryError::RegistrationActive);
         }
@@ -2333,7 +2429,7 @@ impl LuminaRegistry {
             return Err(RegistryError::StakeLocked);
         }
 
-        let staked = Self::stake_of(&env, &contract_id);
+        let staked = Self::stake_of_staker(&env, &contract_id, &staker);
         if staked <= 0 {
             return Err(RegistryError::InsufficientStake);
         }
@@ -2344,13 +2440,17 @@ impl LuminaRegistry {
         // its own balance by virtue of being the invoker.
         token::Client::new(&env, &token_id).transfer(
             &env.current_contract_address(),
-            &owner,
+            &staker,
             &staked,
         );
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stake(contract_id.clone()), &0i128);
+env.storage().persistent()
+            .set(&DataKey::StakeOf(contract_id.clone(), staker.clone()), &0i128);
+        let remaining = Self::stake_of(&env, &contract_id) - staked;
+        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &remaining);
+        if remaining == 0 {
+            env.storage().persistent().remove(&DataKey::Stakers(contract_id.clone()));
+        }
 
         let total_staked: i128 = env
             .storage()
@@ -2380,7 +2480,7 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
-            (contract_id, owner, staked),
+            (contract_id, staker, staked),
         );
 
         Ok(staked)
@@ -2393,16 +2493,19 @@ impl LuminaRegistry {
         CONTRACT_VERSION
     }
 
-    /// The first admin address (kept for backward compatibility with v2 tests
-    /// that call `get_admin`).
+    /// The first admin address.
+    ///
+    /// On a deployment that predates the multi-sig admin set this is read from
+    /// the deprecated `DataKey::Admin` slot; on every current deployment it is
+    /// `get_admins()[0]`. Reading the legacy slot is a compatibility nicety
+    /// only — it confers no authority (see `DataKey::Admin`).
     pub fn get_admin(env: Env) -> Result<Address, RegistryError> {
-        // Prefer the legacy single-admin key so the upgrade tests work as-is.
-        if let Some(a) = env
+        if let Some(legacy) = env
             .storage()
             .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
         {
-            return Ok(a);
+            return Ok(legacy);
         }
         let admins = Self::admin_index(&env);
         admins.get(0).ok_or(RegistryError::NotInitialized)
@@ -2438,6 +2541,11 @@ impl LuminaRegistry {
 
     /// Paginated list of active registrations in one category, in
     /// registration order.
+    ///
+    /// **Deprecated:** prefer [`LuminaRegistry::get_contracts_by_category_after`].
+    /// Offset pagination re-reads the whole category index up to `offset` on
+    /// every page, and a registration inserted mid-walk shifts every later
+    /// page. Retained for one release so existing callers keep working.
     ///
     /// Semantics match [`LuminaRegistry::get_active_contracts`] exactly,
     /// including the one that surprises people: `offset` indexes into the
@@ -2475,6 +2583,25 @@ impl LuminaRegistry {
         }
 
         result
+    }
+
+    /// Cursor form of [`LuminaRegistry::get_active_contracts_by_category`].
+    ///
+    /// `cursor` is the `contract_id` of the last entry the previous call
+    /// returned (`None` to start at the beginning). The position is anchored to
+    /// a registration rather than to a numeric index, so a registration added
+    /// mid-walk is appended after the cursor and cannot duplicate or skip an
+    /// entry already returned. Named without the `active_` prefix, and without
+    /// `get_active_contracts_by_category`'s full length, because Soroban caps
+    /// exported names at 32 characters.
+    pub fn get_contracts_by_category_after(
+        env: Env,
+        category: Category,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let index = Self::category_index(&env, &category);
+        Self::active_page_after(&env, &index, &cursor, limit)
     }
 
     /// Paginated list of active registrations in multiple categories.
@@ -2716,6 +2843,10 @@ impl LuminaRegistry {
             slashed_total += record.amount;
         }
 
+        let withdraw_locked_until = env.storage().persistent()
+            .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
+            .unwrap_or(0);
+
         let reputation = Reputation {
             stake: env
                 .storage()
@@ -2728,21 +2859,53 @@ impl LuminaRegistry {
                 .get(&DataKey::Verified(contract_id.clone()))
                 .unwrap_or(false),
             slashed_total,
-            withdraw_locked_until: env
-                .storage()
-                .persistent()
-                .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
-                .unwrap_or(0),
+            withdraw_locked_until,
+            withdraw_locked: env.ledger().sequence() < withdraw_locked_until,
         };
 
         Ok(ContractProfile {
             reputation,
             entry,
+            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
             superseded_by: env
                 .storage()
                 .persistent()
-                .get(&DataKey::SupersededBy(contract_id)),
+                .get(&DataKey::SupersededBy(contract_id.clone())),
+            registered_at_ts: env
+                .storage()
+                .persistent()
+                .get(&DataKey::ContractTimestamp(contract_id))
+                .unwrap_or(0),
         })
+    }
+
+    /// Record that one registration has been superseded by another project.
+    /// The old entry remains in place, but consumers can surface the newer
+    /// contract in the profile and history views.
+    pub fn set_superseded_by(
+        env: Env,
+        owner: Address,
+        old_contract: Address,
+        new_contract: Address,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let old_entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(old_contract.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+        if owner != old_entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let new_entry: ContractEntry = env.storage().persistent()
+            .get(&DataKey::Contract(new_contract.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+        if new_entry.owner != owner {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        env.storage().persistent().set(&DataKey::SupersededBy(old_contract), &new_contract);
+        Ok(())
     }
 
     /// `get_active_contracts`, with each entry's reputation attached. Same
@@ -2766,6 +2929,7 @@ impl LuminaRegistry {
                     if entry.active {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
                             superseded_by: env
                                 .storage()
                                 .persistent()
@@ -2824,24 +2988,10 @@ impl LuminaRegistry {
     /// counts entries that still load and are flagged active, skipping dead
     /// references exactly as `get_active_contracts` does.
     pub fn get_active_contract_count(env: Env) -> u32 {
-        let all: Vec<Address> = env
-            .storage()
+        env.storage()
             .instance()
-            .get(&DataKey::AllContracts)
-            .unwrap_or(Vec::new(&env));
-        let mut active: u32 = 0;
-        for contract_id in all.iter() {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
-            {
-                if entry.active {
-                    active += 1;
-                }
-            }
-        }
-        active
+            .get(&DataKey::ActiveCount)
+            .unwrap_or(0)
     }
 
     fn is_active_listing(env: &Env, entry: &ContractEntry) -> bool {
@@ -2861,6 +3011,12 @@ impl LuminaRegistry {
     }
 
     /// Paginated list of active registered contracts in registration order.
+    ///
+    /// **Deprecated:** prefer [`LuminaRegistry::get_active_contracts_after`].
+    /// `offset` indexes into the raw `AllContracts` index, so walking the whole
+    /// registry re-reads every earlier entry on each page, and a registration
+    /// inserted mid-walk shifts every later page. Retained for one release so
+    /// `lumina-backend`'s indexer keeps working; see #26.
     pub fn get_active_contracts(env: Env, offset: u32, limit: u32) -> Vec<ContractEntry> {
         let all: Vec<Address> = env
             .storage()
@@ -2886,6 +3042,40 @@ impl LuminaRegistry {
         }
 
         result
+    }
+
+    /// Cursor-based listing of active registrations, for callers walking the
+    /// whole registry.
+    ///
+    /// `cursor` is the `contract_id` of the last entry the previous call
+    /// returned (`None` to start at the beginning), and `limit` bounds this
+    /// page. The position is anchored to a registration rather than to a
+    /// numeric index, so a registration inserted while the caller is walking is
+    /// appended after the cursor and neither duplicates nor skips an entry
+    /// already returned — the stability the offset form cannot offer.
+    ///
+    /// Typical loop:
+    ///
+    /// ```text
+    /// let mut cursor = None;
+    /// loop {
+    ///     let page = registry.get_active_contracts_after(cursor, 50);
+    ///     if page.is_empty() { break; }
+    ///     cursor = Some(page.last().contract_id);
+    ///     // consume page...
+    /// }
+    /// ```
+    pub fn get_active_contracts_after(
+        env: Env,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(&env));
+        Self::active_page_after(&env, &all, &cursor, limit)
     }
 
     /// Paginated list of active contract addresses only, intended for indexers
@@ -2967,6 +3157,7 @@ impl LuminaRegistry {
                     if entry.active {
                         entries.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
+                            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
                             superseded_by: env
                                 .storage()
                                 .persistent()
@@ -2984,8 +3175,121 @@ impl LuminaRegistry {
         ContractProfilePage { entries, has_more }
     }
 
+    /// Returns active registrations ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    ///
+    /// ## Cost tradeoff: computed on read
+    /// This ordering is computed on read rather than maintained on write.
+    /// - **Write cost**: Zero overhead. `stake`, `withdraw_stake`, `slash`, etc. do not need to update an index.
+    /// - **Read cost**: O(N log N) sorting cost and O(N) persistent reads, where N is the total number of active contracts.
+    ///   As the registry grows, this view becomes expensive. Maintaining an index on write would invert this,
+    ///   making the read cheap but imposing overhead on every stake mutation.
+    pub fn get_active_contracts_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractPage {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(&env));
+
+        let mut active_with_stake: alloc::vec::Vec<(i128, u32, ContractEntry)> = alloc::vec::Vec::new();
+
+        for (i, contract_id) in all.into_iter().enumerate() {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+            {
+                if entry.active {
+                    let stake = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, i128>(&DataKey::Stake(contract_id.clone()))
+                        .unwrap_or(0);
+                    active_with_stake.push((stake, i as u32, entry));
+                }
+            }
+        }
+
+        active_with_stake.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut entries = Vec::new(&env);
+        let start = offset as usize;
+        let end = core::cmp::min(start + (limit as usize), active_with_stake.len());
+
+        if start < active_with_stake.len() {
+            for item in &active_with_stake[start..end] {
+                entries.push_back(item.2.clone());
+            }
+        }
+
+        let has_more = end < active_with_stake.len();
+        ContractPage { entries, has_more }
+    }
+
+    /// Returns active profiles ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    ///
+    /// ## Cost tradeoff: computed on read
+    /// See `get_active_contracts_by_stake_page` for the tradeoffs of this approach.
+    pub fn get_active_profiles_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllContracts)
+            .unwrap_or(Vec::new(&env));
+
+        let mut active_with_stake: alloc::vec::Vec<(i128, u32, ContractProfile)> = alloc::vec::Vec::new();
+
+        for (i, contract_id) in all.into_iter().enumerate() {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+            {
+                if entry.active {
+                    let reputation = Self::reputation_of(&env, &contract_id);
+                    let profile = ContractProfile {
+                        reputation: reputation.clone(),
+                        metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
+                        superseded_by: env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey::SupersededBy(contract_id.clone())),
+                        registered_at_ts: env
+                            .storage()
+                            .persistent()
+                            .get(&DataKey::ContractTimestamp(contract_id.clone()))
+                            .unwrap_or(0),
+                        entry,
+                    };
+                    active_with_stake.push((reputation.stake, i as u32, profile));
+                }
+            }
+        }
+
+        active_with_stake.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut entries = Vec::new(&env);
+        let start = offset as usize;
+        let end = core::cmp::min(start + (limit as usize), active_with_stake.len());
+
+        if start < active_with_stake.len() {
+            for item in &active_with_stake[start..end] {
+                entries.push_back(item.2.clone());
+            }
+        }
+
+        let has_more = end < active_with_stake.len();
+        ContractProfilePage { entries, has_more }
+    }
+
     /// Paginated list of every contract registered by `owner`, including
     /// deactivated entries.
+    ///
+    /// **Deprecated:** prefer [`LuminaRegistry::get_contracts_by_owner_after`].
+    /// Offset pagination re-reads the owner's index up to `offset` on each
+    /// page, and a registration inserted mid-walk shifts every later page.
+    /// Retained for one release so existing callers keep working; see #26.
     pub fn get_contracts_by_owner(
         env: Env,
         owner: Address,
@@ -3010,6 +3314,24 @@ impl LuminaRegistry {
         }
 
         result
+    }
+
+    /// Cursor-based form of [`LuminaRegistry::get_contracts_by_owner`].
+    ///
+    /// `cursor` is the `contract_id` of the last entry the previous call
+    /// returned (`None` to start at the beginning). Like the offset form, this
+    /// includes deactivated registrations — an owner listing is a management
+    /// view, not a discovery one — and a registration added mid-walk is
+    /// appended after the cursor without duplicating or skipping earlier
+    /// entries.
+    pub fn get_contracts_by_owner_after(
+        env: Env,
+        owner: Address,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let owned = Self::owner_index(&env, &owner);
+        Self::page_after(&env, &owned, &cursor, limit)
     }
 
     /// Update a registered contract's name and description.
@@ -3074,6 +3396,8 @@ impl LuminaRegistry {
             return Err(RegistryError::NotOwner);
         }
 
+        Self::validate_contract_metadata(&name, &description)?;
+
         entry.name = name.clone();
         entry.description = description;
         env.storage()
@@ -3088,6 +3412,68 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    /// Update the off-chain metadata URI for a registration.
+    ///
+    /// The URI should point to a JSON document with this suggested shape:
+    /// `json
+    /// {
+    ///   "name": "Contract Name",
+    ///   "description": "...",
+    ///   "logo_uri": "https://...",
+    ///   "links": {
+    ///     "website": "...",
+    ///     "twitter": "...",
+    ///     "github": "..."
+    ///   },
+    ///   "audit": "https://..."
+    /// }
+    /// `
+    pub fn update_metadata_uri(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        uri: Option<String>,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        if let Some(u) = &uri {
+            if u.len() > 2048 {
+                return Err(RegistryError::InvalidUri);
+            }
+
+            let u_str: alloc::string::String = alloc::format!("{}", u);
+            if !u_str.starts_with("http://") && !u_str.starts_with("https://") && !u_str.starts_with("ipfs://") && !u_str.starts_with("ipns://") {
+                return Err(RegistryError::InvalidUri);
+            }
+        }
+
+        if let Some(u) = uri {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MetadataUri(contract_id.clone()), &u);
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::MetadataUri(contract_id.clone()));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "metadata_uri_updated"),),
+            (contract_id, owner),
+        );
+
+        Ok(())
+    }
     /// Hand a registration over to a new owner.
     /// Only the current owner can call this (admin override removed — ownership
     /// transfer should be driven by the owner themselves).
@@ -3105,26 +3491,15 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        // Require caller to be the owner OR a member of the admin set.
+        // Require the caller to be the owner or a member of the current admin
+        // set. The legacy single-admin key is deliberately not consulted: it
+        // grants no authority (see `DataKey::Admin`), and honouring it here
+        // would be the same single-key bypass this contract removed elsewhere.
         let is_owner = caller == entry.owner;
-        let admins = Self::admin_index(&env);
-        let is_admin = admins.contains(&caller);
+        let is_admin = Self::admin_index(&env).contains(&caller);
 
-        // Fall back to the legacy single-admin check for the upgrade tests.
-        let is_legacy_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|a| a == caller)
-            .unwrap_or(false);
-
-        if !is_owner && !is_admin && !is_legacy_admin {
-            // Neither the new multi-sig admins nor the legacy admin nor the
-            // owner — check whether we're initialized at all so the error
-            // message stays informative.
-            if !env.storage().instance().has(&DataKey::Admins)
-                && !env.storage().instance().has(&DataKey::Admin)
-            {
+        if !is_owner && !is_admin {
+            if !env.storage().instance().has(&DataKey::Admins) {
                 return Err(RegistryError::NotInitialized);
             }
             return Err(RegistryError::Unauthorized);
@@ -3212,6 +3587,25 @@ impl LuminaRegistry {
             .unwrap_or(Vec::new(env))
     }
 
+    fn validate_contract_metadata(name: &String, description: &String) -> Result<(), RegistryError> {
+        let len = name.len();
+        if name.is_empty() || len > MAX_NAME_LEN {
+            return Err(RegistryError::InvalidMetadata);
+        }
+
+        let mut raw = [0u8; MAX_NAME_LEN as usize];
+        let bytes = &mut raw[..len as usize];
+        name.copy_into_slice(bytes);
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Err(RegistryError::InvalidMetadata);
+        }
+
+        if description.len() > MAX_DESCRIPTION_LEN {
+            return Err(RegistryError::InvalidMetadata);
+        }
+        Ok(())
+    }
+
     /// Return `NotAdmin` if `addr` is not in the current admin set.
     fn assert_is_admin(admins: &Vec<Address>, addr: &Address) -> Result<(), RegistryError> {
         if admins.is_empty() {
@@ -3267,10 +3661,17 @@ impl LuminaRegistry {
                     .persistent()
                     .get(&DataKey::Contract(contract_id.clone()))
                     .ok_or(RegistryError::ContractNotFound)?;
+                let was_active = entry.active;
                 entry.active = false;
                 env.storage()
                     .persistent()
                     .set(&DataKey::Contract(contract_id.clone()), &entry);
+
+                if was_active {
+                    let categories = Self::categories_of(env, contract_id);
+                    Self::decrement_active_counts(env, &categories);
+                }
+
                 env.events().publish(
                     (Symbol::new(env, "contract_deactivated"),),
                     (contract_id.clone(), Symbol::new(env, "governance")),
@@ -3279,7 +3680,8 @@ impl LuminaRegistry {
             ProposalAction::Upgrade(new_wasm_hash) => {
                 env.deployer()
                     .update_current_contract_wasm(new_wasm_hash.clone());
-                // The version being replaced, deliberately — see `upgrade`.
+                // The version being replaced, deliberately — see
+                // `propose_upgrade`.
                 env.events().publish(
                     (Symbol::new(env, "registry_upgraded"),),
                     (new_wasm_hash.clone(), CONTRACT_VERSION),
@@ -3335,6 +3737,14 @@ impl LuminaRegistry {
                     .publish((Symbol::new(env, "threshold_changed"),), (*new_threshold,));
             }
             ProposalAction::ConfigureStaking(token_id, treasury) => {
+                // Capture whatever was configured before this call, if
+                // anything, so the event can report the transition rather
+                // than only the new values.
+                let prev_token: Option<Address> =
+                    env.storage().instance().get(&DataKey::StakeToken);
+                let prev_treasury: Option<Address> =
+                    env.storage().instance().get(&DataKey::Treasury);
+
                 if *treasury == env.current_contract_address() {
                     return Err(RegistryError::InvalidMetadata);
                 }
@@ -3358,11 +3768,20 @@ impl LuminaRegistry {
                 {
                     return Err(RegistryError::OverlappingAddress);
                 }
+                if let Some(pt) = &prev_token {
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::PreviousStakeToken, pt);
+                }
+                if let Some(pt) = &prev_treasury {
+                    env.storage().instance().set(&DataKey::PreviousTreasury, pt);
+                }
                 env.storage().instance().set(&DataKey::StakeToken, token_id);
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
                     (Symbol::new(env, "staking_configured"),),
-                    (prev_token, prev_treasury, token_id, treasury),
+                    (token_id, treasury),
+                    (prev_token, prev_treasury, token_id.clone(), treasury.clone()),
                 );
             }
             ProposalAction::SetVerified(contract_id, verified) => {
@@ -3626,6 +4045,8 @@ impl LuminaRegistry {
             slashed_total += record.amount;
         }
 
+        let withdraw_locked_until = Self::withdraw_locked_until(env, contract_id);
+
         Reputation {
             stake: Self::stake_of(env, contract_id),
             verified: env
@@ -3634,7 +4055,8 @@ impl LuminaRegistry {
                 .get(&DataKey::Verified(contract_id.clone()))
                 .unwrap_or(false),
             slashed_total,
-            withdraw_locked_until: Self::withdraw_locked_until(env, contract_id),
+            withdraw_locked_until,
+            withdraw_locked: env.ledger().sequence() < withdraw_locked_until,
         }
     }
 
@@ -3707,6 +4129,103 @@ impl LuminaRegistry {
             .persistent()
             .set(&DataKey::OwnerContracts(owner.clone()), contracts);
     }
+
+    /// Raw index position a cursor walk resumes from: immediately after
+    /// `cursor`, or the end of the index when the cursor is absent.
+    ///
+    /// Ending rather than restarting when the cursor is gone is deliberate: a
+    /// cursor whose registration was removed has no recoverable position, and
+    /// replaying entries the caller already saw is worse than stopping.
+    fn cursor_start(index: &Vec<Address>, cursor: &Option<Address>) -> u32 {
+        match cursor {
+            None => 0,
+            Some(c) => index
+                .first_index_of(c)
+                .map(|i| i + 1)
+                .unwrap_or(index.len()),
+        }
+    }
+
+    /// Active `ContractEntry`s at or after `cursor` in `index`, up to `limit`.
+    fn active_page_after(
+        env: &Env,
+        index: &Vec<Address>,
+        cursor: &Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let mut result = Vec::new(env);
+        let mut i = Self::cursor_start(index, cursor);
+        while i < index.len() && result.len() < limit {
+            if let Some(contract_id) = index.get(i) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+                {
+                    if entry.active {
+                        result.push_back(entry);
+                    }
+                }
+            }
+            i += 1;
+        }
+        result
+    }
+
+    /// Every `ContractEntry` at or after `cursor` in `index`, up to `limit`.
+    /// Unlike [`LuminaRegistry::active_page_after`] this does not filter on
+    /// `active`, matching `get_contracts_by_owner`'s management-view semantics.
+    fn page_after(
+        env: &Env,
+        index: &Vec<Address>,
+        cursor: &Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let mut result = Vec::new(env);
+        let mut i = Self::cursor_start(index, cursor);
+        while i < index.len() && result.len() < limit {
+            if let Some(contract_id) = index.get(i) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+                {
+                    result.push_back(entry);
+                }
+            }
+            i += 1;
+        }
+        result
+    }
+
+    fn change_active_count(env: &Env, delta: i32) {
+        if delta == 0 { return; }
+        let count: u32 = env.storage().instance().get(&DataKey::ActiveCount).unwrap_or(0);
+        let new_count = if delta > 0 { count.saturating_add(delta as u32) } else { count.saturating_sub((-delta) as u32) };
+        env.storage().instance().set(&DataKey::ActiveCount, &new_count);
+    }
+
+    fn change_category_count(env: &Env, category: &Category, delta: i32) {
+        if delta == 0 { return; }
+        let key = DataKey::CategoryCount(*category);
+        let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+        let new_count = if delta > 0 { count.saturating_add(delta as u32) } else { count.saturating_sub((-delta) as u32) };
+        env.storage().instance().set(&key, &new_count);
+    }
+
+    fn increment_active_counts(env: &Env, categories: &Vec<Category>) {
+        Self::change_active_count(env, 1);
+        for category in categories.iter() {
+            Self::change_category_count(env, &category, 1);
+        }
+    }
+
+    fn decrement_active_counts(env: &Env, categories: &Vec<Category>) {
+        Self::change_active_count(env, -1);
+        for category in categories.iter() {
+            Self::change_category_count(env, &category, -1);
+        }
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -3719,11 +4238,11 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::{IntoVal, TryFromVal};
 
-    // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
-
-    mod registry_v1_wasm {
-        soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/lumina_registry.wasm");
-    }
+    // ── Upgrade-path wasm fixture ───────────────────────────────────────────
+    //
+    // Only the *incoming* wasm is imported: the upgrade tests deploy the
+    // registry natively and swap in this fixture, so there is no separate
+    // "v1 wasm" to load.
 
     mod registry_v2_wasm {
         soroban_sdk::contractimport!(
@@ -4346,6 +4865,80 @@ mod test {
     // ── Existing registry tests (single-admin setup) ────────────────────────
 
     #[test]
+    fn test_active_counts_invariant() {
+        let (env, client, _admin) = setup();
+
+        let (owner1, target1) = register_sample(&env, &client); // default_cats = [Infrastructure]
+
+        let owner2 = Address::generate(&env);
+        let target2 = register_in(&env, &client, &owner2, &[Category::DeFi, Category::Oracle]);
+
+        let owner3 = Address::generate(&env);
+        let target3 = register_in(&env, &client, &owner3, &[Category::Oracle, Category::Infrastructure]);
+
+        // Deactivate one
+        client.deactivate(&owner2, &target2);
+
+        // Deregister another (deactivate first)
+        client.deactivate(&owner1, &target1);
+        client.deregister(&owner1, &target1);
+
+        // Change categories of an active one (target3 is still active)
+        client.set_categories(&owner3, &target3, &cats(&env, &[Category::DeFi, Category::Infrastructure]));
+
+        let mut expected_active = 0;
+        let mut expected_defi = 0;
+        let mut expected_oracle = 0;
+        let mut expected_infrastructure = 0;
+
+        let all: Vec<Address> = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env))
+        });
+
+        for target in all.iter() {
+            let active = env.as_contract(&client.address, || {
+                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(target.clone())) {
+                    entry.active
+                } else {
+                    false
+                }
+            });
+
+            if active {
+                expected_active += 1;
+                let categories = env.as_contract(&client.address, || {
+                    LuminaRegistry::categories_of(&env, &target)
+                });
+                for cat in categories.iter() {
+                    match cat {
+                        Category::DeFi => expected_defi += 1,
+                        Category::Oracle => expected_oracle += 1,
+                        Category::Infrastructure => expected_infrastructure += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let actual_active = env.as_contract(&client.address, || {
+            env.storage().instance().get::<DataKey, u32>(&DataKey::ActiveCount).unwrap_or(0)
+        });
+
+        assert_eq!(actual_active, expected_active);
+        assert_eq!(client.get_active_contract_count(), expected_active);
+
+        let get_cat_count = |cat: Category| -> u32 {
+            env.as_contract(&client.address, || {
+                env.storage().instance().get::<DataKey, u32>(&DataKey::CategoryCount(cat)).unwrap_or(0)
+            })
+        };
+
+        assert_eq!(get_cat_count(Category::DeFi), expected_defi);
+        assert_eq!(get_cat_count(Category::Oracle), expected_oracle);
+        assert_eq!(get_cat_count(Category::Infrastructure), expected_infrastructure);
+    }
+
+    #[test]
     fn register_contract_succeeds() {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
@@ -4530,6 +5123,140 @@ mod test {
         assert!(page_contains(&b, &target_b));
     }
 
+    // ── Cursor pagination (#26) ─────────────────────────────────────────────
+
+    #[test]
+    fn cursor_walks_every_active_entry_exactly_once() {
+        let (env, client, _admin) = setup();
+        for _ in 0..7 {
+            register_sample(&env, &client);
+        }
+
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut cursor: Option<Address> = None;
+        loop {
+            let page = client.get_active_contracts_after(&cursor, &2);
+            if page.is_empty() {
+                break;
+            }
+            for entry in page.iter() {
+                assert!(
+                    !seen.contains(&entry.contract_id),
+                    "cursor walk returned an entry twice"
+                );
+                seen.push_back(entry.contract_id);
+            }
+            cursor = Some(page.get(page.len() - 1).unwrap().contract_id);
+        }
+        assert_eq!(seen.len(), 7);
+    }
+
+    #[test]
+    fn cursor_does_not_replay_or_skip_when_a_registration_is_added_mid_walk() {
+        let (env, client, _admin) = setup();
+        let (_o1, first) = register_sample(&env, &client);
+        let (_o2, second) = register_sample(&env, &client);
+        let (_o3, third) = register_sample(&env, &client);
+
+        let none: Option<Address> = None;
+        let page1 = client.get_active_contracts_after(&none, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap().contract_id, first);
+        assert_eq!(page1.get(1).unwrap().contract_id, second);
+
+        // A registration lands mid-walk. It is appended to the index, so it
+        // appears after the cursor rather than shifting the entries already
+        // returned or being skipped.
+        let (_o4, fourth) = register_sample(&env, &client);
+
+        let cursor = Some(second);
+        let page2 = client.get_active_contracts_after(&cursor, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().contract_id, third);
+        assert_eq!(page2.get(1).unwrap().contract_id, fourth);
+
+        let cursor = Some(fourth);
+        assert!(client.get_active_contracts_after(&cursor, &2).is_empty());
+    }
+
+    #[test]
+    fn category_cursor_walks_every_active_entry_exactly_once() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        for _ in 0..5 {
+            register_in(&env, &client, &owner, &[Category::DeFi]);
+        }
+        // Noise filed under another category must not leak into the walk.
+        register_in(&env, &client, &owner, &[Category::Nft]);
+
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut cursor: Option<Address> = None;
+        loop {
+            let page = client.get_contracts_by_category_after(&Category::DeFi, &cursor, &2);
+            if page.is_empty() {
+                break;
+            }
+            for entry in page.iter() {
+                assert!(
+                    !seen.contains(&entry.contract_id),
+                    "category cursor walk returned an entry twice"
+                );
+                seen.push_back(entry.contract_id);
+            }
+            cursor = Some(page.get(page.len() - 1).unwrap().contract_id);
+        }
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[test]
+    fn owner_cursor_walks_every_entry_exactly_once_and_keeps_deactivated() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let other = Address::generate(&env);
+        let first = register_for(&env, &client, &owner);
+        let second = register_for(&env, &client, &owner);
+        register_for(&env, &client, &owner);
+        // Another owner's entries must not leak in.
+        register_for(&env, &client, &other);
+        // The owner listing is a management view, so deactivated entries stay.
+        client.deactivate(&owner, &first);
+
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut cursor: Option<Address> = None;
+        loop {
+            let page = client.get_contracts_by_owner_after(&owner, &cursor, &2);
+            if page.is_empty() {
+                break;
+            }
+            for entry in page.iter() {
+                assert!(
+                    !seen.contains(&entry.contract_id),
+                    "owner cursor walk returned an entry twice"
+                );
+                seen.push_back(entry.contract_id);
+            }
+            cursor = Some(page.get(page.len() - 1).unwrap().contract_id);
+        }
+        assert_eq!(seen.len(), 3);
+        assert!(seen.contains(&first));
+        assert!(seen.contains(&second));
+    }
+
+    #[test]
+    fn cursor_whose_registration_was_deregistered_ends_the_walk() {
+        let (env, client, _admin) = setup();
+        let (owner, first) = register_sample(&env, &client);
+        register_for(&env, &client, &owner);
+
+        client.deactivate(&owner, &first);
+        client.deregister(&owner, &first);
+
+        // The cursor's registration is gone, so its position is unrecoverable.
+        // The walk stops rather than replaying entries the caller already saw.
+        let cursor = Some(first);
+        assert!(client.get_active_contracts_after(&cursor, &10).is_empty());
+    }
+
     #[test]
     fn update_metadata_by_owner_succeeds() {
         let (env, client, _admin) = setup();
@@ -4553,6 +5280,74 @@ mod test {
                 &String::from_str(&env, "X"),
             ),
             Err(Ok(RegistryError::NotOwner))
+        );
+    }
+
+    #[test]
+    fn register_contract_rejects_invalid_metadata() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            client.try_register_contract(
+                &owner,
+                &target,
+                &String::from_str(&env, ""),
+                &String::from_str(&env, "desc"),
+                &soroban_sdk::vec![&env, Category::Other],
+            ),
+            Err(Ok(RegistryError::InvalidMetadata))
+        );
+
+        assert_eq!(
+            client.try_register_contract(
+                &owner,
+                &Address::generate(&env),
+                &String::from_str(&env, "   "),
+                &String::from_str(&env, "desc"),
+                &soroban_sdk::vec![&env, Category::Other],
+            ),
+            Err(Ok(RegistryError::InvalidMetadata))
+        );
+
+        let long_name = "x".repeat((MAX_NAME_LEN + 1) as usize);
+        assert_eq!(
+            client.try_register_contract(
+                &owner,
+                &Address::generate(&env),
+                &String::from_str(&env, &long_name),
+                &String::from_str(&env, "desc"),
+                &soroban_sdk::vec![&env, Category::Other],
+            ),
+            Err(Ok(RegistryError::InvalidMetadata))
+        );
+    }
+
+    #[test]
+    fn update_metadata_rejects_invalid_metadata() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+
+        assert_eq!(
+            client.try_update_metadata(
+                &owner,
+                &target,
+                &String::from_str(&env, ""),
+                &String::from_str(&env, "desc"),
+            ),
+            Err(Ok(RegistryError::InvalidMetadata))
+        );
+
+        let long_desc = "x".repeat((MAX_DESCRIPTION_LEN + 1) as usize);
+        assert_eq!(
+            client.try_update_metadata(
+                &owner,
+                &target,
+                &String::from_str(&env, "Valid"),
+                &String::from_str(&env, &long_desc),
+            ),
+            Err(Ok(RegistryError::InvalidMetadata))
         );
     }
 
@@ -4640,53 +5435,45 @@ mod test {
     }
 
     // ── Upgrade-path tests ──────────────────────────────────────────────────
+    //
+    // The registry is deployed natively so these run under the shortened
+    // `cfg(test)` timelock. The *incoming* code is the real `registry-v2` wasm,
+    // so `execute_proposal` performs a genuine wasm swap; the old code being
+    // replaced is the native registry under test.
 
-    fn deploy_v1(env: &Env) -> (registry_v1_wasm::Client<'static>, Address, Address) {
-        let admin = Address::generate(env);
-        // `__constructor` calls `require_auth()`, and deploying *from wasm*
-        // runs it as a sub-invocation of the `CreateContractV2` host function
-        // rather than as the root invocation. `mock_all_auths` rejects a
-        // `require_auth` that is not tied to the root frame, so the upgrade
-        // tests need the non-root variant. (Native `env.register(LuminaRegistry,
-        // ..)` in `setup` needs no such allowance and keeps plain mocking.)
-        env.mock_all_auths_allowing_non_root_auth();
-        let contract_id = env.register(registry_v1_wasm::WASM, (&admin,));
-        let client = registry_v1_wasm::Client::new(env, &contract_id);
-        (client, admin, contract_id)
-    }
-
-    fn register_via(env: &Env, client: &registry_v1_wasm::Client, owner: &Address) -> Address {
-        let target = Address::generate(env);
-        // The imported wasm carries its own generated copy of `Category`.
-        let mut categories = Vec::new(env);
-        categories.push_back(registry_v1_wasm::Category::Infrastructure);
-        client.register_contract(
-            owner,
-            &target,
-            &String::from_str(env, "Test Contract"),
-            &String::from_str(env, "A test contract"),
-            &categories,
-        );
-        target
+    /// Drive a native registry through the governance upgrade flow.
+    ///
+    /// `__constructor` sets a 1-of-1 threshold, so a single approval readies
+    /// the proposal; the timelock then has to elapse before `execute_proposal`
+    /// swaps the code. This is the only path that changes the wasm — the direct
+    /// `upgrade` entrypoint no longer exists (#36).
+    fn govern_upgrade(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        admin: &Address,
+        new_wasm_hash: &BytesN<32>,
+    ) {
+        let pid = client.propose_upgrade(admin, new_wasm_hash);
+        client.approve_proposal(admin, &pid);
+        advance_ledger(env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
     }
 
     #[test]
     fn upgrade_swaps_code_and_preserves_registrations() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, contract_id) = deploy_v1(&env);
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
 
-        let owner = Address::generate(&env);
-        let kept_active = register_via(&env, &v1, &owner);
-        let deactivated = register_via(&env, &v1, &owner);
-        let other_owner = register_via(&env, &v1, &Address::generate(&env));
-        v1.deactivate(&owner, &deactivated);
+        let (owner, kept_active) = register_sample(&env, &client);
+        let deactivated = register_for(&env, &client, &owner);
+        let (other_owner_addr, other_owner) = register_sample(&env, &client);
+        client.deactivate(&owner, &deactivated);
 
-        assert_eq!(v1.get_version(), CONTRACT_VERSION);
-        assert_eq!(v1.get_contract_count(), 3);
+        assert_eq!(client.get_version(), CONTRACT_VERSION);
+        assert_eq!(client.get_contract_count(), 3);
 
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-        v1.upgrade(&admin, &v2_hash);
+        govern_upgrade(&env, &client, &admin, &v2_hash);
 
         let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
         assert_eq!(v2.get_version(), CONTRACT_VERSION + 1);
@@ -4697,6 +5484,7 @@ mod test {
         assert!(entry.active);
         assert!(!v2.get_contract(&deactivated).active);
         assert_ne!(v2.get_contract(&other_owner).owner, owner);
+        let _ = other_owner_addr;
 
         let owned = v2.get_contracts_by_owner(&owner, &0, &10);
         assert_eq!(owned.len(), 2);
@@ -4705,111 +5493,76 @@ mod test {
 
     #[test]
     fn upgrade_retires_previous_interface() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, _) = deploy_v1(&env);
-        register_via(&env, &v1, &Address::generate(&env));
-        assert_eq!(v1.get_active_contracts(&0, &10).len(), 1);
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+        register_sample(&env, &client);
+        assert_eq!(client.get_active_contracts(&0, &10).len(), 1);
 
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-        v1.upgrade(&admin, &v2_hash);
-        assert!(v1.try_get_active_contracts(&0, &10).is_err());
+        govern_upgrade(&env, &client, &admin, &v2_hash);
+
+        // The upgraded contract no longer exports `get_active_contracts`, so
+        // invoking it through the old spec fails at the host boundary.
+        let after = LuminaRegistryClient::new(&env, &contract_id);
+        assert!(after.try_get_active_contracts(&0, &10).is_err());
     }
 
     #[test]
-    fn upgrade_by_non_admin_is_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, _admin, _) = deploy_v1(&env);
+    fn propose_upgrade_by_non_admin_is_rejected() {
+        let (env, client, _admin) = setup();
         let stranger = Address::generate(&env);
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
         assert_eq!(
-            v1.try_upgrade(&stranger, &v2_hash),
-            Err(Ok(registry_v1_wasm::RegistryError::Unauthorized))
+            client.try_propose_upgrade(&stranger, &v2_hash),
+            Err(Ok(RegistryError::NotAdmin))
         );
     }
 
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
-    fn upgrade_without_admin_signature_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, _) = deploy_v1(&env);
+    fn propose_upgrade_without_admin_signature_panics() {
+        let (env, client, admin) = setup();
         let stranger = Address::generate(&env);
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
 
         env.mock_auths(&[MockAuth {
             address: &stranger,
             invoke: &MockAuthInvoke {
-                contract: &v1.address,
-                fn_name: "upgrade",
+                contract: &client.address,
+                fn_name: "propose_upgrade",
                 args: (admin.clone(), v2_hash.clone()).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        v1.upgrade(&admin, &v2_hash);
+        client.propose_upgrade(&admin, &v2_hash);
     }
 
     #[test]
-    fn upgrade_with_admin_signature_succeeds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, contract_id) = deploy_v1(&env);
+    fn propose_upgrade_with_admin_signature_succeeds() {
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
 
         env.mock_auths(&[MockAuth {
             address: &admin,
             invoke: &MockAuthInvoke {
-                contract: &v1.address,
-                fn_name: "upgrade",
+                contract: &client.address,
+                fn_name: "propose_upgrade",
                 args: (admin.clone(), v2_hash.clone()).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        v1.upgrade(&admin, &v2_hash);
+        let pid = client.propose_upgrade(&admin, &v2_hash);
+        // Restore blanket mocking for the remaining governance steps.
+        env.mock_all_auths();
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        client.execute_proposal(&pid);
+
         assert_eq!(
             registry_v2_wasm::Client::new(&env, &contract_id).get_version(),
             CONTRACT_VERSION + 1
         );
-    }
-
-    #[test]
-    fn upgraded_registry_can_be_rolled_back() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, contract_id) = deploy_v1(&env);
-        let owner = Address::generate(&env);
-        let target = register_via(&env, &v1, &owner);
-
-        let v1_hash = env.deployer().upload_contract_wasm(registry_v1_wasm::WASM);
-        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-
-        v1.upgrade(&admin, &v2_hash);
-        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
-        assert_eq!(v2.get_version(), CONTRACT_VERSION + 1);
-
-        v2.upgrade(&admin, &v1_hash);
-        assert_eq!(v1.get_version(), CONTRACT_VERSION);
-        assert_eq!(v1.get_contract(&target).owner, owner);
-        assert_eq!(v1.get_active_contracts(&0, &10).len(), 1);
-    }
-
-    #[test]
-    fn upgrade_carries_admin_across_swap() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, contract_id) = deploy_v1(&env);
-        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-
-        v1.upgrade(&admin, &v2_hash);
-        let v2 = registry_v2_wasm::Client::new(&env, &contract_id);
-
-        let stranger = Address::generate(&env);
-        assert_eq!(
-            v2.try_upgrade(&stranger, &v2_hash),
-            Err(Ok(registry_v2_wasm::RegistryError::Unauthorized))
-        );
-        v2.upgrade(&admin, &v2_hash);
     }
 
     /// Data of the single `registry_upgraded` event emitted by `contract_id`
@@ -4836,54 +5589,18 @@ mod test {
     // The upgrade event carries the version of the code being *replaced*.
     // Emitting the incoming version would be an equally plausible-looking
     // choice, and it would silently invert every consumer's reading of the
-    // field — these tests pin the intent so that change cannot slip through.
-
-    #[test]
-    fn registry_upgraded_event_reports_the_replaced_version() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (v1, admin, contract_id) = deploy_v1(&env);
-        let replaced = v1.get_version();
-
-        let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-        v1.upgrade(&admin, &v2_hash);
-        // Read the event before any further call: `events().all()` only
-        // covers the most recent invocation.
-        let (by, hash, version): (Address, BytesN<32>, u32) =
-            registry_upgraded_data(&env, &contract_id).into_val(&env);
-
-        let incoming = registry_v2_wasm::Client::new(&env, &contract_id).get_version();
-        assert_ne!(
-            replaced, incoming,
-            "fixture must make the two versions distinguishable"
-        );
-        assert_eq!(by, admin);
-        assert_eq!(hash, v2_hash);
-        assert_eq!(version, replaced);
-        assert_ne!(version, incoming);
-    }
+    // field — this test pins the intent so that change cannot slip through.
 
     #[test]
     fn governance_upgrade_event_reports_the_replaced_version() {
-        // The v1 fixture is the release wasm, built without `cfg(test)`, so it
-        // enforces the production timelock. Stretch entry TTLs so waiting it
-        // out does not archive the registry's storage or code.
-        let production_timelock: u32 = 17_280;
-        let env = Env::default();
-        env.ledger().with_mut(|li| {
-            li.min_persistent_entry_ttl = production_timelock * 2;
-            li.min_temp_entry_ttl = production_timelock * 2;
-            li.max_entry_ttl = production_timelock * 4;
-        });
-        env.mock_all_auths();
-        let (v1, admin, contract_id) = deploy_v1(&env);
-        let replaced = v1.get_version();
+        let (env, client, admin) = setup();
+        let contract_id = client.address.clone();
+        let replaced = client.get_version();
 
         let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-        let pid = v1.propose_upgrade(&admin, &v2_hash);
-        v1.approve_proposal(&admin, &pid);
-        advance_ledger(&env, production_timelock);
-        v1.execute_proposal(&pid);
+        govern_upgrade(&env, &client, &admin, &v2_hash);
+        // Read the event before any further call: `events().all()` only
+        // covers the most recent invocation.
         let (hash, version): (BytesN<32>, u32) =
             registry_upgraded_data(&env, &contract_id).into_val(&env);
 
@@ -5576,6 +6293,7 @@ mod test {
         assert!(!reputation.verified);
         assert_eq!(reputation.slashed_total, 0);
         assert_eq!(reputation.withdraw_locked_until, 0);
+        assert!(!reputation.withdraw_locked);
         assert_solvency(&env, &client, &token_id);
     }
 
@@ -5677,6 +6395,7 @@ mod test {
         assert_eq!(reputation.stake, 750);
         assert_eq!(reputation.slashed_total, 250);
         assert!(reputation.withdraw_locked_until > env.ledger().sequence());
+        assert!(reputation.withdraw_locked);
         assert_eq!(balance(&env, &token_id, &treasury), 250);
 
         // Trying to exit immediately fails on both counts, in order: still
@@ -5694,6 +6413,7 @@ mod test {
         // Once the lock expires the remainder — and only the remainder —
         // comes back.
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        assert!(!client.get_reputation(&target).withdraw_locked);
         assert_eq!(client.withdraw_stake(&owner, &target), 750);
         assert_eq!(balance(&env, &token_id, &owner), 750);
         assert_eq!(balance(&env, &token_id, &client.address), 0);
@@ -7176,8 +7896,17 @@ mod test {
 
         let mut admins = Vec::new(&env);
         admins.push_back(admin);
-        // MIN_ADMINS is 2; passing 1 admin must fail with AdminSetTooSmall
-        let res = LuminaRegistry::initialize(env.clone(), admins, 1);
+        // `initialize` touches contract storage, so it needs a real contract
+        // frame to run in. Register one, then clear the admin set the
+        // constructor wrote so `initialize` sees the never-initialized state
+        // it is meant to guard (this is the legacy pre-constructor path).
+        // MIN_ADMINS is 2; passing 1 admin must fail with AdminSetTooSmall.
+        let bootstrap = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&bootstrap,));
+        let res = env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::Admins);
+            LuminaRegistry::initialize(env.clone(), admins, 1)
+        });
         assert_eq!(res, Err(RegistryError::AdminSetTooSmall));
     }
 
@@ -7256,7 +7985,10 @@ mod test {
     #[test]
     fn propose_configure_staking_rejects_noop() {
         let (env, client, admin) = setup();
-        let token_id = Address::generate(&env);
+        // Must be a real SEP-41 token: `execute_proposal` validates this by
+        // calling `decimals()` on it, which a plain generated address fails.
+        let issuer = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(issuer).address();
         let treasury = Address::generate(&env);
 
         let pid = client.propose_configure_staking(&admin, &token_id, &treasury);
@@ -7310,5 +8042,633 @@ mod test {
             ready_events.get(0).unwrap().into_val(&env);
         assert_eq!(r_pid, pid);
         assert_eq!(executable_from, ready_at + TIMELOCK_LEDGERS);
+    }
+
+    // ── Issue #56: negative auth coverage for every state-changing entrypoint ──
+    //
+    // A missing `require_auth()` is the highest-severity bug this contract can
+    // have, and it is invisible to any test that uses `mock_all_auths` — that
+    // helper approves *any* address's authorization, including one the
+    // contract never actually asked to authorize, so a dropped
+    // `require_auth()` call would not fail a single test above this section.
+    //
+    // Each test below signs the call as a real, wrong address (never the
+    // address the entrypoint's own `require_auth()` checks) via the exact
+    // `MockAuth`/`MockAuthInvoke` pattern already used above for
+    // `update_metadata`, `transfer_ownership` and `upgrade`, and asserts the
+    // call panics with `Error(Auth, InvalidAction)`. Removing the
+    // corresponding `require_auth()` call from `lib.rs` makes the matching
+    // test below pass auth and fail on the `should_panic` expectation instead
+    // (or run to completion), which is exactly the regression this section
+    // exists to catch.
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn constructor_without_bootstrap_admin_signature_panics() {
+        let env = Env::default();
+        let bootstrap_admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let contract_id = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "__constructor",
+                args: (bootstrap_admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        env.register_at(&contract_id, LuminaRegistry, (&bootstrap_admin,));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn initialize_without_admin_signatures_panics() {
+        let (env, client, _bootstrap) = setup();
+        // `initialize` only runs its no-admins-yet path when the admin set
+        // the constructor wrote is absent; clear it directly in storage
+        // (mirrors `initialize_below_min_admins_is_refused`).
+        env.as_contract(&client.address, || {
+            env.storage().instance().remove(&DataKey::Admins);
+        });
+
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        let mut admins = Vec::new(&env);
+        admins.push_back(a1);
+        admins.push_back(a2);
+
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "initialize",
+                args: (admins.clone(), 1u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.initialize(&admins, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_deactivate_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_deactivate",
+                args: (admin.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_deactivate(&admin, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_add_admin_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_add_admin",
+                args: (admin.clone(), new_admin.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_add_admin(&admin, &new_admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_remove_admin_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let other = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_remove_admin",
+                args: (admin.clone(), other.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_remove_admin(&admin, &other);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_change_threshold_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_change_threshold",
+                args: (admin.clone(), 1u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_change_threshold(&admin, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_upgrade_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let new_wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_upgrade",
+                args: (admin.clone(), new_wasm_hash.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_upgrade(&admin, &new_wasm_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_configure_staking_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let token = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_configure_staking",
+                args: (admin.clone(), token.clone(), treasury.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_configure_staking(&admin, &token, &treasury);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_verified_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_verified",
+                args: (admin.clone(), target.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_verified(&admin, &target, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_slash_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let reason = String::from_str(&env, "test");
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_slash",
+                args: (admin.clone(), target.clone(), 100i128, reason.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_slash(&admin, &target, &100, &reason);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_allowlist_enabled_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_allowlist_enabled",
+                args: (admin.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_allowlist_enabled(&admin, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_allowlisted_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_allowlisted",
+                args: (admin.clone(), owner.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_allowlisted(&admin, &owner, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_rate_limit_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_rate_limit",
+                args: (admin.clone(), 10u32, 100u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_rate_limit(&admin, &10, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_registration_fee_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_registration_fee",
+                args: (admin.clone(), 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_registration_fee(&admin, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_configure_minimum_stake_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_configure_minimum_stake",
+                args: (admin.clone(), 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_configure_minimum_stake(&admin, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_withdraw_from_treasury_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_withdraw_from_treasury",
+                args: (admin.clone(), 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_withdraw_from_treasury(&admin, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn approve_proposal_without_admin_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "approve_proposal",
+                args: (admin.clone(), 0u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.approve_proposal(&admin, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn deactivate_without_caller_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "deactivate",
+                args: (owner.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.deactivate(&owner, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn deregister_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "deregister",
+                args: (owner.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.deregister(&owner, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn register_contract_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let name = String::from_str(&env, "Test Contract");
+        let description = String::from_str(&env, "A test contract");
+        let categories = default_cats(&env);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_contract",
+                args: (
+                    owner.clone(),
+                    target.clone(),
+                    name.clone(),
+                    description.clone(),
+                    categories.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.register_contract(&owner, &target, &name, &description, &categories);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn register_contracts_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let entries = {
+            let mut v = Vec::new(&env);
+            v.push_back(RegistrationEntry {
+                contract_id: target,
+                name: String::from_str(&env, "Test Contract"),
+                description: String::from_str(&env, "A test contract"),
+                categories: default_cats(&env),
+            });
+            v
+        };
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_contracts",
+                args: (owner.clone(), entries.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.register_contracts(&owner, &entries);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn set_categories_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let categories = cats(&env, &[Category::Nft]);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_categories",
+                args: (owner.clone(), target.clone(), categories.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_categories(&owner, &target, &categories);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn set_tags_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "tag"));
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_tags",
+                args: (owner.clone(), target.clone(), tags.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_tags(&owner, &target, &tags);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn set_superseded_by_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let (_other_owner, replacement) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_superseded_by",
+                args: (owner.clone(), target.clone(), replacement.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_superseded_by(&owner, &target, &replacement);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn attest_without_attester_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let attester = Address::generate(&env);
+        let label = String::from_str(&env, "trustworthy");
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "attest",
+                args: (attester.clone(), target.clone(), label.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.attest(&attester, &target, &label);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn revoke_attestation_without_attester_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let attester = Address::generate(&env);
+        let label = String::from_str(&env, "trustworthy");
+        client.attest(&attester, &target, &label);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "revoke_attestation",
+                args: (attester.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.revoke_attestation(&attester, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn stake_without_owner_signature_panics() {
+        let (env, client, admin) = setup();
+        let _ = admin;
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "stake",
+                args: (owner.clone(), target.clone(), 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.stake(&owner, &target, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn withdraw_stake_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "withdraw_stake",
+                args: (owner.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.withdraw_stake(&owner, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn respond_to_slash_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let response = String::from_str(&env, "it was a mistake");
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "respond_to_slash",
+                args: (owner.clone(), target.clone(), 0u32, response.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.respond_to_slash(&owner, &target, &0, &response);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn renew_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "renew",
+                args: (owner.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.renew(&owner, &target);
     }
 }
