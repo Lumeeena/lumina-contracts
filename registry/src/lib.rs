@@ -647,7 +647,7 @@ pub struct Proposal {
 /// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
 /// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
 /// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
-/// | `Admin` | instance | `Address` — deprecated single-admin compatibility slot | Instance lifetime. Never written by current `__constructor` / `initialize`; only pre-multi-sig deployments still carry it, and `get_admin` reads it as a fallback. **Confers no authority** — no entrypoint authorizes against it. |
+/// | `Admin` | instance | `Address` — legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
 ///
 /// Indexes that must stay consistent with their entries: `OwnerContracts`,
 /// `AllContracts`, and `ByCategory`. Each names `Contract` entries, so a

@@ -233,10 +233,6 @@ storage shapes documented on `DataKey` and `ContractEntry` in
 [registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
-The legacy `DataKey::Admin` slot is retained for storage compatibility but
-**confers no authority**: no entrypoint authorizes against it, and current
-`initialize` / `__constructor` no longer write it. See the storage table below.
-
 ### Storage keys and their lifetimes
 
 Every key the registry writes is a `DataKey` variant. The table below lists each
@@ -246,7 +242,8 @@ site.
 
 | Key | Storage | Holds | Lifetime / TTL behaviour |
 | --- | --- | --- | --- |
-| `Admin` | instance | Deprecated single-admin compatibility slot. | **Not written by current `initialize` / `__constructor`.** Only pre-multisig deployments carry it; `get_admin` reads it as a fallback. It grants no authority — upgrades and other privileged actions go through `Admins` and proposals. |
+| `Admin` | instance | The registry admin `Address`. | Lives as long as the contract instance; set once by `initialize`, replaced only by `upgrade`-adjacent admin flows. |
+| `Version` | instance | The live build's version `u32`. | Lives as long as the contract instance; rewritten on each `upgrade`. |
 | `Contract(contract_id)` | persistent | The `ContractEntry` for a registration (owner, name, description, categories, `active`, verified, stake, etc.). | Lives until `deregister` deletes it. `deactivate` keeps the entry, so a deactivated registration still occupies this key. |
 | `AllContracts` | persistent | Index `Vec<Address>` of every registered `contract_id` in registration order. | Lives as long as the registry; entries are appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
 | `OwnerContracts(owner)` | persistent | Index `Vec<Address>` of the `contract_id`s owned by `owner`, deactivated included. | Lives as long as the registry; appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
