@@ -691,6 +691,8 @@ pub enum DataKey {
     ProposalCount,
     /// Proposal — the full proposal record.
     ProposalData(u32),
+    /// bool — governance‑controlled pause flag. When true, write entrypoints reject.
+    Paused,
 
     // ── Registry ────────────────────────────────────────────────────────────
     /// u32 — live registrations (deactivated included, deregistered excluded).
@@ -1812,6 +1814,10 @@ impl LuminaRegistry {
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
+        // Pause guard: reject writes when paused.
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(RegistryError::Paused);
+        }
 
         if env
             .storage()
@@ -2050,6 +2056,10 @@ impl LuminaRegistry {
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
+        // Pause guard: reject writes when paused.
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(RegistryError::Paused);
+        }
 
         let entry: ContractEntry = env
             .storage()
@@ -4008,7 +4018,11 @@ impl LuminaRegistry {
                     .set(&DataKey::AllowlistEnabled, enabled);
                 env.events()
                     .publish((Symbol::new(env, "allowlist_mode_changed"),), (*enabled,));
-            }
+            },
+            ProposalAction::SetPaused(paused) => {
+                env.storage().instance().set(&DataKey::Paused, &paused);
+                env.events().publish((Symbol::new(env, "paused_set"),), (paused,));
+            },
             ProposalAction::SetAllowlisted(owner, allowed) => {
                 env.storage()
                     .persistent()
