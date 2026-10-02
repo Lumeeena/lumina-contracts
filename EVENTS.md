@@ -41,3 +41,11 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `registration_fee_set` | `(fee: i128,)` | When governance sets a flat fee for new registrations. | | `registration_fee_can_be_set` |
 | `manager_set` | `(contract_id: Address, owner: Address, manager: Address)` | When the owner assigns a manager for the contract. | History | `owner_can_delegate_metadata_and_categories` |
 | `manager_revoked` | `(contract_id: Address, owner: Address)` | When the owner revokes the contract's manager. | History | `owner_can_revoke_manager_immediately` |
+
+## Slash History Retention
+
+Per-registration slash history is stored under `DataKey::Slashes(Address)` as a bounded `Vec<SlashRecord>`. To keep write cost bounded and prevent a registration from becoming unslashable due to an oversized history entry, the contract retains only the most recent `MAX_SLASH_HISTORY` records per registration.
+
+- **Cap**: @{MAX_SLASH_HISTORY} records are kept per registration. Once the cap is reached, each new slash appends its record and evicts the oldest retained record (FIFO).
+- **Aggregate accounding**: `slashed_total` is maintained as a separate running total and is *not* derived from the retained vector. Pruning older records therefore never changes the aggregate amount attributed to a registration.
+- **Events**: `stake_slashed` is emitted for every slash, including slashes whose record later gets evicted from the retained history. Downstream consumers that need the complete slash timeline should index the event stream rather than reading the on-chain `Slashes` vector.

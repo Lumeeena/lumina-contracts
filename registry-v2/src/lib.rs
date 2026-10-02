@@ -47,8 +47,17 @@
 //! `registry` crate's `fixture_sync` test. When a storage type changes, update
 //! this file in the same commit; CI fails otherwise.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
-
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+};
+/// Maximum number of slash records retained per registration.
+///
+/// Slash history is bounded so that a registration slashed many times cannot
+/// grow its `DataKey::Slashes(Address)` entry past the storage limit (which
+/// would make it impossible to slash again). When the cap is reached, the
+/// oldest records are pruned; the aggregate `slashed_total` is stored
+/// separately and is never affected by pruning.
+pub const MAX_SLASH_HISTORY: u32 = 32;
 /// Always `lumina_registry::CONTRACT_VERSION + 1` — the value the upgrade test
 /// reads back to confirm the new code is the one now executing. The tests
 /// assert the relationship rather than the literal, so bumping the registry's
@@ -109,8 +118,10 @@ pub enum DataKey {
     OwnerContracts(Address),
     /// List of all registered contract addresses.
     AllContracts,
-    /// Resumable cursor for an in-progress category migration.
-    MigrationCursor,
+    /// Bounded slash history for a registration.
+    Slashes(Address),
+    /// Aggregate amount slashed for a registration, independent of pruning.
+    SlashedTotal(Address),
 }
 
 /// Upgraded v2 registry contract target used for upgrade testing.
@@ -216,5 +227,94 @@ impl LuminaRegistryV2 {
         }
 
         active
+    }
+
+    /// Record a slash against a registration.
+    ///
+    /// The retained history is capped at [`MAX_SLASH_HISTORY`] records: once
+    /// the cap is reached the oldest record is dropped before appending the
+    /// new one, so the entry never grows without bound. The aggregate
+    /// `slashed_total` is accumulated separately and therefore stays correct
+    /// regardless of which individual records have been pruned.
+    pub fn slash(env: Env, contract_id: Address, amount: i128) -> Result<(), RegistryError> {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        let mut history: Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Slashes(contract_id.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        while history.len() >= MAX_SLASH_HISTORY {
+            history.remove(0);
+        }
+        history.push_back(amount);
+
+        let total: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashedTotal(contract_id.clone()))
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Slashes(contract_id.clone()), &history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashedTotal(contract_id), &(total + amount));
+
+        Ok(())
+    }
+
+    /// Return the retained slash history for a registration.
+    ///
+    /// At most [`MAX_SLASH_HISTORY`] most-recent records are returned; older
+    /// records have been pruned and are not recoverable from this entry.
+    pub fn get_slashes(env: Env, contract_id: Address) -> Vec<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Slashes(contract_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return the aggregate amount slashed for a registration.
+    ///
+    /// This value is maintained independently of the bounded history, so it
+    /// remains accurate after records have been pruned.
+    pub fn get_slashed_total(env: Env, contract_id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashedTotal(contract_id))
+            .unwrap_or(0)
+    }
+
+    /// Same admin gate as v1, so an upgraded registry can be upgraded again.
+    ///
+    /// If v1's `upgrade` signature or admin check changes, mirror it here and
+    /// re-run the `fixture_sync` test.
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), RegistryError> {
+        admin.require_auth();
+
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
+        if admin != stored {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 }
