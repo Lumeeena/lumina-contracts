@@ -2,7 +2,7 @@
 
 All notable changes to the Lumina Registry contract will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
+The format is based on [Keep a Changelog](https://keepadhangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Version 4 (unreleased)
@@ -77,4 +77,4 @@ Because the decay is applied at read time, a long-inactive registration reports 
 -  Basic contract registration, metadata, and discovery.
 
 ### Storage Changes
--  Initial `DataKey` enum: `Admins`, `Threshold`, `ProposalCount`, `ContractCount`, `TotalRegistered`, `Contract`, `OwnerContracts`, `AllContracts`, `StakeToken`, `Treasury`, `Stake`, `Verified`, `Slashes`, `WithdrawLockedUntil`, `Categories`, `ByCategory`, `AllowlistEnabled`, `Allowlisted`, `RegistrationRateLimit`, `RegistrationRateWindow`, `Admin`.
+- Initial `DataKey` enum: `Admins`, `Threshold`, `ProposalCount`, `ContractCount`, `TotalRegistered`, `Contract`, `OwnerContracts`, `AllContracts`, `StakeToken`, `Treasury`, `Stake`, `Verified`, `Slashes`, `WithdrawLockedUntil`, `Categories`, `ByCategory`, `AllowlistEnabled`, `Allowlisted`, `RegistrationRateLimit`, `RegistrationRateWindow`, `Admin`.
