@@ -250,42 +250,39 @@ storage shapes documented on `DataKey` and `ContractEntry` in
 [registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
-### Storage keys and their lifetimes
+### Slashing and staker rewards
 
-Every key the registry writes is a `DataKey` variant. The table below lists each
-one with its storage type, what it holds, and its expected lifetime, so an
-operator can reason about archival without reading the enum plus every call
-site.
+A slash does not send the whole stake to the treasury. `slash` splits the
+slashed amount by a governance-set proportion: one part goes to the treasury
+address, the rest is credited to a staker reward pool. The split is configured
+with `set_slash_split(admin, treasury_bps)`, where `treasury_bps` is the
+treasury's share in basis points (0–10000). The remainder, `10000 -
+treasury_bps`, is the stakers' share. `get_slash_split()` returns the current
+value. With `treasury_bps = 10000` the behaviour matches the old contract
+exactly: the treasury receives the full slashed amount and the reward pool
+stays empty.
 
-| Key | Storage | Holds | Lifetime / TTL behaviour |
-| --- | --- | --- | --- |
-| `Admin` | instance | The registry admin `Address`. | Lives as long as the contract instance; set once by `initialize`, replaced only by `upgrade`-adjacent admin flows. |
-| `Version` | instance | The live build's version `u32`. | Lives as long as the contract instance; rewritten on each `upgrade`. |
-| `Contract(contract_id)` | persistent | The `ContractEntry` for a registration (owner, name, description, categories, `active`, verified, stake, etc.). | Lives until `deregister` deletes it. `deactivate` keeps the entry, so a deactivated registration still occupies this key. |
-| `AllContracts` | persistent | Index `Vec<Address>` of every registered `contract_id` in registration order. | Lives as long as the registry; entries are appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
-| `OwnerContracts(owner)` | persistent | Index `Vec<Address>` of the `contract_id`s owned by `owner`, deactivated included. | Lives as long as the registry; appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
-| `CategoryContracts(category)` | persistent | Index `Vec<Address>` of `contract_id`s filed under `category`. | Lives as long as the registry; appended on register and removed eagerly on `deregister`. `deactivate` does not rewrite it. Index — must stay consistent with `Contract` entries. |
-| `ContractCount` | instance | Live total of registrations (deactivated included, deregistered excluded). | Lives as long as the contract instance; incremented on register, decremented on `deregister`. |
-| `TotalRegistered` | instance | Lifetime total of registrations ever made; never decremented. | Lives as long as the contract instance; monotonically increasing. |
-| `ActiveContractCount` | instance | Currently listed (active) registration count. | Lives as long as the contract instance; adjusted on register, `deactivate`, reactivation and `deregister`. |
-| `Stake(contract_id)` | persistent | The staked amount for a registration. | Lives until the entry is deregistered or the stake is fully withdrawn; slash and withdraw mutate it in place. |
-| `StakeLock(contract_id)` | persistent | Ledger at which the slash lock expires for a registration. | Lives until the entry is deregistered; refreshed by each slash. |
-| `Verified(contract_id)` | persistent | Whether the registration is governance-verified. | Lives until the entry is deregistered; set only through a timelocked proposal. |
-| `Slashes(contract_id)` | persistent | Append-only `Vec` of slash records (amount, reason, ledger). | Kept for auditability even after `deregister`; not removed by eager cleanup. |
-| `Attestations(contract_id)` | persistent | Bounded `Vec` of `(attester, label, created_at)` records. | Lives until the entry is deregistered; one per attester, revised in place on re-attest. |
-| `StakingConfig` | instance | The SEP-41 token and treasury `Address` used for staking. | Lives as long as the contract instance; set by `propose_configure_staking` after the timelock. |
-| `AllowlistEnabled` | instance | Whether the allowlist gate is on. | Lives as long as the contract instance; toggled through governance. |
-| `Allowlisted(owner)` | persistent | Whether `owner` is on the allowlist. | Lives as long as the registry; toggled through governance. |
-| `RateLimit` | instance | Per-owner registration limit and window in ledgers. | Lives as long as the contract instance; set through governance; zero limit disables it. |
-| `Proposal(id)` | persistent | A governance proposal (kind, payload, execution ledger, state). | Lives until the proposal is executed or cancelled; read for the timelock check. |
-| `ProposalCount` | instance | Monotonic counter used to allocate proposal IDs. | Lives as long as the contract instance; never decremented. |
+Distribution is a **claim**, not a push. A slash credits the reward pool and
+records the slashed amount; it does not iterate over stakers. A push would have
+to loop over every honest staker on every slash, so the cost of a slash would
+scale with the number of stakers — an attacker could make slashing unaffordable
+by staking from many addresses, and a slash against a popular registration
+could exceed the transaction's resource limits. A claim inverts that: the slash
+is O(1), and each staker pays the cost of their own withdrawal when they choose
+to collect.
 
-Instance keys share the contract instance's TTL and are extended whenever the
-instance is bumped. Persistent keys have their own TTLs and can be archived if
-they are not touched; the index keys (`AllContracts`, `OwnerContracts`,
-`CategoryContracts`) are the ones most likely to strand a reference, which is
-what `prune_category` / `prune_all_contracts` exist to clean up. Slash records
-are deliberately kept past `deregister` for auditability.
+| Method | Who can call it |
+| --- | --- |
+| `set_slash_split(admin, treasury_bps)` | the admin only — `treasury_bps` must be ≤ 10000 |
+| `get_slash_split()` | anyone — the current treasury share in basis points |
+| `claim_staker_reward(staker)` | a staker with an unclaimed share |
+| `get_claimable_reward(staker)` | anyone — the staker's unclaimed share |
+
+A staker's share is proportional to their stake on registrations other than
+the slashed one, so staking becomes a judgement about which registrations are
+honest rather than a lottery. Claiming transfers the staker's share and zeroes
+it; a second claim returns nothing. The reward pool is funded only by slashes,
+so a registry with no slashes has nothing to claim.
 
 ### Error codes
 

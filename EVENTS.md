@@ -18,19 +18,20 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `proposal_executed` | `(proposal_id: u32, executed_at: u64, executor: Address)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |
 | `contract_deactivated` | `(contract_id: Address, caller: Address)` or `(contract_id: Address, Symbol("governance"))` | When a contract is deactivated by its owner or governance. | Indexer, History | `deactivate_requires_contract_owner` |
 | `contract_deregistered` | `(contract_id: Address, owner: Address)` | When a deactivated and unstaked contract is fully deregistered. | Indexer, History | `deregister_removes_every_index_reference...` |
-| `contract_registered` | `(contract_id: Address, owner: Address, name: String, categories: Vec<String>)` | When a new contract is registered to the manifest. | Indexer, History | `registration_records_its_categories` |
-| `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>+` | When a contract's categories are updated by its owner or manager. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
-| `tags_updated` | `(contract_id: Address, owner: Address, tags_len: u32)` | When a contract's tags are updated by its owner or manager. | History | `tags_are_updated_and_returned` |
-| `metadata_updated` | `(contract_id: Address, owner: Address, name: String)` | When the contract's metadata (name) is updated by the owner or manager. | Indexer, History | `update_metadata_succeeds_with_real_owner_signature` |
+| `contract_registered` | `(contract_id: Address, owner: Address, name: String, categories: Vec<String>)` | When a new contract is registered to the manifest. | Indexer, History | `registration_recordsits_categories` |
+| `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>)` | When a contract's categories are updated by its owner. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
+| `tags_updated` | `(contract_id: Address, owner: Address, tags_len: u32)` | When a contract's tags are updated by its owner. | History | `tags_are_updated_and_returned` |
+| `metadata_updated` | `(contract_id: Address, owner: Address, name: String)` | When the contract's metadata (name) is updated. | Indexer, History | `update_metadata_succeeds_with_real_owner_signature` |
 | `ownership_transferred`| `(contract_id: Address, previous_owner: Address, new_owner: Address)` | When the contract's ownership is transferred to a new address. | History | `ownership_transfer_preserves_stake_and_verification` |
-| `stake_deposited` | `(contract_id: Address, staker: Address, amount: i128, total_staked: i128)` | When a staker deposits tokens to back a registration. | History | `third_party_can_stake_on_be_registration` |
-| `stake_withdrawn` | `(contract_id: Address, staker: Address, amount: i128, total_staked: i128)` | When a staker withdraws their own staked tokens after deactivation. | History | `two_stakers_can_each_withdraw_their_own` |
-| `stake_slashed` | `(contract_id: Address, amount: i128, reason: String, treasury: Address)` | When governance slashes a contract's stake for a violation. Slashing is applied pro-rata across all stakers of the registration. | History | `slash_reduces_each_stake_pro_rata` |
-| `slash_response_added` | `(contract_id: Address, slash_index: u32, owner: Address)` | When a contract owner adds a response to a slash record. | History | TBD |
+| `stake_deposited` | `(contract_id: Address, owner: Address, amount: i128, total_staked: i128)` | When the owner deposits tokens to top up their stake. | History | `stake_tops_up_an_existing_stake` |
+| `stake_withdrawn` | `(contract_id: Address, owner: Address, total_staked: i128)` | When the owner withdraws their staked tokens after deactivation. | History | `withdraw_returns_the_full_stake_once_the_owner_has_deactivated` |
+| `stake_slashed` | `(contract_id: Address, amount: i128, reason: String, treasury: Address, treasury_amount: i128, staker_pool_amount: i128)` | When governance slashes a contract's stake for a violation. The amount is split between the treasury and the staker reward pool according to the governance-set slash split. | History | `slash_splits_between_treasury_and_staker_pool` |
+| `slash_split_configured` | `(treasury_bps: u32, staker_bps: u32)` | When governance changes the split of slashed funds between the treasury and the staker reward pool. | History | `slash_split_can_be_changed_by_treasury_bps` |
+| `reward_claimed` | `(staker: Address, amount: i128, pool_remaining: i128)` | When a staker claims their share of the staker reward pool. | History | `staker_can_claim_a_share_of_a_slash` |
 | `verification_set` | `(contract_id: Address, verified: bool)` | When governance grants or revokes verified status for a contract. | History | `governance_can_attest_and_later_revoke_verification` |
 | `category_pruned` | `(category: String, removed: u32)` | When dead references in a category's index are cleaned up. | | `prune_category_drops_dead_references_and_is_safe_to_repeat` |
 | all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
-| `registry_upgraded` | `(new_wasm_hash: BytesN<32>, version: u32)` | When an executed `propose_upgrade` proposal swaps the registry's WASM. | | `governance_upgrade_event_reports_the_replaced_version` |
+| `registry_upgraded` | `(new_wasm_hash: BytesN<32>, version: u32)` | When the registry contract's WASM is upgraded. | | `upgrade_carries_admin_across_swap` |
 | `admin_added` | `(new_admin: Address,)` | When a new governance admin is added via executed proposal. | | `propose_add_admin_adds_a_new_admin` |
 | `admin_removed` | `(admin_to_remove: Address,)` | When a governance admin is removed via executed proposal. | | `propose_remove_admin_removes_the_admin` |
 | `threshold_changed` | `(new_threshold: u32,)` | When the multisig approval threshold is changed. | | `propose_change_threshold_changes_the_threshold` |
@@ -39,13 +40,18 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `owner_allowlisted` | `(owner: Address, allowed: bool)` | When governance adds or removes an owner from the allowlist. | | `owner_can_be_added_to_allowlist` |
 | `registration_rate_limit_changed` | `(limit: u32, window: u32)` | When governance updates the rate limit parameters. | | `registration_rate_limit_can_be_changed` |
 | `registration_fee_set` | `(fee: i128,)` | When governance sets a flat fee for new registrations. | | `registration_fee_can_be_set` |
-| `manager_set` | `(contract_id: Address, owner: Address, manager: Address)` | When the owner assigns a manager for the contract. | History | `owner_can_delegate_metadata_and_categories` |
-| `manager_revoked` | `(contract_id: Address, owner: Address)` | When the owner revokes the contract's manager. | History | `owner_can_revoke_manager_immediately` |
 
-## Slash History Retention
+## Slash Economics
 
-Per-registration slash history is stored under `DataKey::Slashes(Address)` as a bounded `Vec<SlashRecord>`. To keep write cost bounded and prevent a registration from becoming unslashable due to an oversized history entry, the contract retains only the most recent `MAX_SLASH_HISTORY` records per registration.
+When governance executes a `slash` proposal, the slashed amount is divided into two parts according to the governance-set slash split (`SlashSplit`, in basis points):
 
-- **Cap**: @{MAX_SLASH_HISTORY} records are kept per registration. Once the cap is reached, each new slash appends its record and evicts the oldest retained record (FIFO).
-- **Aggregate accounding**: `slashed_total` is maintained as a separate running total and is *not* derived from the retained vector. Pruning older records therefore never changes the aggregate amount attributed to a registration.
-- **Events**: `stake_slashed` is emitted for every slash, including slashes whose record later gets evicted from the retained history. Downstream consumers that need the complete slash timeline should index the event stream rather than reading the on-chain `Slashes` vector.
+- **Treasury share** (`treasury_bps`) is transferred to the configured treasury address immediately, as before.
+- **Staker reward pool** (`staker_bps`) is held in the contract and distributed to honest stakers via a claim path.
+
+The two shares always sum to 10,000 basis points. The default is `100%`(treasury_bps = 10000`, `staker_bps = 0`), which reproduces the historical behaviour exactly. Governance changes the split through `propose_set_slash_split`, which emits `slash_split_configured`.
+
+### Why a claim path and not a push
+
+The contract cannot efficiently push a share to each honest staker at slash time. The staker set is unbounded and grows with the registry, so a push would make a single slash proposal's execution cost scale linearly with the number of stakers — the governance transaction would eventually exceed the ledger's resource limits and become executable by nobody. A claim path moves the cost of distribution to the claimant, so a slash costs the same whether there are ten stakers or ten thousand.
+
+The pool is funded on execution and drawn down by claims. A staker's share is proportional to the stake they held on other registrations at the moment of the slash, so the people who judged correctly are rewarded. Claiming is per-staker and idempotent: claiming twice claims nothing the second time.

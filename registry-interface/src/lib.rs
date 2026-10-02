@@ -248,6 +248,15 @@ pub trait RegistryInterface {
     /// not opened staking yet.
     fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError>;
 
+    /// `(treasury_bps, staker_pool_bps)` — the governance-set split applied to
+    /// every slash. The two sum to 10_000. A value of `(10_000, 0)` reproduces
+    /// the pre-split behaviour where the treasury takes the whole slash.
+    fn get_slash_split(env: Env) -> Result<(u32, u32), RegistryError>;
+
+    /// The amount of slashed stake currently claimable by `staker` from the
+    /// staker reward pool. Zero for an address that has never staked.
+    fn get_claimable_slash_reward(env: Env, staker: Address) -> i128;
+
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
 
@@ -335,11 +344,10 @@ pub trait RegistryInterface {
     /// while `get_reputation` answers "how much in total".
     fn get_slashes(env: Env, contract_id: Address) -> Vec<SlashRecord>;
 
-    /// Every third-party attestation recorded against a registration, oldest
-    /// first. Attestations are claims, not the governance `is_verified`
-    /// signal: they are published so a reader can weigh them, and an empty
-    /// list is an answer rather than an error.
-    fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation>;
+    /// Claim the caller's share of the staker reward pool accumulated from
+    /// past slashes. Errors with `NothingToClaim` if the caller's share is
+    /// zero.
+    fn claim_slash_reward(env: Env, staker: Address) -> Result<i128, RegistryError>;
 
     /// The full reputation signal for a registration. Returns zeroed values
     /// rather than erroring for an unregistered address, matching
@@ -532,11 +540,9 @@ pub enum RegistryError {
     /// Registration fee was not paid.
     InsufficientFee = 26,
     /// Tag count or length exceeds bounds.
-    InvalidTags = 27,
-    /// Caller is not the registered owner nor its delegated manager.
-    NotManager = 29,
-    /// The unbonding period has not elapsed yet.
-    UnbondingNotComplete = 30,
+    InvalidTags = 26,
+    /// The caller has no slashed stake available to claim.
+    NothingToClaim = 27,
 }
 
 /// A single attestation recorded against a contract.
@@ -809,12 +815,36 @@ pub struct ContractPage {
 
 /// A page of contract profiles plus an exhaustion flag.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractProfilePage {
-    /// The profiles in this page.
-    public profiles: Vec<ContractProfile>,
-    /// Whether more active entries follow this page.
-    public has_more: bool,
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalAction {
+    /// Deactivate the given contract on behalf of the registry (admin action).
+    Deactivate(Address),
+    /// Upgrade the contract wasm to the given hash.
+    Upgrade(soroban_sdk::BytesN<32>),
+    /// Add a new address to the admin set.
+    AddAdmin(Address),
+    /// Remove an address from the admin set.
+    RemoveAdmin(Address),
+    /// Change the approval threshold.
+    ChangeThreshold(u32),
+    /// Point staking at a token and a treasury: `(stake_token, treasury)`.
+    ConfigureStaking(Address, Address),
+    /// Attest (or revoke) verified status for a registration.
+    SetVerified(Address, bool),
+    /// Take `(contract_id, amount, reason)` of a registration's stake.
+    Slash(Address, i128, String),
+    /// Enable or disable permissioned registration.
+    SetAllowlistEnabled(bool),
+    /// Add or remove an owner from the registration allowlist.
+    SetAllowlisted(Address, bool),
+    /// Set the per-owner limit and ledger window; a zero limit disables it.
+    ConfigureRegistrationRateLimit(u32, u32),
+    /// Set the registration fee in the stake token; zero disables it.
+    SetRegistrationFee(i128),
+    /// Set the slash split between treasury and the staker reward pool, in
+    /// basis points: `(treasury_bps, staker_pool_bps)`. The two must sum to
+    /// 10_000.
+    ConfigureSlashSplit(u32, u32),
 }
 
 /// Number of ledgers a proposal of a given action must wait before execution.

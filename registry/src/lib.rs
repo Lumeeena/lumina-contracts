@@ -245,46 +245,10 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
-/// The proposed treasury or stake-token address is itself a registered
-    /// contract.
-    OverlappingAddress = 29,
-    /// The owner has reached the maximum number of contracts they may
-    /// register. See [`MAX_CONTRACTS_PER_OWNER`].
-    OwnerContractLimitReached = 30,
-    /// The admin set would have fewer than `MIN_ADMINS` members.
-    AdminSetTooSmall = 31,
-    /// The proposed address is already a member of the admin set.
-    AlreadyAdmin = 32,
-    /// The proposed address to remove is not a member of the admin set.
-    AdminNotFound = 33,
-    /// The proposed threshold is already the current threshold.
-    ThresholdAlreadySet = 34,
-    /// The proposed verification status matches the contract's current status.
-    AlreadyVerified = 35,
-    /// Staking is already configured with the proposed token and treasury.
-    StakingAlreadyConfigured = 36,
-    /// Caller-supplied input failed validation (e.g. an empty slash response).
-    InvalidInput = 37,
-    /// No slash exists at the given index in a registration's slash history.
-    SlashNotFound = 38,
-    /// The referenced slash already has a recorded response.
-    ResponseAlreadyExists = 39,
-    /// The registry's real token balance is smaller than the total it
-    /// believes is staked, so a transfer that depends on that balance cannot
-    /// proceed safely.
-    ContractBalanceInsufficient = 39,
-    /// The stake arithmetic would overflow `i128`.
-    ///
-    /// Note: the workspace profile enables `overflow-checks`, so an unchecked
-    /// `+`/`-` would trap rather than wrap. That profile setting is a backstop
-    /// for arithmetic we have not audited, not the mechanism that protects
-    /// stake accounting — the stake and slash paths use explicit checked
-    /// arithmetic and return this error instead.
-    StakeOverflow       = 40,
-    /// A proposal batch is empty or exceeds [`MAX_BATCH_ACTIONS`].
-    InvalidBatchSize = 41,
-    /// A proposal batch contains another batch.
-    NestedBatch = 42,
+    /// The configured treasury split is greater than 10000 basis points.
+    InvalidSplit        = 29,
+    /// The caller has no claimable staker reward to withdraw.
+    NothingToClaim      = 30,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
