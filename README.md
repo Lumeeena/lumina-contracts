@@ -162,7 +162,25 @@ Registrations are also manageable after the fact:
 | `set_manager(owner, contract_id, manager)` | the registered owner only — grants the manager a subset of rights |
 | `transfer_ownership(caller, contract_id, new_owner)` | the current owner or the admin |
 | `deactivate(caller, contract_id)` | the current owner or the admin |
-| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and unstaked |
+| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and fully unstaked |
+| `stake(staker, contract_id, amount)` | anyone — a third party may stake on a registration's behalf |
+| `withdraw_stake(staker, contract_id, amount)` | the staker only — each staker withdraws only their own stake |
+| `get_stake(contract_id)` | anyone — total staked across all stakers |
+| `get_stake_of(contract_id, staker)` | anyone — the amount a single staker has on a registration |
+
+### Staking
+
+Stake is tracked per `(registration, staker)` rather than per registration
+alone, so a backer who wants to vouch for a project can do so without owning
+it. The total reported for a registration (`get_stake`) is the sum of every
+staker's balance.
+
+Slashing policy: when a registration is slashed, the penalty is applied
+**pro-rata across all stakers** — each staker loses the same fraction of their
+stake, so no staker is preferred over another and the relative weights of the
+backers are preserved. The slash record stores the total amount taken; the
+per-staker reductions are reflected in each staker's balance, and each staker
+can still withdraw whatever remains of their own contribution.
 
 Counters: `get_contract_count` is the live total (deactivated included,
 deregistered excluded), `get_total_registered` is the lifetime total
@@ -201,14 +219,23 @@ orphan existing registrations at a new address:
 | Method | Who can call it |
 | --- | --- |
 | `get_version()` | anyone — which build is live at this address |
-| `get_admin()` | anyone |
-| `upgrade(admin, new_wasm_hash)` | the admin only |
+| `get_admin()` / `get_admins()` | anyone |
+| `propose_upgrade(proposer, new_wasm_hash)` | any admin — opens an upgrade proposal |
+| `approve_proposal(admin, proposal_id)` | any admin — counts toward the threshold |
+| `execute_proposal(proposal_id)` | anyone, once threshold **and** timelock are met |
 | `get_manager(contract_id)` | anyone — the delegated manager for a registration, if set |
 
-`upgrade` swaps the contract's code and keeps its address and storage, so a new
-version must stay compatible with the storage shapes documented on `DataKey` and
-`ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
+There is **no single-signer upgrade path**. Changing the code is governance-only:
+`propose_upgrade` by an admin, enough `approve_proposal` calls to reach the
+threshold, then `execute_proposal` after the timelock. The swap keeps the
+contract's address and storage, so a new version must stay compatible with the
+storage shapes documented on `DataKey` and `ContractEntry` in
+[registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
+
+The legacy `DataKey::Admin` slot is retained for storage compatibility but
+**confers no authority**: no entrypoint authorizes against it, and current
+`initialize` / `__constructor` no longer write it. See the storage table below.
 
 ### Storage keys and their lifetimes
 
@@ -219,8 +246,7 @@ site.
 
 | Key | Storage | Holds | Lifetime / TTL behaviour |
 | --- | --- | --- | --- |
-| `Admin` | instance | The registry admin `Address`. | Lives as long as the contract instance; set once by `initialize`, replaced only by `upgrade`-adjacent admin flows. |
-| `Version` | instance | The live build's version `u32`. | Lives as long as the contract instance; rewritten on each `upgrade`. |
+| `Admin` | instance | Deprecated single-admin compatibility slot. | **Not written by current `initialize` / `__constructor`.** Only pre-multisig deployments carry it; `get_admin` reads it as a fallback. It grants no authority — upgrades and other privileged actions go through `Admins` and proposals. |
 | `Contract(contract_id)` | persistent | The `ContractEntry` for a registration (owner, name, description, categories, `active`, verified, stake, etc.). | Lives until `deregister` deletes it. `deactivate` keeps the entry, so a deactivated registration still occupies this key. |
 | `AllContracts` | persistent | Index `Vec<Address>` of every registered `contract_id` in registration order. | Lives as long as the registry; entries are appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |
 | `OwnerContracts(owner)` | persistent | Index `Vec<Address>` of the `contract_id`s owned by `owner`, deactivated included. | Lives as long as the registry; appended on register and removed eagerly on `deregister`. Index — must stay consistent with `Contract` entries. |

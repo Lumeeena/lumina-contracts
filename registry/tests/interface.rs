@@ -1,48 +1,5 @@
-// Copyright (c) Lumina contributors
-// SPDX-License-Identifier: MIT
-//! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
-//!
-//! The interface — every exported function signature and every type and error
-//! code those functions expose — is what the indexer, the frontend and every
-//! registrant bind to. A renamed parameter or a new argument is a breaking
-//! change for all of them, and without this test it only surfaces when
-//! something downstream fails.
-//!
-//! The test reads the contract spec out of the *built* wasm (the same
-//! `contractspecv0` section `stellar contract bindings` and `contractimport!`
-//! consume), renders it as plain text, and compares it with the checked-in
-//! `registry/interface.snap`. Doc comments are left out: rewording one is not
-//! an interface change.
-//!
-//! The exported interface also includes the `Category` enum and the
-//! `MAX_CATEGORIES_PER_CONTRACT` cap: a registration may claim at most that
-//! many categories, and claiming more is rejected with `TooManyCategories`.
-//! The cap is deliberately smaller than the vocabulary so that a registration
-//! claiming every category is rejected rather than silently truncated.
-//!
-//! To accept an intended change, rebuild the wasm and regenerate the snapshot:
-//!
-//! ```bash
 //! cargo build --target wasm32v1-none --release && UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
-//! ```
 //!
-//! then commit `registry/interface.snap` alongside the change so the diff is
-//! reviewed with it.
-//!
-//! This file also guards the `registry-v2` upgrade fixture, a hand-maintained
-//! copy of the storage types that must stay byte-compatible with the real ones.
-//! The fixture's whole value is proving that independently written v2 types
-//! decode v1 storage, so if it drifts out of sync with the types it mirrors it
-//! quietly stops testing anything. When a storage type changes, update the
-//! fixture deliberately and regenerate its snapshot:
-//!
-//! 
-//!
-//! The interface snapshot also covers the delegation surface: `set_manager`,
-//! `manager`, and `revoke_manager` are exported so that an owner can delegate
-//! metadata and category management without exposing stake withdrawal or
-//! ownership transfer. Managers are intentionally limited to the metadata and
-//! category entry points; the value-moving entry points remain owner-only.
 
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
@@ -84,7 +41,7 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
     }
 }
 
-/// One line per exported item, sorted so that moving code around in `lib.rs`
+/// One line per exported item, sorted so that moving code around in `lib.r`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
 ///
@@ -96,8 +53,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
         .iter()
         .map(|entry| match entry {
             ScSpecEntry::FunctionV0(f) => {
-                let args = f
-                    .inputs
+                let args = f.inputs
                     .iter()
                     .map(|i| {
                         format!(
@@ -204,6 +160,14 @@ fn exported_interface_matches_snapshot() {
             actual.contains(&format!("fn {expected_fn}(")),
             "delegation entry point `{expected_fn}` is missing from the exported interface; \
              the owner-delegated manager surface must remain part of the contract spec"
+        );
+    }
+
+    for expected_fn in ["get_proposals"] {
+        assert!(
+            actual.contains(&format!("fn {expected_fn}(")),
+            "proposal listing entry point `{expected_fn}` is missing from the exported interface; \
+             a UI cannot enumerate pending proposals without it"
         );
     }
 
