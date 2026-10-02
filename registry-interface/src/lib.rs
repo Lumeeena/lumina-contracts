@@ -144,14 +144,14 @@ use soroban_sdk::{contractclient, contracterror, contracttype, Address, Env, Str
 ///
 /// The write side of the registry moves tokens through an external token
 /// contract in `stake`, `withdraw_stake` and the slash path. Every such
-/// entrypoint writes its stored balance before it issues the transfer
+/// entrypoint writes its stored balance before it issues the transfer,
 /// (checks-effects-interactions), so a token that reenters during its own
 /// `transfer` sees the already-updated balance and cannot double-withdraw.
 /// Soroban itself does not prevent reentrancy and does not roll back a
 /// successful call's state mutations, so this ordering is the defense.
 /// See the crate-level docs for the full argument. Consumers that only
 /// read the registry are unaffected by any of this.
-[contractclient(name = "RegistryInterfaceClient")]
+@contractclient(name = "RegistryInterfaceClient")]
 pub trait RegistryInterface {
     /// Which build of the registry is live at this address.
     fn get_version(env: Env) -> u32;
@@ -171,7 +171,27 @@ pub trait RegistryInterface {
     fn get_threshold(env: Env) -> Result<u32, RegistryError>;
 
     /// Retrieve a governance proposal by ID.
+    ///
+    /// The returned [`Proposal`] carries `expires_at`, the ledger sequence at
+    /// which the proposal stops being executable. A UI can compare it against
+    /// the current ledger to show a countdown, and a client can refuse to build
+    /// an execution transaction that the contract would reject anyway. See
+    /// `Proposal::expires_at` for the definition.
     fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, RegistryError>;
+
+    /// One page of governance proposals, newest first.
+    ///
+    /// `offset` indexes the proposal list by insertion order, so the newest
+    /// proposal is at offset 0. When `open_only` is `true`, executed
+    /// proposals are skipped before the offset is applied, so a page can come
+    /// back shorter than `limit` while more open proposals follow. This matches
+    /// the registry listings' paging semantics.
+    fn get_proposals(
+        env: Env,
+        offset: u32,
+        limit: u32,
+        open_only: bool,
+    ) -> Result<Vec<Proposal>, RegistryError>;
 
     /// The timelock duration, in ledgers, that applies to a given action.
     fn get_action_timelock(env: Env, action: ProposalAction) -> u32;
@@ -186,10 +206,10 @@ pub trait RegistryInterface {
 
     /// One page of active registrations filed under `category`, in
     /// registration order.
-    ///
-    /// `offset` indexes the category's raw index rather than the filtered
-    /// result, so a page can come back shorter than `limit` while more active
-    /// registrations follow. See the trait docs.
+///
+/// `offset` indexes the category's raw index rather than the filtered
+/// result, so a page can come back shorter than `limit` while more active
+/// registrations follow. See the trait docs.
     fn get_active_contracts_by_category(
         env: Env,
         category: Category,
@@ -209,10 +229,10 @@ pub trait RegistryInterface {
     ) -> Vec<ContractEntry>;
 
     /// One page of active registrations filed under **any** of `categories` —
-    /// the union, deduplicated, in registration order.
-    ///
-    /// Errors with `NoCategories` if `categories` is empty. Paging semantics
-    /// as for `get_active_contracts_by_category`.
+/// the union, deduplicated, in registration order.
+///
+/// Errors with `NoCategories` if `categories` is empty. Paging semantics
+/// as for `get_active_contracts_by_category`.
     fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
@@ -221,27 +241,41 @@ pub trait RegistryInterface {
     ) -> Result<Vec<ContractEntry>, RegistryError>;
 
     /// `(stake_token, treasury)`, or `StakingNotConfiguree` if governance
-    /// has not opened staking yet.
+/// has not opened staking yet.
     fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError>;
 
     /// The per-registration fee. Zero means registration is free.
     fn get_registration_fee(env: Env) -> i128;
 
     /// The stake a registration has to hold to stay listed. Zero means the
-    /// threshold is not open — nothing is refused for being under-staked.
+/// threshold is not open — nothing is refused for being under-staked.
     fn get_minimum_stake(env: Env) -> i128;
 
     /// Currently staked balance. Zero for a registration that never staked,
-    /// and zero — not an error — for an address that was never registered.
+/// and zero — not an error — for an address that was never registered.
     fn get_stake(env: Env, contract_id: Address) -> i128;
 
-    /// The ledger at which an in-progress unbonding completes, or zero if no
+/// The ledger at which an in-progress unbonding completes, or zero if no
     /// unbonding is in progress. `withdraw_stake` refuses until the current
     /// ledger reaches this value. The unbonding period is deliberately longer
     /// than the governance timelock, so a slash proposal cannot be outrun by
     /// deactivating and withdrawing.
     fn get_unbonding_completes_at(env: Env, contract_id: Address) -> u32;
 
+    /// The amount `staker` has personally backed `contract_id` with. Zero for
+    /// a staker who never contributed, and zero — not an error — for an
+    /// address that was never registered.
+    ///
+    /// Stake is tracked per (registration, staker), so any address may
+    /// back a registration it does not own, and each staker withdraws only
+    /// their own contribution. `get_stake` reports the sum across all of
+    /// them.
+    fn get_stake_of(env: Env, contract_id: Address, staker: Address) -> i128;
+
+    /// Every address that has a currently nonzero stake on `contract_id`,
+    /// in the order they first staked. Empty for a registration with no
+    /// stakers, and for an address that was never registered.
+    fn get_stakers_of(env: Env, contract_id: Address) -> Vec<Address>;
     /// Whether governance has attested this registration. False, not an error,
     /// for an address that was never registered.
     fn is_verified(env: Env, contract_id: Address) -> bool;
@@ -299,6 +333,14 @@ pub trait RegistryInterface {
     /// As `get_active_profiles`, plus `has_more`.
     fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
 
+    /// Returns active registrations ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_contracts_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractPage;
+
+    /// Returns active profiles ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_profiles_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
+
     /// Every contract registered by `owner`, **including** deactivated ones.
     /// Deprecated in favour of `get_contracts_by_owner_after`.
     fn get_contracts_by_owner(
@@ -316,6 +358,17 @@ pub trait RegistryInterface {
         cursor: Option<Address>,
         limit: u32,
     ) -> Vec<ContractEntry>;
+
+    /// Registrations whose normalised name starts with `prefix`, up to `limit`.
+    ///
+    /// Matching is case-insensitive: both the stored name and `prefix` are
+    /// lowercased before comparison. An unmatched prefix returns an empty
+    /// list rather than erroring.
+    ///
+    /// On-chain prefix matching is deliberately limited to a prefix scan over
+    /// the name index; anything richer (substring, fuzzy, ranked) belongs in
+    /// the indexer, not in the contract.
+    fn find_by_name_prefix(env: Env, prefix: String, limit: u32) -> Vec<ContractEntry>;
 }
 
 /// Errors the registry's read-only surface can return.
@@ -326,7 +379,7 @@ pub trait RegistryInterface {
 /// variant that is missing here turns a well-defined error into an opaque
 /// decode failure. `tests/interface_matches_registry.rs` pins the whole list
 /// against the contract's spec, so the two cannot drift.
-[contracterror]
+#[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
@@ -334,62 +387,82 @@ pub enum RegistryError {
     AlreadyInitialized = 1,
     /// Caller lacks authorization for this action.
     Unauthorized = 2,
-    /// Contract has not been initialized.
-    NotInitialized = 3,
-    /// The registration does not exist.
+/// The registry has not been initialized.
+NotInitialized = 3,
+/// No registration exists for the given address.
     ContractNotFound = 4,
-    /// The registration is already present.
+/// The registration is already present.
     AlreadyRegistered = 5,
-    /// The proposal does not exist.
-    ProposalNotFound = 6,
-    /// The proposal has already been executed or rejected.
-    ProposalFinalized = 7,
-    /// The caller has already voted on this proposal.
-    AlreadyVoted = 8,
-    /// The address is not an admin.
-    NotAdmin = 9,
-    /// The admin set would be left empty.
-    LastAdmin = 10,
-    /// The admin set is full.
-    AdminLimitReached = 11,
-    /// The proposal does not have enough approvals.
-    ThresholdNotMet = 12,
+    /// The caller is not the registration's owner.
+    NotOwner = 6,
+    /// The registration has been deactivated.
+    Deactivated = 7,
+    /// Staking has not been configured by governance.
+    StakingNotConfigured = 8,
+    /// The stake amount is not positive.
+    InvalidStake = 9,
+    /// The staker has insufficient balance to cover the stake.
+    InsufficientBalance = 10,
+    /// The staker has nothing to withdraw.
+    Nostake = 11,
+    /// The proposal ID does not exist.
+    ProposalNotFound = 12,
+    /// The proposal has already been executed.
+    ProposalExecuted = 13,
     /// The proposal has expired.
-    ProposalExpired = 13,
-    /// The proposal is not open for voting.
-    ProposalNotActive = 14,
-    /// Staking has not been configured.
-    StakingNotConfigured = 15,
-    /// The stake amount is invalid.
-    InvalidStake = 16,
-    /// The stake is insufficient for the requested operation.
-    InsufficientStake = 17,
-    /// The stake is still inside the post-slash lock window.
-    StakeLocked = 18,
-    /// The registration is still active — deactivate before withdrawing.
-    RegistrationActive = 19,
-    /// A registration must declare at least one category.
-    NoCategories = 20,
-    /// The registration claims more categories than `MAX_CATEGORIES_PER_CONTRACT`.
-    TooManyCategories = 28,
-    /// The registration still holds stake — withdraw it before deregistering.
-    StakeNotEmpty = 21,
-    /// The registration rate limit configuration is invalid.
-    InvalidRateLimit = 22,
-    /// The owner is not allowlisted for registration.
-    NotAllowlisted = 23,
-    /// The registration rate limit has been exceeded.
-    RegistrationRateLimited = 24,
-    /// Registration fee was not paid.
-    InsufficientFee = 25,
-    /// Tag count or length exceeds bounds.
-    InvalidTags = 26,
-    /// Caller is not the registered owner nor its delegated manager.
-    NotManager = 27,
-    /// The unbonding period has not elapsed yet.
-    UnbondingNotComplete = 28,
+    ProposalExpired = 14,
+    /// The caller has already approved the proposal.
+    AlreadyApproved = 15,
+    /// The category list was empty.
+    NoCategories = 16,
+    /// Too many categories were supplied.
+    TooManyCategories = 17,
+    /// The category is not a recognized value.
+    InvalidCategory = 18,
+    /// The tag is not a valid length or character set.
+    InvalidTag = 19,
+    /// Too many tags were supplied.
+    TooManyTags = 20,
+    /// The admin set would be empty.
+    NoAdmins = 21,
+    /// The threshold is not positive or exceeds the admin count.
+    InvalidThreshold = 22,
+    /// The address is not a valid contract address.
+    InvalidContractId = 23,
+    /// The metadata field is out of bounds.
+    InvalidMetadata = 24,
+    /// The caller is not an admin.
+    NotAdmin = 25,
+    /// The registration fee could not be collected.
+    FeePaymentFailed = 26,
+    /// The slash amount is not positive.
+    InvalidSlash = 27,
+    /// The slash exceeds the total staked balance.
+    SlashExceedsStake = 28,
+    /// The registration is not verified.
+    NotVerified = 29,
+    /// The registration is already verified.
+    AlreadyVerified = 30,
+    /// The address is already in the admin set.
+    AdminExists = 31,
+    /// The address is not in the admin set.
+    AdminNotFound = 32,
+    /// The admin set would fall below the threshold.
+    ThresholdNotMet = 33,
+    /// The proposal kind is not recognized.
+    InvalidProposalKind = 34,
+    /// The proposal payload is malformed.
+    InvalidPayload = 35,
+    /// The argument is out of the accepted range.
+    InvalidArgument = 36,
+    /// The contract has not been initialized.
+    Uninitialized = 37,
 }
 
+/// A single registration as the registry stores it.
+///
+/// Duplicated from `lumina-registry` for the reasons in the crate docs.
+///
 /// The maximum number of categories a single registration may claim.
 ///
 /// The [`Category`] vocabulary is the natural upper bound, but relying on its
@@ -402,30 +475,32 @@ pub enum RegistryError {
 /// truncated.
 pub const MAX_CATEGORIES_PER_CONTRACT: u32 = 5;
 
-/// Byte-compatible with `lumina_registry::ContractEntry`.
+/// A governance proposal.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractEntry {
-    /// The registered Soroban contract address.
+    /// The registered contract address.
     pub contract_id: Address,
-    /// Owner/deployer who registered this contract.
+    /// The address that registered it.
     pub owner: Address,
     /// Human-readable name.
     pub name: String,
-    /// Short description of what the contract does.
+    /// Human-readable description.
     pub description: String,
-    /// Ledger at which this contract was registered.
-    pub registered_at: u32,
-    /// Whether indexing is currently active for this contract.
+    /// Project URL.
+    pub url: String,
+    /// Whether the registration is currently active.
     pub active: bool,
-    /// Address the owner delegated registration management to, if any.
+/// Address the owner delegated registration management to, if any.
     pub manager: Option<Address>,
+    /// Ledger timestamp of registration.
+    pub registered_at: u64,
 }
 
 /// The kind of action a proposal carries.
 ///
 /// Duplicated from `lumina-registry`.
-Ncontracttype]
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalAction {
     /// Add an admin.
@@ -444,26 +519,38 @@ pub enum ProposalAction {
 ///
 /// Byte-compatible with `lumina_registry::Proposal`.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Proposal {
-    /// Monotonic identifier assigned at creation.
-    pub id: u32,
-    /// The action the proposal would take if approved.
-    pub action: ProposalAction,
-    /// Optional human-readable rationale, bounded by
-    /// `MAX_PROPOSAL_DESCRIPTION_LEN` bytes. Empty when the proposer
-    /// supplied none.
-    pub description: String,
-    /// Address that created the proposal.
-    pub proposer: Address,
-    /// Ledger at which the proposal was created.
-    pub created_at: u32,
-    /// Ledger after which the proposal can no longer be voted on.
-    pub expires_at: u32,
-    /// Approvals recorded so far.
-    pub approvals: u32,
-    /// Whether the proposal has been executed or rejected.
-    pub finalized: bool,
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[member]
+pub enum Category {
+    /// Defi protocols.
+    Dei = 1,
+    /// Non-fungible tokens.
+    Nft = 2,
+    /// Infrastructure and tooling.
+    Infrastructure = 3,
+    /// Gaming.
+    Gaming = 4,
+    /// Social and community.
+    Social = 5,
+    /// Other.
+    Other = 6,
+}
+
+/// The reputation signal for a registration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reputation {
+    /// Whether governance has attested the registration.
+    pub verified: bool,
+    /// Total currently staked balance.
+    pub staked: i128,
+    /// Number of distinct stakers.
+    pub staker_count: u32,
+    /// Total amount ever slashed.
+    pub slashed: i128,
+    /// Number of slashes levied.
+    pub slash_count: u32,
+}
 }
 
 /// Maximum length, in bytes, of a proposal description.
@@ -473,15 +560,17 @@ pub struct Proposal {
 /// submitting a transaction.
 pub const MAX_PROPOSAL_DESCRIPTION_LEN: u32 = 256;
 
-/// Byte-compatible with `lumina_registry::SlashRecord`.
+/// A slash record, kept for auditability.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlashRecord {
-    /// How much stake was taken.
+    /// The amount slashed.
     pub amount: i128,
-    /// Why governance slashed — recorded on-chain for accountability.
+    /// Ledger timestamp of the slash.
+    pub timestamp: u64,
+    /// Free-text reason.
     pub reason: String,
-    /// Ledger at which the slash executed.
+/// Ledger at which the slash executed.
     pub slashed_at: u32,
     /// Owner's optional response to the slash.
     pub response: Option<String>,
@@ -499,13 +588,17 @@ pub struct Attestation {
     pub created_at: u32,
 }
 
-/// Byte-compatible with `lumina_registry::Reputation`.
+/// A governance proposal.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reputation {
-    /// Currently staked, withdrawable balance.
-    pub stake: i128,
-    /// Whether governance has attested this registration.
+    /// Reputation score.
+    pub score: i64,
+    /// Number of slashes levied.
+    pub slashes_count: u32,
+    /// Total amount slashed.
+    pub total_slashed: i128,
+    /// Whether governance has attested it.
     pub verified: bool,
     /// Lifetime total slashed, which unlike `stake` never goes down.
     pub slashed_total: i128,
@@ -515,110 +608,40 @@ pub struct Reputation {
     /// in progress. Distinct from `withdraw_locked_until`, which is the
     /// post-slash lock.
     pub unbonding_completes_at: u32,
+    /// Whether the registration is currently withdrawal-locked.
+    pub withdraw_locked: bool,
+}
 }
 
-/// Byte-compatible with `lumina_registry::ContractProfile`.
+/// Aggregate registry counters.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractProfile {
-    /// The base registration metadata and status.
+    /// The underlying registration.
     pub entry: ContractEntry,
-    /// The reputation and staking signal.
+    /// The reputation signal.
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Optional URI pointing at richer off-chain metadata.
+    pub metadata_uri: Option<String>,
+    /// The Unix timestamp of when the contract was registered, or 0 if legacy.
+    pub registered_at_ts: u64,
+}
 }
 
 /// The reputation signal for a registration.
 ///
-/// Duplicated from `lumina-registry`.
-Ncontracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Reputation {
-    /// The current reputation score.
-    public score: i128,
-    /// The number of slashes levied.
-    public slash_count: u32,
-    /// The total amount slashed.
-    public total_slashed: i128,
-    /// Whether the registration is verified.
-    public verified: bool,
-}
-
-/// Aggregate registry counters.
+/// This is the cheapest question to ask the registry: one `has` against one
+/// persistent entry, no decoding. Prefer it whenever the answer is a
+/// yes/no gate and the details are not needed.
 ///
-/// Duplicated from `lumina-registry`.
-Ncontracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RegistryStats {
-    /// Lifetime registrations.
-    public total_registered: u32,
-    /// Active registrations.
-    public active_count: u32,
-    /// Verified registrations.
-    public verified_count: u32,
-    /// Registrations with a non-zero stake.
-    public staked_count: u32,
-    /// Total amount staked.
-    public total_staked: i128,
-}
-
-/// A registration joined with its reputation.
-///
-/// Duplicated from `lumina-registry`.
-Ncontracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractProfile {
-    /// The registration entry.
-    public entry: ContractEntry,
-    /// The reputation signal.
-    public reputation: Reputation,
-}
-
-/// A page of registration entries.
-///
-/// Duplicated from `lumina-registry`.
-Ncontracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractPage {
-    /// The entries in this page.
-    public entries: Vec<ContractEntry>,
-    /// Whether more entries follow.
-    public has_more: bool,
-}
-
-/// Byte-compatible with `lumina_registry::ProposalAction`.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum ProposalAction {
-    /// Deactivate the given contract on behalf of the registry (admin action).
-    Deactivate(Address),
-    /// Upgrade the contract wasm to the given hash.
-    Upgrade(soroban_sdk::BytesN<32>),
-    /// Add a new address to the admin set.
-    AddAdmin(Address),
-    /// Remove an address from the admin set.
-    RemoveAdmin(Address),
-    /// Change the approval threshold.
-    ChangeThreshold(u32),
-    /// Point staking at a token and a treasury: `(stake_token, treasury)`.
-    ConfigureStaking(Address, Address),
-    /// Attest (or revoke) verified status for a registration.
-    SetVerified(Address, bool),
-    /// Take `(contract_id, amount, reason)` of a registration's stake.
-    Slash(Address, i128, String),
-    /// Enable or disable permissioned registration.
-    SetAllowlistEnabled(bool),
-    /// Add or remove an owner from the registration allowlist.
-    SetAllowlisted(Address, bool),
-    /// Set the per-owner limit and ledger window; a zero limit disables it.
-    ConfigureRegistrationRateLimit(u32, u32),
-    /// Set the registration fee in the stake token; zero disables it.
-    SetRegistrationFee(i128),
-    /// Set the minimum stake threshold; zero disables it.
-    ConfigureMinimumStake(i128),
-    /// Withdraw from the treasury.
-    WithdrawFromTreasury(i128),
+/// `contract_id` is a contract address (`C…`); a `G…` account address is
+/// never registered and returns `false`. Registration refuses `G`…`
+/// addresses, so a `G…` in the registry is not a state this read can
+/// observe — the downstream `isContractAddress` filter that
+/// `lumina-backend/indexer/src/index.ts` had to add
+    fn is_registered(env: Env, contract_id: Address) -> bool;
 }
 
 /// Number of ledgers a proposal of a given action must wait before execution.

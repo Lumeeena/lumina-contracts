@@ -162,7 +162,25 @@ Registrations are also manageable after the fact:
 | `set_manager(owner, contract_id, manager)` | the registered owner only — grants the manager a subset of rights |
 | `transfer_ownership(caller, contract_id, new_owner)` | the current owner or the admin |
 | `deactivate(caller, contract_id)` | the current owner or the admin |
-| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and unstaked |
+| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and fully unstaked |
+| `stake(staker, contract_id, amount)` | anyone — a third party may stake on a registration's behalf |
+| `withdraw_stake(staker, contract_id, amount)` | the staker only — each staker withdraws only their own stake |
+| `get_stake(contract_id)` | anyone — total staked across all stakers |
+| `get_stake_of(contract_id, staker)` | anyone — the amount a single staker has on a registration |
+
+### Staking
+
+Stake is tracked per `(registration, staker)` rather than per registration
+alone, so a backer who wants to vouch for a project can do so without owning
+it. The total reported for a registration (`get_stake`) is the sum of every
+staker's balance.
+
+Slashing policy: when a registration is slashed, the penalty is applied
+**pro-rata across all stakers** — each staker loses the same fraction of their
+stake, so no staker is preferred over another and the relative weights of the
+backers are preserved. The slash record stores the total amount taken; the
+per-staker reductions are reflected in each staker's balance, and each staker
+can still withdraw whatever remains of their own contribution.
 
 Counters: `get_contract_count` is the live total (deactivated included,
 deregistered excluded), `get_total_registered` is the lifetime total
@@ -201,13 +219,18 @@ orphan existing registrations at a new address:
 | Method | Who can call it |
 | --- | --- |
 | `get_version()` | anyone — which build is live at this address |
-| `get_admin()` | anyone |
-| `upgrade(admin, new_wasm_hash)` | the admin only |
+| `get_admin()` / `get_admins()` | anyone |
+| `propose_upgrade(proposer, new_wasm_hash)` | any admin — opens an upgrade proposal |
+| `approve_proposal(admin, proposal_id)` | any admin — counts toward the threshold |
+| `execute_proposal(proposal_id)` | anyone, once threshold **and** timelock are met |
 | `get_manager(contract_id)` | anyone — the delegated manager for a registration, if set |
 
-`upgrade` swaps the contract's code and keeps its address and storage, so a new
-version must stay compatible with the storage shapes documented on `DataKey` and
-`ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
+There is **no single-signer upgrade path**. Changing the code is governance-only:
+`propose_upgrade` by an admin, enough `approve_proposal` calls to reach the
+threshold, then `execute_proposal` after the timelock. The swap keeps the
+contract's address and storage, so a new version must stay compatible with the
+storage shapes documented on `DataKey` and `ContractEntry` in
+[registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
 
 ### Storage keys and their lifetimes
