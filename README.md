@@ -8,6 +8,10 @@ Part of the Lumina project, split across three repos:
 - [lumina-backend](https://github.com/Lumeeena/lumina-backend) — indexer + GraphQL API + PostgreSQL schema
 - [lumina-contracts](https://github.com/Lumeeena/lumina-contracts) — this repo
 
+For a contributor-oriented map of storage, governance, registration, staking,
+slashing, and the invariants protected by the test suite, see
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ## Where the registry fits
 
 Lumina indexes Soroban contract events, but an indexer has to know *which*
@@ -106,7 +110,9 @@ calls against the table above.
 registry.register_contract(owner, contract_id, "My Protocol", "A DeFi protocol on Stellar", vec![Category::DeFi])
 ```
 
-`get_active_contracts(offset, limit)` returns a paginated list of active registrations for discovery.
+`get_active_contracts_after(cursor, limit)` walks the active registrations for discovery. Pass the `contract_id` of the last entry the previous call returned (`None` to start) and repeat until the page is empty. The cursor is anchored to a registration, so entries added mid-walk are neither duplicated nor skipped. The older `get_active_contracts(offset, limit)` is retained for one release but **deprecated**: it re-reads the index up to `offset` on every page, and a registration inserted mid-walk shifts every later page.
+
+**Example**: See [examples/registry-registrant](./examples/registry-registrant/) for a complete working contract that registers itself during deployment. The example demonstrates integration patterns and includes tests you can copy to your own project.
 
 ### Categories
 
@@ -118,7 +124,8 @@ browsing rather than only a flat list:
 
 | Method | Who can call it |
 | --- | --- |
-| `get_active_contracts_by_category(category, offset, limit)` | anyone — same paging semantics as `get_active_contracts` |
+| `get_contracts_by_category_after(category, cursor, limit)` | anyone — cursor over one category; preferred over the offset form |
+| `get_active_contracts_by_category(category, offset, limit)` | anyone — deprecated offset form, same paging semantics as `get_active_contracts` |
 | `get_categories(contract_id)` | anyone |
 | `set_categories(owner, contract_id, categories)` | the registered owner only |
 | `prune_category(category)` | anyone — removes dead index references, returns the count removed |
@@ -149,16 +156,77 @@ Registrations are also manageable after the fact:
 
 | Method | Who can call it |
 | --- | --- |
-| `get_contracts_by_owner(owner, offset, limit)` | anyone — paginated, includes the owner's deactivated entries |
+| `get_contracts_by_owner_after(owner, cursor, limit)` | anyone — cursor form, includes the owner's deactivated entries |
+| `get_contracts_by_owner(owner, offset, limit)` | anyone — deprecated offset form, includes the owner's deactivated entries |
 | `update_metadata(owner, contract_id, name, description)` | the registered owner only |
+| `set_manager(owner, contract_id, manager)` | the registered owner only — grants the manager a subset of rights |
 | `transfer_ownership(caller, contract_id, new_owner)` | the current owner or the admin |
 | `deactivate(caller, contract_id)` | the current owner or the admin |
-| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and unstaked |
+| `deregister(owner, contract_id)` | the registered owner only — entry must be deactivated and fully unstaked |
+| `stake(staker, contract_id, amount)` | anyone — a third party may stake on a registration's behalf |
+| `withdraw_stake(staker, contract_id, amount)` | the staker only — each staker withdraws only their own stake |
+| `get_stake(contract_id)` | anyone — total staked across all stakers |
+| `get_stake_of(contract_id, staker)` | anyone — the amount a single staker has on a registration |
+
+### Staking
+
+Stake is tracked per `(registration, staker)` rather than per registration
+alone, so a backer who wants to vouch for a project can do so without owning
+it. The total reported for a registration (`get_stake`) is the sum of every
+staker's balance.
+
+Slashing policy: when a registration is slashed, the penalty is applied
+**pro-rata across all stakers** — each staker loses the same fraction of their
+stake, so no staker is preferred over another and the relative weights of the
+backers are preserved. The slash record stores the total amount taken; the
+per-staker reductions are reflected in each staker's balance, and each staker
+can still withdraw whatever remains of their own contribution.
 
 Counters: `get_contract_count` is the live total (deactivated included,
 deregistered excluded), `get_total_registered` is the lifetime total
 (never decremented), and `get_active_contract_count` is the currently listed
 figure. The frontend stats page should read `get_active_contract_count`.
+
+### Delegated management
+
+Teams often operate from a multisig or a deliberately cold deployer key.
+Requiring that key for routine metadata edits means either using it too often
+or not editing at all. An owner can therefore delegate registration management
+to a manager address:
+
+| Method | Who can call it |
+| --- | --- |
+| `set_manager(owner, contract_id, manager)` | the registered owner only — sets or replaces the manager |
+| `clear_manager(owner, contract_id)` | the registered owner only — revokes immediately |
+| `get_manager(contract_id)` | anyone — the current manager, if any |
+
+A manager may:
+
+- `update_metadata(manager, contract_id, name, description)`
+- `set_categories(manager, contract_id, categories)`
+- `deactivate(manager, contract_id)`
+
+A manager may **not** transfer ownership or withdraw stake — the two actions
+that move value. Those remain owner-only (or admin, for `transfer_ownership`
+and `deactivate`). Revocation via `clear_manager` is immediate: the next call
+from the former manager fails with `Unauthorized`.
+
+### Batched governance actions
+
+`propose_batch(proposer, actions)` creates one proposal containing 1–10
+`ProposalAction` values. Only an authenticated admin may propose it. Nested
+`ProposalAction::Batch` values are rejected. Approval and timelock requirements
+are the same as for individual proposals.
+
+Actions execute in their supplied order. For example, add two replacement admins
+before removing the old admin, then change the threshold. Each action validates
+against the state produced by earlier actions. If any action fails, all storage
+changes, events and token transfers revert, including the proposal's execution
+marker; governance can retry the proposal once the cause is resolved.
+
+The new `Batch` union variant preserves the encoding of existing individual
+actions and adds no storage keys or fields to stored structs. Clients submitting
+batches need bindings that include `Batch` and `propose_batch`.
 
 ### Upgrades
 
@@ -168,13 +236,53 @@ orphan existing registrations at a new address:
 | Method | Who can call it |
 | --- | --- |
 | `get_version()` | anyone — which build is live at this address |
-| `get_admin()` | anyone |
-| `upgrade(admin, new_wasm_hash)` | the admin only |
+| `get_admin()` / `get_admins()` | anyone |
+| `propose_upgrade(proposer, new_wasm_hash)` | any admin — opens an upgrade proposal |
+| `approve_proposal(admin, proposal_id)` | any admin — counts toward the threshold |
+| `execute_proposal(proposal_id)` | anyone, once threshold **and** timelock are met |
+| `get_manager(contract_id)` | anyone — the delegated manager for a registration, if set |
 
-`upgrade` swaps the contract's code and keeps its address and storage, so a new
-version must stay compatible with the storage shapes documented on `DataKey` and
-`ContractEntry` in [registry/src/lib.rs](./registry/src/lib.rs). See
+There is **no single-signer upgrade path**. Changing the code is governance-only:
+`propose_upgrade` by an admin, enough `approve_proposal` calls to reach the
+threshold, then `execute_proposal` after the timelock. The swap keeps the
+contract's address and storage, so a new version must stay compatible with the
+storage shapes documented on `DataKey` and `ContractEntry` in
+[registry/src/lib.rs](./registry/src/lib.rs). See
 [DEPLOY.md](./DEPLOY.md#upgrading-a-live-registry) for the live runbook.
+
+### Slashing and staker rewards
+
+A slash does not send the whole stake to the treasury. `slash` splits the
+slashed amount by a governance-set proportion: one part goes to the treasury
+address, the rest is credited to a staker reward pool. The split is configured
+with `set_slash_split(admin, treasury_bps)`, where `treasury_bps` is the
+treasury's share in basis points (0–10000). The remainder, `10000 -
+treasury_bps`, is the stakers' share. `get_slash_split()` returns the current
+value. With `treasury_bps = 10000` the behaviour matches the old contract
+exactly: the treasury receives the full slashed amount and the reward pool
+stays empty.
+
+Distribution is a **claim**, not a push. A slash credits the reward pool and
+records the slashed amount; it does not iterate over stakers. A push would have
+to loop over every honest staker on every slash, so the cost of a slash would
+scale with the number of stakers — an attacker could make slashing unaffordable
+by staking from many addresses, and a slash against a popular registration
+could exceed the transaction's resource limits. A claim inverts that: the slash
+is O(1), and each staker pays the cost of their own withdrawal when they choose
+to collect.
+
+| Method | Who can call it |
+| --- | --- |
+| `set_slash_split(admin, treasury_bps)` | the admin only — `treasury_bps` must be ≤ 10000 |
+| `get_slash_split()` | anyone — the current treasury share in basis points |
+| `claim_staker_reward(staker)` | a staker with an unclaimed share |
+| `get_claimable_reward(staker)` | anyone — the staker's unclaimed share |
+
+A staker's share is proportional to their stake on registrations other than
+the slashed one, so staking becomes a judgement about which registrations are
+honest rather than a lottery. Claiming transfers the staker's share and zeroes
+it; a second claim returns nothing. The reward pool is funded only by slashes,
+so a registry with no slashes has nothing to claim.
 
 ### Error codes
 
@@ -205,6 +313,7 @@ reference for those codes; it is kept next to the enum in
 | 18 | `ProposalNotReady` | The proposal exists but its timelock has not elapsed. | Wait until the proposal's execution ledger, then call `execute_proposal` again. |
 | 19 | `ProposalAlreadyExecuted` | The proposal was already executed or cancelled. | Do not re-execute; read the proposal's final state to confirm the outcome. |
 | 20 | `RegistrationLimitReached` | The per-owner registration limit is enabled and this owner has hit it. | Deregister an unused entry, or have an admin raise the limit via `propose_configure_registration_rate_limit`. |
+| 21 | `OwnerContractLimitReached` | The owner already has the maximum number of registrations in their contract index. | Deregister an unused entry owned by this address, then retry the registration. |
 
 ### Staking & reputation
 
@@ -230,6 +339,14 @@ was typed into a form:
 | `get_active_profiles(offset, limit)` | anyone — `get_active_contracts` with reputation attached |
 | `get_stake` / `is_verified` / `get_slashes` / `get_staking_config` | anyone |
 
+### Per-owner registration limit
+
+Each owner's contract index (`DataKey::OwnerContracts(Address)`) is capped at
+`MAX_OWNER_CONTRACTS` entries. Registering past the cap fails with
+`OwnerContractLimitReached` (code 21) instead of an opaque storage failure, so
+an owner at the limit gets a clear error. Registrations below the cap are
+unaffected. Deregistering an entry frees a slot in the index.
+
 Verified status has no non-governance path: a registrant cannot verify their own
 contract, which is the entire value of the signal. (Permissionless third-party
 `attest` exists and is documented below, but it records a separate, weaker claim
@@ -247,6 +364,19 @@ Staking is closed until governance runs `propose_configure_staking` to name a
 SEP-41 token (native XLM via its Stellar Asset Contract works) and a treasury.
 Routing that through governance rather than `initialize` means the already-live
 registry can adopt staking after an upgrade instead of being redeployed.
+
+**Token compatibility note:** the registry tracks every deposited stake exactly
+and expects the contract's real token balance to match the sum of all individual
+stakes at all times.  **Fee-on-transfer tokens are not supported**: because the
+registry credits the full transfer `amount` while the contract receives
+`amount - fee`, the two figures diverge immediately, and any subsequent slash
+will fail with `ContractBalanceInsufficient` (error 29).  Use only standard
+SEP-41 tokens where `transfer(from, to, amount)` delivers exactly `amount` to
+the recipient.  If this invariant is ever violated for any other reason (rounding
+bug in a custom token, tokens sent directly out of the contract), the same
+`ContractBalanceInsufficient` error is raised before the slash transfer, making
+the discrepancy diagnosable rather than causing an opaque panic deep inside the
+token contract.
 
 ### Third-party attestations
 
@@ -281,10 +411,10 @@ of the contract rather than of how many parties choose to speak up.
 
 ## Build & Test
 
-Install GNU Make, the Rust stable toolchain, and the Soroban wasm target:
+Install GNU Make, the Rust stable toolchain, and the wasm targets:
 
 ```bash
-rustup target add wasm32v1-none
+rustup target add wasm32v1-none wasm32-unknown-unknown
 rustup component add rustfmt clippy
 ```
 
@@ -296,6 +426,7 @@ make build
 make test
 make fmt
 make clippy
+make wasm-both
 ```
 
 `make test` builds the release wasm for the workspace before running tests. The
@@ -305,8 +436,14 @@ deliberately minimal second version that exists only as that test's upgrade
 target and is never deployed. `make check` runs formatting and clippy checks
 before the build-and-test sequence.
 
-Use `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
+Ship `wasm32v1-none`, not `wasm32-unknown-unknown`; on current Rust the latter
 emits the reference-types proposal, which the Soroban host refuses to load.
+Both targets are built anyway — `make wasm-both`, which `make test` runs — so
+that the host-compatibility test in
+[registry/tests/wasm_targets.rs](./registry/tests/wasm_targets.rs) has the
+artifacts of both to load: the ones we ship have to be accepted, and the other
+ones have to be refused for the documented reason, so that neither claim can go
+stale unnoticed. CI builds both targets before running the suite.
 
 ### Upgrading the Rust Toolchain
 
@@ -314,8 +451,8 @@ The project pins its Rust compiler version using a `rust-toolchain.toml` file to
 
 To upgrade the compiler version:
 1. Update the `channel` value in `rust-toolchain.toml` to the new stable version.
-2. Ensure `targets = ["wasm32v1-none"]` remains present in the file.
-3. Re-run `cargo build --target wasm32v1-none --release` and `cargo test` locally to verify the new compiler version doesn't introduce any new build errors or warnings.
+2. Ensure `targets = ["wasm32v1-none", "wasm32-unknown-unknown"]` remains present in the file: the first is what ships, the second is what CI checks the host's verdict on.
+3. Re-run `make check` locally to verify the new compiler version doesn't introduce any new build errors, warnings or wasm the Soroban host refuses to load.
 4. Commit the updated `rust-toolchain.toml` file and open a PR. CI will automatically honor the newly pinned version instead of defaulting to `stable`.
 
 ### Interface snapshot
@@ -353,6 +490,10 @@ Deployed on **testnet** at:
 CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ
 ```
 
+**Automated deployment**: Use [scripts/deploy.sh](./scripts/deploy.sh) to deploy or upgrade the registry with automatic wasm hash tracking and rollback capability. See [scripts/README.md](./scripts/README.md) for usage.
+
+**TypeScript bindings**: Generate type-safe client bindings with [scripts/generate-bindings.sh](./scripts/generate-bindings.sh) to eliminate hand-written clients and prevent silent breakage when the interface changes.
+
 When a storage type changes, update `registry-v2/` in the same PR so the fixture
 keeps mirroring the real types, then re-run `cargo test`. If you changed
 `ContractEntry` without updating the fixture, CI fails and the message names the
@@ -379,4 +520,3 @@ This repository maintains a minimal dependency surface to minimize attack vector
 ## License
 
 MIT
-
