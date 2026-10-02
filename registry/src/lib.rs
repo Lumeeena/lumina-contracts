@@ -168,7 +168,7 @@ pub const EXPIRY_LEDGERS: u32 = 20;
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
 /// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or the registration already has the maximum number of attestations. | Pass a non-empty label of at most `MAX_ATTESTATION_LABEL_LEN` bytes, or revoke an existing attestation first. |
-/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only the attester themselves can revoke; check `get_attestations` for the caller's address. |
+/// | 28 | `AttestationNotFound` | The caller has no attestation to revoke on this registration. | Only the attester can revoke their own attestation; check `get_attestations` first. |
 /// | 29 | `OverlappingAddress` | The proposed treasury or stake token is itself a registered contract. | Choose a token/treasury address that is not already registered. |
 /// | 30 | `AdminSetTooSmall` | The admin set would have fewer than `MIN_ADMINS` members. | Do not remove an admin that would drop the set below the minimum. |
 /// | 31 | `AlreadyAdmin` | The proposed address is already a member of the admin set. | Propose a different address, or skip `propose_add_admin` for one already an admin. |
@@ -245,43 +245,31 @@ pub enum RegistryError {
 /// The proposed treasury or stake-token address is itself a registered
     /// contract.
     OverlappingAddress = 29,
+    /// The owner has reached the maximum number of contracts they may
+    /// register. See [`MAX_CONTRACTS_PER_OWNER`].
+    OwnerContractLimitReached = 30,
     /// The admin set would have fewer than `MIN_ADMINS` members.
-    AdminSetTooSmall = 30,
+    AdminSetTooSmall = 31,
     /// The proposed address is already a member of the admin set.
-    AlreadyAdmin = 31,
+    AlreadyAdmin = 32,
     /// The proposed address to remove is not a member of the admin set.
-    AdminNotFound = 32,
+    AdminNotFound = 33,
     /// The proposed threshold is already the current threshold.
-    ThresholdAlreadySet = 33,
+    ThresholdAlreadySet = 34,
     /// The proposed verification status matches the contract's current status.
-    AlreadyVerified = 34,
+    AlreadyVerified = 35,
     /// Staking is already configured with the proposed token and treasury.
-    StakingAlreadyConfigured = 35,
-    /// Generic invalid input.
-    InvalidInput = 36,
-    /// The referenced slash record does not exist.
-    SlashNotFound = 37,
-    /// A response already exists for this slash record.
-    ResponseAlreadyExists = 38,
-    /// The contract's token balance is insufficient.
+    StakingAlreadyConfigured = 36,
     /// Caller-supplied input failed validation (e.g. an empty slash response).
-    InvalidInput = 36,
+    InvalidInput = 37,
     /// No slash exists at the given index in a registration's slash history.
-    SlashNotFound = 37,
+    SlashNotFound = 38,
     /// The referenced slash already has a recorded response.
-    ResponseAlreadyExists = 38,
+    ResponseAlreadyExists = 39,
     /// The registry's real token balance is smaller than the total it
     /// believes is staked, so a transfer that depends on that balance cannot
     /// proceed safely.
-    ContractBalanceInsufficient = 39,
-    /// The stake arithmetic would overflow `i128`.
-    ///
-    /// Note: the workspace profile enables `overflow-checks`, so an unchecked
-    /// `+`/`-` would trap rather than wrap. That profile setting is a backstop
-    /// for arithmetic we have not audited, not the mechanism that protects
-    /// stake accounting — the stake and slash paths use explicit checked
-    /// arithmetic and return this error instead.
-    StakeOverflow       = 40,
+    ContractBalanceInsufficient = 40,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -302,6 +290,9 @@ pub enum RegistryError {
 // `registry-v2/src/lib.rs` re-declares both types independently and reads
 // back storage written by this version — that test keeps these rules honest.
 
+/// Maximum number of contracts a single owner may have registered at once.
+pub const MAX_CONTRACTS_PER_OWNER: u32 = 100;
+
 /// Stored entry describing a registered Soroban contract.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -318,6 +309,8 @@ pub struct ContractEntry {
     pub registered_at: u32,
     /// Whether indexing is currently active for this contract.
     pub active: bool,
+    /// Whether the registration is currently active.
+    pub active2: bool,
 }
 
 // ─── Category taxonomy ─────────────────────────────────────────────────────
