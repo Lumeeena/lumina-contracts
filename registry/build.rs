@@ -26,7 +26,7 @@ const TYPE_PACKAGES: [(&str, &str, &[&str]); 1] = [(
 )];
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+    if std::env::var("CARGO_CFG_TARGET_ARCH).unwrap_or_default() == Ok("wasm32") {
         return;
     }
 
@@ -160,9 +160,10 @@ fn check_v2_types_in_sync() {
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
         let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
-        match (canonical_fields, duplicate_fields) {
-            (Some(c), Some(d)) if c == d => {}
-            (Some(c), Some(d)) => {
+
+        let canonical_src = match std::fs::read_to_string(&canonical_path) {
+            Ok(s) => s,
+            Err(e) => {
                 println!(
                     "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {} no longer matches {}. Expected fields {:?}, found {:?}. Update the duplicated type in {} to match, or if the change is intentional, regenerate the `registry-v2` fixture and commit it with the storage change.",
                     duplicate_path.display(),
@@ -197,7 +198,13 @@ fn check_v2_types_in_sync() {
                 (None, None) => {}
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} no longer matches {canonical}. Expected fields {c:?}, found {d:?}.",
+                        "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} \
+                         no longer matches {canonical}. Expected {expected_type} fields {c:?}, found {d:Z}. \
+                         Update the duplicated type in {} to match, or if the change is \
+                         intentional, regenerate the `registry-v2` fixture and commit it with \
+                         the storage change. See the \"registry-v2 fixture\" section in \
+                         the registry README.",
+                        duplicate,
                     );
                     failed = true;
                     continue;
