@@ -166,6 +166,10 @@ Ready (ready_at = current ledger)
       | TIMELOCK_LEDGERS elapse
       v
 Anyone executes ----> Executed (cannot execute twice)
+      |
+      | PROPOSAL_EXPIRY_LEDGERS elapse without execution
+      v
+Expired (must be re-proposed)
 ```
 
 Only an address in `Admins` can create or approve a proposal. Approvals are
@@ -218,6 +222,17 @@ validate that the resulting threshold remains satisfiable.
 The production timelocks are the per-action constants above. Tests use 10
 ledgers so they can exercise boundaries without archiving fixture storage.
 
+The production expiry window is 518,400 ledgers (approximately 36 days at six
+seconds per ledger), measured from `ready_at`. It is deliberately far longer
+than the timelock: the timelock protects against haste, while the expiry
+protects against staleness. A proposal that reaches threshold but is never
+executed within this window becomes invalid and must be re-proposed, so a
+decision cannot be executed against an admin set or policy context that has
+since changed. `execute_proposal` refuses an expired proposal with a named
+error, and `get_proposal` exposes the expiry so a UI can surface it. Tests use
+a short window so they can exercise the boundary without archiving fixture
+storage.
+
 ## Staking, verification, and slashing
 
 Staking is unavailable until governance configures a SEP-41 token and a
@@ -266,6 +281,12 @@ numbers, so the two constants can be retuned together without silently
 inverting the ordering. A view exposes when unbonding completes so indexers
 and the frontend can display the remaining wait.
 
+Withdrawing below the minimum does not leave an under-collateralised listing
+active. When a non-zero `MinimumStake` is configured, a withdrawal that would
+drop a registration's recorded stake below the minimum clears its `active`
+flag as part of the same invocation, so the listing is deactivated rather than
+silently remaining visible while under-collateralised.
+
 The internal bookkeeping invariant across staking transitions is:
 
 ```text
@@ -292,6 +313,7 @@ properties it checks, with representative test names for quick navigation:
 | Invariant | Representative tests |
 | --- | --- |
 | A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
+| A proposal that is never executed within the expiry window is refused and must be re-proposed. | `proposal_executes_inside_expiry_window`, `expired_proposal_cannot_execute`, `get_proposal_reports_expiry` |
 | Proposals of different actions become executable at different times. | `different_actions_have_different_timelocks`, `get_proposal_exposes_action_timelock` |
 | Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
 | Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
@@ -325,6 +347,10 @@ change the code. That makes storage encoding part of the long-lived protocol:
   read-time composition over modifying `ContractEntry`.
 - `CONTRACT_VERSION` must change with exported-interface or storage-shape
   changes.
+
+`PROPOSAL_EXPIRY_LEDGERS` is a documented constant rather than a stored value:
+changing its length is an exported-behavior change and must be accompanied by
+an update to this document and the interface snapshot.
 
 Before changing the architecture, run `make check`. For changes to exported
 functions or contract types, also update the interface snapshot and verify the
