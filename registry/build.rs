@@ -160,33 +160,30 @@ fn check_v2_types_in_sync() {
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
         let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
-
-        let canonical_src = match std::fs::read_to_string(&canonical_path) {
-            Ok(s) => s,
-            Err(e) => {
+        match (canonical_fields, duplicate_fields) {
+            (Some(c), Some(d)) if c == d => {}
+            (Some(c), Some(d)) => {
                 println!(
-                    "cargo::warning=could not read {}: {e}",
-                    canonical_path.display()
+                    "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {} no longer matches {}. Expected fields {:?}, found {:?}. Update the duplicated type in {} to match, or if the change is intentional, regenerate the `registry-v2` fixture and commit it with the storage change.",
+                    duplicate_path.display(),
+                    canonical_path.display(),
+                    c,
+                    d,
+                    duplicate_path.display(),
                 );
                 failed = true;
-                continue;
             }
-        };
-        let duplicate_src = match std::fs::read_to_string(&duplicate_path) {
-            Ok(s) => s,
-            Err(e) => {
+            (None, _) => {
                 println!(
-                    "cargo::warning=could not read {}: {e}",
-                    duplicate_path.display()
+                    "cargo::warning=could not locate `struct {struct_name}` in {}. The `registry-v2` check needs this type to compare against {}.",
+                    canonical_path.display(),
+                    duplicate_path.display(),
                 );
                 failed = true;
-                continue;
             }
-        };
-
-        for (struct_name, _expected_type) in fields {
-            let canonical_fields = extract_struct_fields(&canonical_src, struct_name);
-            let duplicate_fields = extract_struct_fields(&duplicate_src, struct_name);
+        for type_name in type_names {
+            let canonical_fields = extract_struct_fields(&canonical_src, type_name);
+            let duplicate_fields = extract_struct_fields(&duplicate_src, type_name);
 
             match (canonical_fields, duplicate_fields) {
                 (Some(c), Some(d)) => {
@@ -265,3 +262,4 @@ fn check_v2_types_in_sync() {
              Update the fixture and commit it together with the storage change."
         );
     }
+}
