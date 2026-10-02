@@ -335,4 +335,427 @@ pub trait RegistryInterface {
     /// addresses, so a `G…` in the registry is not a state this read can
     /// observe — the downstream `isContractAddress` filter that
     /// `lumina-backend/indexer/src/index.ts` had to add
+    fn is_registered(env: Env, contract_id: Address) -> bool;
+
+    /// Aggregate counters: lifetime, active and verified totals, plus the
+    /// staked count and amount. Maintained on write, so the read is cheap
+    /// apart from the per-registration stake scan.
+    fn get_registry_stats(env: Env) -> RegistryStats;
+
+    /// The retained slash history for a registration, oldest first. Kept
+    /// after deregistration so penalties stay auditable.
+    ///
+    /// # Retention policy
+    ///
+    /// The registry retains at most a bounded number of the *most recent* slash
+    /// records per registration (`SLASH_HISTORY_CAPACITY`). Once that capacity is
+    /// reached, each new slash evicts the oldest retained record, so the vector
+    /// never grows without bound and a long history can always be slashed again.
+    ///
+    /// Pruning is *not* a write-off: the aggregate `slashed_total` on the
+    /// registration (see `Reputation`) accumulates every slash ever levied,
+    /// including those whose individual records have been evicted, and is
+    /// unaffected by retention. So this method answers "what happened lately",
+    /// while `get_reputation` answers "how much in total".
+    fn get_slashes(env: Env, contract_id: Address) -> Vec<SlashRecord>;
+
+    /// Claim the caller's share of the staker reward pool accumulated from
+    /// past slashes. Errors with `NothingToClaim` if the caller's share is
+    /// zero.
+    fn claim_slash_reward(env: Env, staker: Address) -> Result<i128, RegistryError>;
+
+    /// The full reputation signal for a registration. Returns zeroed values
+    /// rather than erroring for an unregistered address, matching
+    /// `is_registered`s tolerance.
+    fn get_reputation(env: Env, contract_id: Address) -> Reputation;
+
+    /// A registration joined with its reputation — one call instead of
+    /// `get_contract` plus `get_reputation`. Errors with `ContractNotFound`
+    /// for an address that is not registered.
+///
+    /// **This is the one to reach for when you want both "listed" and
+    /// "verified".** The two facts cost one nested invocation here versus two
+    /// via `is_registered` + `is_verified`, and the fixed per-call charge is
+    /// the part that dominates a cheap read.
+    fn get_contract_profile(
+        env: Env,
+        contract_id: Address,
+    ) -> Result<ContractProfile, RegistryError>;
+
+    /// Whether `contract_id` is both active and verified — the gate most
+    /// consumers actually want. Equivalent to `get_contract_profile` and
+    /// checking both flags, but cheaper than two separate calls.
+    fn is_listed(env: Env, contract_id: Address) -> bool;
+
+    /// Everything the registry knows about one contract, in a single call.
+    ///
+    /// This is the read to prefer when a consumer needs more than one fact:
+    /// it avoids the fixed per-call cost of a second cross-contract invocation.
+    /// Errors with `NotRegistered` for an address that has no registration.
+    fn get_contract_profile(env: Env, contract_id: Address) -> Result<ContractProfile, RegistryError>;
+
+    /// The number of registered contracts, active or not.
+    fn get_total_contracts(env: Env) -> u32;
+
+    /// The number of active registrations.
+    fn get_active_contract_count(env: Env) -> u32;
+
+    /// The number of registrations governance has verified.
+    fn get_verified_count(env: Env) -> u32;
+
+    /// One page of active registrations in registration order.
+///
+    /// `offset` indexes the raw index, so a page can come back shorter than
+    /// `limit` while more active registrations follow. Deprecated in favour of
+    /// `get_active_contracts_after`; see the trait docs.
+    fn get_active_contracts(env: Env, offset: u32, limit: u32) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_active_contracts`. Pass the `contract_id` of the
+    /// last entry the previous call returned (or `None` to start) and walk
+    /// until an empty page. Cheaper than offset paging and stable against
+    /// registrations added mid-walk.
+    fn get_active_contracts_after(
+        env: Env,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
+
+    /// As `get_active_contracts`, but only the addresses. Cheaper to decode
+    /// and much smaller to return, for a consumer that does not read the
+    /// metadata.
+    fn get_active_contract_ids(env: Env, offset: u32, limit: u32) -> Vec<Address>;
+
+    /// The number of governance proposals ever created.
+    fn get_proposal_count(env: Env) -> u32;
+
+    /// The number of governance proposals that have been executed.
+    fn get_executed_proposal_count(env: Env) -> u32;
+
+    /// Whether a governance proposal has been executed.
+    fn is_proposal_executed(env: Env, proposal_id: u32) -> bool;
+
+    /// Whether a governance proposal has been cancelled.
+    fn is_proposal_cancelled(env: Env, proposal_id: u32) -> bool;
+
+    /// Returns active registrations ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_contracts_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractPage;
+
+    /// Returns active profiles ordered by staked amount descending, paginated.
+    /// Ties are broken by registration order (ascending index).
+    fn get_active_profiles_by_stake_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage;
+
+    /// Every contract registered by `owner`, **including** deactivated ones.
+///
+    /// The underlying per-owner index is capped at [`MAX_CONTRACTS_PER_OWNER`]
+    /// entries, so this list is bounded and can be walked by paging. An owner
+    /// that hits the cap gets [`RegistryError::OwnerContractLimitReached`]
+    /// from registration, not an opaque storage failure.
+    fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry>;
+
+    /// Cursor form of `get_contracts_by_owner`, including deactivated entries.
+    /// `cursor` is the `contract_id` last returned, or `None` to start.
+    fn get_contracts_by_owner_after(
+        env: Env,
+        owner: Address,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry>;
+/// Remove a registration entirely, reclaiming its storage.
+    ///
+    /// Deletes the stored entry, its owner-index membership and its
+    /// category-index membership, and decrements the live contract count.
+    /// Refuses with `StakeNotEmpty` while the registration still holds
+    /// stake — call `withdraw_stake` first, since deleting an entry that
+    /// still holds collateral would strand it. Emits `contract_deregistered`.
+    fn deregister(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError>;
+
+    /// Whether an address is in the governance admin set.
+    fn is_admin(env: Env, address: Address) -> bool;
+
+    /// The admins that have approved a governance proposal.
+    fn get_proposal_approvals(env: Env, proposal_id: u32) -> Result<Vec<Address>, RegistryError>;
+}
+
+/// The maximum number of contracts a single owner may register.
+///
+/// The registry stores an owner's contracts in a single
+/// `DataKey::OwnerContracts(Address)` entry that is rewritten on every
+/// registration. Without a cap, an owner registering many contracts makes
+/// each subsequent registration more expensive, until the entry can no
+/// longer be written and that owner can no longer register anything.
+///
+/// This constant is the bound. Registrations below it are unaffected; a
+/// registration that would exceed it fails with
+/// [`RegistryError::OwnerContractLimitReached`]. The cap is per owner,
+/// not global.
+///
+/// The value is part of the registry's public behavior and is pinned by
+/// `tests/interface_matches_registry.rs` against the contract's spec.
+///
+/// [`RegistryError::OwnerContractLimitReached`]: RegistryError::OwnerContractLimitReached
+pub const MAX_CONTRACTS_PER_OWNER: u32 = 100;
+
+/// Errors the registry's read-only surface can return.
+///
+/// Declared in full, with the same discriminants as `lumina_registry::RegistryError`,
+/// not just the handful a read can actually produce. A client decodes a
+/// contract error by matching on the enum it was generated against, so a
+/// variant that is missing here turns a well-defined error into an opaque
+/// decode failure. `tests/interface_matches_registry.rs` pins the whole list
+/// against the contract's spec, so the two cannot drift.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RegistryError {
+    /// Contract is already initialized.
+    AlreadyInitialized = 1,
+    /// Caller lacks authorization for this action.
+    Unauthorized = 2,
+/// Contract has not been initialized yet.
+    NotInitialized = 3,
+    /// The address has no registration.
+    ContractNotFound = 4,
+/// The registration is already present.
+    AlreadyRegistered = 5,
+    /// The caller is not the owner of the registration.
+    NotOwner = 6,
+    /// The proposal does not exist.
+    ProposalNotFound = 7,
+    /// The proposal has already been executed or rejected.
+    ProposalFinalized = 8,
+    /// The caller has already voted on this proposal.
+    AlreadyVoted = 9,
+    /// The address is not an admin.
+    NotAdmin = 10,
+    /// The admin set would be left empty.
+    LastAdmin = 11,
+    /// The admin set is full.
+    AdminLimitReached = 12,
+    /// The proposal does not have enough approvals.
+    ThresholdNotMet = 13,
+    /// The proposal has expired.
+    ProposalExpired = 14,
+    /// The proposal is not open for voting.
+    ProposalNotActive = 15,
+    /// Staking has not been configured.
+    StakingNotConfigured = 16,
+    /// The stake amount is invalid.
+    InvalidStake = 17,
+    /// The stake is insufficient for the requested operation.
+    InsufficientStake = 18,
+    /// The stake is still inside the post-slash lock window.
+    StakeLocked = 19,
+    /// The registration is still active — deactivate before withdrawing.
+    RegistrationActive = 20,
+    /// A registration must declare at least one category.
+    NoCategories = 21,
+    /// The registration claims more categories than `MAX_CATEGORIES_PER_CONTRACT`.
+    TooManyCategories = 28,
+    /// The registration still holds stake — withdraw it before deregistering.
+    StakeNotEmpty = 22,
+    /// The registration rate limit configuration is invalid.
+    InvalidRateLimit = 23,
+    /// The owner is not allowlisted for registration.
+    NotAllowlisted = 24,
+    /// The registration rate limit has been exceeded.
+    RegistrationRateLimited = 25,
+    /// Registration fee was not paid.
+    InsufficientFee = 26,
+    /// Tag count or length exceeds bounds.
+    InvalidTags = 26,
+    /// The caller has no slashed stake available to claim.
+    NothingToClaim = 27,
+}
+
+/// A single attestation recorded against a contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attestation {
+    /// The admin who attested.
+    pub attester: Address,
+    /// Ledger timestamp of the attestation.
+    pub created_at: u32,
+    /// Free-form label.
+    pub label: String,
+}
+
+/// A governance proposal.
+///
+/// A registration that claims every category is not categorised in any useful
+/// sense — it is spam in a discovery surface. Claiming more than this cap is
+/// rejected with [`RegistryError::TooManyCategories`] rather than silently
+/// truncated.
+pub const MAX_CATEGORIES_PER_CONTRACT: u32 = 5;
+
+/// A governance proposal as returned by `get_proposal`.
+///
+/// Duplicated from `lumina-registry` for the reasons given in the crate
+/// docs; `tests/interface_matches_registry.rs` pins the layout against the
+/// contract's spec.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractEntry {
+    /// Whether the registration is active.
+    pub active: bool,
+    /// The registered contract address.
+    pub contract_id: Address,
+    /// Human-readable description.
+    pub description: String,
+    /// Human-readable name.
+    pub name: String,
+    /// The owner address.
+    pub owner: Address,
+    /// Ledger timestamp of registration.
+    pub registered_at: u32,
+/// Whether indexing is currently active for this contract.
+    pub active: bool,
+    /// Address the owner delegated registration management to, if any.
+    pub manager: Option<Address>,
+}
+
+/// The kind of action a governance proposal would take.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalAction {
+    /// Add an admin.
+    AddAdmin(Address),
+    /// Remove an admin.
+    RemoveAdmin(Address),
+    /// Change the approval threshold.
+    SetThreshold(u32),
+    /// Pause the registry.
+    Pause,
+    /// Unpause the registry.
+    Unpause,
+}
+
+/// A category a registration can be filed under.
+///
+/// Duplicated from `lumina-registry`; see the crate docs for why.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ProposalKind {
+    /// Add an admin to the governance set.
+    AddAdmin = 1,
+    /// Remove an admin from the governance set.
+    RemoveAdmin = 2,
+    /// Change the number of approvals a proposal needs.
+    SetThreshold = 3,
+    /// Mark a registration as verified.
+    Verify = 4,
+    /// Remove verification from a registration.
+    Unverify = 5,
+    /// Deactivate a registration.
+    Deactivate = 6,
+    /// Slash a registration's stake.
+    Slash = 7,
+    /// Set the per-registration registration fee.
+    SetRegistrationFee = 8,
+    /// Configure the staking token and treasury.
+    SetStakingConfig = 9,
+}
+
+/// A taxonomy category a registration can be filed under.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Category {
+    /// General service or utility contract.
+    Service = 1,
+    /// Developer tooling or infrastructure.
+    Tooling = 2,
+    /// Financial application.
+    Finance = 3,
+    /// Gaming or entertainment application.
+    Gaming = 4,
+    /// Social or community application.
+    Social = 5,
+    /// Other, unspecified category.
+    Other = 6,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    /// Monotonic identifier assigned at creation.
+    pub id: u32,
+    /// The action the proposal would take if approved.
+    pub action: ProposalAction,
+    /// Optional human-readable rationale, bounded by
+    /// `MAX_PROPOSAL_DESCRIPTION_LEN` bytes. Empty when the proposer
+    /// supplied none.
+    pub description: String,
+    /// Address that created the proposal.
+    pub proposer: Address,
+    /// Ledger at which the proposal was created.
+    pub created_at: u32,
+    /// Ledger after which the proposal can no longer be voted on.
+    pub expires_at: u32,
+    /// Approvals recorded so far.
+    pub approvals: u32,
+    /// Whether the proposal has been executed or rejected.
+    pub finalized: bool,
+}
+}
+
+/// A single registration entry.
+///
+/// Enforced at creation; a longer description is rejected with
+/// `InvalidDescription`. Documented here so clients can validate before
+/// submitting a transaction.
+pub const MAX_PROPOSAL_DESCRIPTION_LEN: u32 = 256;
+
+/// A single slash levied against a registration.
+///
+/// The registry retains only a bounded number of the most recent records per
+/// registration; see `get_slashes` for the retention policy. The aggregate
+/// total lives on `Reputation.slashed_total` and is not affected by pruning.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashRecord {
+/// When the slash was levied, in ledger timestamps.
+    pub timestamp: u64,
+    /// The amount of stake taken.
+    pub amount: i128,
+    /// Free-form reason recorded with the slash.
+    pub reason: String,
+    /// The governance proposal that authorized the slash.
+    pub proposal_id: u32,
+    /// Owner's optional response to the slash.
+    pub response: Option<String>,
+}
+
+/// Byte-compatible with `lumina_registry::Attestation`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attestation {
+    /// Who made the claim, so it is attributable and revocable.
+    pub attester: Address,
+    /// Short, bounded free-text label describing the basis of the claim.
+    pub label: String,
+    /// Ledger at which the attestation was made.
+    pub created_at: u32,
+}
+
+/// The reputation signal for a registration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reputation {
+/// Currently staked, withdrawable balance.
+    pub stake: i128,
+    /// Whether governance has attested this registration.
+    pub verified: bool,
+    /// Lifetime total slashed, which unlike `stake` never goes down.
+    pub slashed_total: i128,
+    /// Number of slashes ever levied.
+    pub slash_count: u32,
+    /// Ledger before which `withdraw_stake` is refused. Zero once clear.
+    pub withdraw_locked_until: u32,
+    /// Ledger at which an in-progress unbonding completes, or zero if none is
+    /// in progress. Distinct from `withdraw_locked_until`, which is the
+    /// post-slash lock.
+    pub unbonding_completes_at: u32,
+    /// Whether the registration is active.
+    pub active: bool,
 }

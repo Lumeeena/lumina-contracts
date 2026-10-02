@@ -17,13 +17,11 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `proposal_ready` | `(proposal_id: u32, ready_at: u32, executable_from: u32)` | When a proposal receives enough approvals and enters the timelock. | | `proposal_enters_timelock_after_sufficient_approvals` |
 | `proposal_executed` | `(proposal_id: u32, executed_at: u64, executor: Address)` | When a ready proposal is executed after the timelock elapses. | | `execute_proposal_applies_action` |
 | `contract_deactivated` | `(contract_id: Address, caller: Address)` or `(contract_id: Address, Symbol("governance"))` | When a contract is deactivated by its owner or governance. | Indexer, History | `deactivate_requires_contract_owner` |
-| `contract_deregistered` | `(contract_id: Address, owner: Address)` | When a deactivated and unstaked contract is fully deregistered. | Indexer, History | `deregister_removes_every_index_reference...` |
-| `contract_registered` | `(contract_id: Address, owner: Address, name: String, categories: Vec<String>)` | When a new contract is registered to the manifest. | Indexer, History | `registration_recordsits_categories` |
-| `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>)` | When a contract's categories are updated by its owner. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
-| `tags_updated` | `(contract_id: Address, owner: Address, tags_len: u32)` | When a contract's tags are updated by its owner. | History | `tags_are_updated_and_returned` |
-| `metadata_updated` | `(contract_id: Address, owner: Address, name: String)` | When the contract's metadata (name) is updated. | Indexer, History | `update_metadata_succeeds_with_real_owner_signature` |
-| `ownership_transfer_proposed` | `(contract_id: Address, current_owner: Address, new_owner: Address)` | When an owner proposes a two-step ownership transfer. | History | `propose_and_accept_ownership_transfer_succeeds_with_real_signatures` |
-| `ownership_transfer_canceled` | `(contract_id: Address, owner: Address)` | When an owner cancels a pending ownership transfer. | History | `cancel_ownership_transfer_removes_pending_and_blocks_accept` |
+| `contract_deregistered` | `(contract_id: Address, owner: Address)` | When a deactivated and unstaked contract is fully deregistered. | Indexer, History | `deregister_removes_every_index_reference` |
+| `contract_registered` | `(contract_id: Address, owner: Address, name: String, categories: Vec<String>)` | When a new contract is registered to the manifest. | Indexer, History | `registration_records_its_categories` |
+| `categories_updated` | `(contract_id: Address, owner: Address, categories: Vec<String>)` | When a contract's categories are updated by its owner or manager. | Indexer, History | `set_categories_moves_a_registration_between_categories` |
+| `tags_updated` | `(contract_id: Address, owner: Address, tags_len: u32)` | When a contract's tags are updated by its owner or manager. | History | `tags_are_updated_and_returned` |
+| `metadata_updated` | `(contract_id: Address, owner: Address, name: String)` | When the contract's metadata (name) is updated by the owner or manager. | Indexer, History | `update_metadata_succeeds_with_real_owner_signature` |
 | `ownership_transferred`| `(contract_id: Address, previous_owner: Address, new_owner: Address)` | When the contract's ownership is transferred to a new address. | History | `ownership_transfer_preserves_stake_and_verification` |
 | `stake_deposited` | `(contract_id: Address, owner: Address, amount: i128, total_staked: i128)` | When the owner deposits tokens to top up their stake. | History | `stake_tops_up_an_existing_stake` |
 | `stake_withdrawn` | `(contract_id: Address, owner: Address, total_staked: i128)` | When the owner withdraws their staked tokens after deactivation. | History | `withdraw_returns_the_full_stake_once_the_owner_has_deactivated` |
@@ -32,7 +30,7 @@ Events are the integration surface for downstream consumers, serving as the inte
 | `reward_claimed` | `(staker: Address, amount: i128, pool_remaining: i128)` | When a staker claims their share of the staker reward pool. | History | `staker_can_claim_a_share_of_a_slash` |
 | `verification_set` | `(contract_id: Address, verified: bool)` | When governance grants or revokes verified status for a contract. | History | `governance_can_attest_and_later_revoke_verification` |
 | `category_pruned` | `(category: String, removed: u32)` | When dead references in a category's index are cleaned up. | | `prune_category_drops_dead_references_and_is_safe_to_repeat` |
-| all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
+| `all_contracts_pruned` | `(removed: u32,)` | When dead references in the global index are cleaned up. | | `contract_count_is_live_and_total_registered_is_lifetime` |
 | `registry_upgraded` | `(new_wasm_hash: BytesN<32>, version: u32)` | When the registry contract's WASM is upgraded. | | `upgrade_carries_admin_across_swap` |
 | `admin_added` | `(new_admin: Address,)` | When a new governance admin is added via executed proposal. | | `propose_add_admin_adds_a_new_admin` |
 | `admin_removed` | `(admin_to_remove: Address,)` | When a governance admin is removed via executed proposal. | | `propose_remove_admin_removes_the_admin` |
