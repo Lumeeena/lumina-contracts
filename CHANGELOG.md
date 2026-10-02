@@ -2,7 +2,7 @@
 
 All notable changes to the Lumina Registry contract will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
+The format is based on [Keep a Changelog](https://keepadhangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Version 4 (unreleased)
@@ -15,41 +15,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Added `cancel_proposal`** — callable by the proposer or by a threshold of admins, allowing a mistaken or superseded proposal to be withdrawn before execution. A cancelled proposal cannot be approved or executed, and emits `proposal_cancelled`.
 
 ### Storage Changes
-- **Added `DataKey::PreviousStakeToken`** -- stores the previous staking token address prior to reconfiguration. Variant names are preserved in `#[contractype]` enum, so adding this new variant is safe for upgrades.
-- **Added `DataKey::PreviousTreasury`** -- stores the previous treasury address prior to reconfiguration. Same upgrade-safe semantics.
+- **Added `DataKey::PreviousStakeToken`** — stores the previous staking token address prior to reconfiguration. Variant names are preserved in `\#contracttype]` enum, so adding this new variant is safe for upgrades.
+- **Added `DataKey::PreviousTreasury`** — stores the previous treasury address prior to reconfiguration. Same upgrade-safe semantics.
+- **Added `DataKey::MinimumStake`** — stores the governance-set minimum stake required to register a contract. Absent means zero (no minimum).
 - Storage changes are backwards-compatible: new code can decode entries written by old code, and vice-versa, because variant names are preserved.
+
+### Behaviour Notes
+- **Withdrawing below the minimum** — `withdraw_stake` refuses to reduce a contract's stake below the configured `MinimumStake` while the contract remains active. To withdraw below the minimum, the owner must first deregister the contract, which deactivates the listing rather than silently leaving an under-collateralised entry in the registry. This interaction is tested for both the default-zero and non-zero minimum cases.
 
 ---
 
 ## Version 3
 
 ### Interface Changes
-- Added `propose_change_threshold` governance flow for modifying the admin threshold with timelock protection.
-- Enhanced `propose_configure_registration_rate_limit` with explicit rate limit window configuration.
+-  Added `propose_change_threshold` governance flow for modifying the admin threshold with timelock protection.
+-  Enhanced `propose_configure_registration_rate_limit` with explicit rate limit window configuration.
 
 ### Storage Changes
-- Added `RegistrationRateWindow` and `RegistrationRateLimit` `DataKey` entries for per-owner rate limiting.
-- Added `TotalRegistered` counter surviving deregistration.
+-  Added `RegistrationRateWindow` and `RegistrationRateLimit` `DataKey` entries for per-owner rate limiting.
+-  Added `TotalRegistered` counter surviving deregistration.
 
 ---
 
 ## Version 2
 
 ### Interface Changes
-- Initial registry-v2 migration with multi-admin governance.
-- Added `initialize` constructor flow and `__constructor` for new deployments.
+-  Initial registry-v2 migration with multi-admin governance.
+-  Added `initialize` constructor flow and `__constructor` for new deployments.
 
 ### Storage Changes
-- Complete rewrite of storage schema with `registry-v2` compatibility layer.
-- Added `Admin`, `Admins`, `Threshold`, `ProposalCount` entries for governance.
+-  Complete rewrite of storage schema with `registry-v2` compatibility layer.
+-  Added `Admin`, `Admins`, `Threshold`, `ProposalCount` entries for governance.
 
 ---
 
 ## Version 1
 
 ### Interface Changes
-- Initial Lumina Registry contract deployment.
-- Basic contract registration, metadata, and discovery.
+-  Initial Lumina Registry contract deployment.
+-  Basic contract registration, metadata, and discovery.
 
 ### Storage Changes
 - Initial `DataKey` enum: `Admins`, `Threshold`, `ProposalCount`, `ContractCount`, `TotalRegistered`, `Contract`, `OwnerContracts`, `AllContracts`, `StakeToken`, `Treasury`, `Stake`, `Verified`, `Slashes`, `WithdrawLockedUntil`, `Categories`, `ByCategory`, `AllowlistEnabled`, `Allowlisted`, `RegistrationRateLimit`, `RegistrationRateWindow`, `Admin`.
