@@ -157,7 +157,7 @@ impl Fixture {
     /// Approve, wait out the timelock, execute.
     fn execute(&self, proposal: u32) {
         self.advance(20_000);
-        self.registry_client().execute_proposal(&proposal);
+        self.registry_client().execute_proposal(&self.admin, &proposal);
     }
 
     fn register(&self, name: &str, which: &[Category]) -> Address {

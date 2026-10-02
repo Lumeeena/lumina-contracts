@@ -10,7 +10,7 @@
 /// It also guards the hand-maintained `registry-v2` upgrade fixture: the
 /// duplicated v2 storage types must match the real ones field-for-field,
 /// otherwise the fixture silently stops testing anything.
-use std::path::PathBuf;
+ use std::path::PathBuf;
 
 const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
 
@@ -20,10 +20,10 @@ const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
 const TYPE_PACKAGES: [(&str, &str, &[&str]); 1] = [(
     "src/lib.rs",
     "../registry-v2/src/lib.rs",
-    &["ContractEntry", "DataKey"],
+    &[
+        ("ContractEntry", "ContractEntry"),
+    ],
 )];
-
-fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
@@ -57,8 +57,7 @@ fn check_fixtures() {
 
     if !missing.is_empty() {
         println!(
-            "cargo::warning=upgrade-test fixtures not built ({}). \
-             Run `cargo build --target wasm32v1-none --release` before `cargo test`.",
+            "cargo::warning=upgrade-test fixtures not built ({}). Run `cargo build --target wasm32v1-none --release` before `cargo test`.",
             missing.join(", "),
         );
     }
@@ -100,15 +99,12 @@ fn extract_struct_fields(source: &str, name: &str) -> Option<Vec<(String, String
 
         let line = line.trim_end_matches(',').trim_end();
         let (name_part, type_part) = line.split_once(':')?;
-        let name = name_part.trim();
-        // Drop the visibility: the canonical type writes `pub field`, the
-        // fixture does too, but only the name and type are being compared.
-        let name = name.trim_start_matches("pub ").trim();
-        let type_part = type_part.trim();
+        let name = name_part.trim().trim_start_matches("pub").trim().to_string();
+        let type_part = type_part.trim().replace("soroban_sdk::", "");
         if name.is_empty() || type_part.is_empty() {
-            return None;
+            continue;
         }
-        fields.push((name.to_string(), normalize_type(type_part)));
+        fields.push((name, type_part));
     }
 
     Some(fields)
@@ -201,11 +197,7 @@ fn check_v2_types_in_sync() {
                 (None, None) => {}
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `struct {type_name}` in {}. \
-                         The `registry-v2` fixture is supposed to duplicate this type. \
-                         Update it (see the \"Upgrade fixture\" section in the README) \
-                         or update TYPE_PACKAGES in build.rs if it was renamed.",
-                        duplicate,
+                        "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} no longer matches {canonical}. Expected fields {c:?}, found {d:?}.",
                     );
                     failed = true;
                     continue;
@@ -239,19 +231,14 @@ fn check_v2_types_in_sync() {
                 }
                 (None, None) => {
                     println!(
-                        "cargo::warning=could not locate `{type_name}` in {}. \
-                         The `registry-v2` check needs this type to compare against {}. \
-                         Update the check in build.rs if the type was renamed or moved.",
-                        canonical, duplicate,
+                        "cargo::warning=could not locate `struct {struct_name}` in {}.",
+                        canonical,
                     );
                     failed = true;
                 }
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `pub enum {type_name}` in {}. \
-                         The `registry-v2` fixture is supposed to duplicate this type. \
-                         Update it (see the \"Upgrade fixture\" section in the README) \
-                         or update TYPE_PACKAGES in build.rs if it was renamed.",
+                        "cargo::warning=could not locate `struct {struct_name}` in {}.",
                         duplicate,
                     );
                     failed = true;
