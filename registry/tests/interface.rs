@@ -41,7 +41,7 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
     }
 }
 
-/// One line per exported item, sorted so that moving code around in `lib.rs`
+/// One line per exported item, sorted so that moving code around in `lib.r`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
 ///
@@ -53,8 +53,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
         .iter()
         .map(|entry| match entry {
             ScSpecEntry::FunctionV0(f) => {
-                let args = f
-                    .inputs
+                let args = f.inputs
                     .iter()
 .map(|i| {
                         format!(
@@ -164,6 +163,14 @@ fn exported_interface_matches_snapshot() {
         );
     }
 
+    for expected_fn in ["get_proposals"] {
+        assert!(
+            actual.contains(&format!("fn {expected_fn}(")),
+            "proposal listing entry point `{expected_fn}` is missing from the exported interface; \
+             a UI cannot enumerate pending proposals without it"
+        );
+    }
+
     // The unbonding surface is part of the exported interface: an owner must
     // be able to start an unbonding timer and observe when it completes, and
     // `withdraw_stake` must refuse until it elapses. Any change to these
@@ -252,7 +259,7 @@ fn reentrant_token_cannot_withdraw_twice() {
                 // Attempt the reentrant double withdrawal. With
                 // checks-effects-interactions ordering this must fail because
                 // the stake was already zeroed before `transfer` was called.
-                let _ = client.try_withdraw_stake(&staker, &amount);
+                let _ = client.try_withdraw_stake(&staker, &amount, &amount);
             }
         }
     }
@@ -272,6 +279,6 @@ fn reentrant_token_cannot_withdraw_twice() {
     registry.request_unbond(&staker);
     // The reentrant call inside `transfer` must not have succeeded in
     // withdrawing a second time; the original withdrawal stands.
-    registry.withdraw_stake(&staker, &1_000);
+    registry.withdraw_stake(&staker, &1_000, &1_000);
     assert_eq!(registry.stake_of(&staker), 0);
 }
