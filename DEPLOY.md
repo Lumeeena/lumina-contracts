@@ -24,6 +24,13 @@ your own following the steps below.
 - [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) (`stellar`, formerly `soroban`)
 - A funded testnet identity
 
+### CLI configuration
+
+The CLI reads the network and contract id from config so they are not repeated
+per command. Create `lumina-registry.toml` in the working directory (or set
+`LUMINA_REGISTRY_CONFIG` to its path):
+
+
 ```bash
 stellar keys generate lumina-deployer --network testnet --fund
 ```
@@ -133,17 +140,23 @@ stellar contract invoke \
   --id lumina-registry \
   --source lumina-deployer \
   --network testnet \
-  -- get_active_contracts --offset 0 --limit 10
+  -- get_active_contracts_after --limit 10
 ```
 
-Or browse one category — same offset/limit semantics, same `active` filtering:
+`get_active_contracts_after` takes an optional `--cursor <C...>` set to the
+`contract_id` of the last entry the previous call returned; repeat until the
+result is empty. It is stable if a registration is added mid-walk. The older
+`get_active_contracts --offset 0 --limit 10` is deprecated and kept for one
+release.
+
+Or browse one category:
 
 ```bash
 stellar contract invoke \
   --id lumina-registry \
   --source lumina-deployer \
   --network testnet \
-  -- get_active_contracts_by_category --category DeFi --offset 0 --limit 10
+  -- get_contracts_by_category_after --category DeFi --limit 10
 ```
 
 ### Refile an existing registration
@@ -284,6 +297,11 @@ slash proposal to clear its own timelock.
 A slash for more than the registration has staked passes governance but reverts
 at execution with `InsufficientStake`; check `get_stake` before proposing.
 
+A slash will also revert with `ContractBalanceInsufficient` if the registry's
+real token balance is less than its tracked total — a sign of accounting drift
+(fee-on-transfer token, rounding bug, or tokens moved directly out of the
+contract).  Fee-on-transfer tokens are **not supported** as stake tokens.
+
 ### Reclaiming a stake (registrant)
 
 Withdrawal requires **good standing**: you are the registered owner, the
@@ -318,15 +336,19 @@ A Soroban upgrade replaces the contract's **code** and keeps its **address and
 storage**. Nothing has to be re-registered, and every `REGISTRY_CONTRACT_ID`
 already configured downstream keeps working.
 
-Only the admin stored at `initialize` time can do it:
+Changing the code is **governance-only**. There is no single-signer `upgrade`
+entrypoint: an admin proposes, enough admins approve to reach the threshold, and
+after the timelock anyone may execute. Check the current configuration first:
 
 ```bash
-stellar contract invoke \
-  --id lumina-registry \
-  --source lumina-deployer \
-  --network testnet \
-  -- get_admin
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- get_threshold
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- get_admins
 ```
+
+`get_admin` still answers (it falls back to the first admin), but the legacy
+`DataKey::Admin` slot it may read is deprecated and grants no authority.
 
 ### 1. Check what is live now
 
@@ -344,7 +366,8 @@ sha256sum rollback.wasm   # macOS: shasum -a 256 rollback.wasm
 ```
 
 Save that hash (and the wasm) somewhere durable *before* upgrading. Rolling back
-is just another `upgrade` to that hash, but only if you still have it.
+is just another governance upgrade proposal to that hash — but only if you still
+have it.
 
 ### 3. Build and upload the new wasm
 
@@ -367,24 +390,43 @@ sha256sum target/wasm32v1-none/release/lumina_registry.wasm  # macOS: shasum -a 
 
 Build with `wasm32v1-none` (what `stellar contract build` uses). A
 `wasm32-unknown-unknown` build of the same source produces different bytes and,
-on current Rust, a module the Soroban host refuses to load — an upgrade to that
-hash bricks the contract with no way to call `upgrade` again.
+on current Rust, a module the Soroban host refuses to load — and an upgrade to
+that hash behind the timelock cannot be recalled, so verify the hash before
+proposing.
 
-### 4. Submit the upgrade
+### 4. Propose, approve, and execute the upgrade
+
+An upgrade is an ordinary governance proposal. Any admin proposes it:
 
 ```bash
-stellar contract invoke \
-  --id lumina-registry \
-  --source lumina-deployer \
-  --network testnet \
-  -- upgrade \
-  --admin <admin-address-G...> \
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- propose_upgrade \
+  --proposer <admin-G...> \
   --new_wasm_hash <hash-from-upload>
+```
+
+`propose_upgrade` returns a proposal ID. Enough admins must approve to reach the
+threshold (`get_threshold`); each approval is recorded once:
+
+```bash
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- approve_proposal \
+  --admin <admin-G...> \
+  --proposal_id <id>
+```
+
+Once the threshold is reached the proposal is *ready*, and after
+`TIMELOCK_LEDGERS` (~24 h) anyone may execute it:
+
+```bash
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- execute_proposal --proposal_id <id>
 ```
 
 The swap takes effect for the *next* invocation; the call that performs it runs
 to completion under the old code and emits a `registry_upgraded` event carrying
-the admin, the new hash, and the version being replaced.
+the new hash and the version being replaced. Inspect the proposal at any point
+with `get_proposal`.
 
 ### 5. Verify
 
@@ -397,6 +439,25 @@ stellar contract invoke --id lumina-registry --source lumina-deployer \
 
 `get_version` should report the new value and the registrations should come back
 unchanged.
+
+### Staking survives upgrade
+
+Because `StakeToken`, `Treasury`, `PreviousStakeToken`, and `PreviousTreasury`
+are stored as `DataKey` entries in instance storage, they persist across a
+Soroban upgrade. The new code will decode these entries correctly as long as:
+
+- The `DataKey` enum variant names are preserved (adding new variants is safe,
+  renaming breaks entries)
+- The `Address` type shape is unchanged (it is — `#[contracttype]` Address is
+  just a 32-byte hash)
+
+What breaks it: changing the `StakeToken` or `Treasury` field types or removing
+the `DataKey` variants without a migration. The storage compatibility rules in
+the previous section apply.
+
+After an upgrade, callers can read the new staking config with
+`get_staking_config()` and see the `PreviousStakeToken`/`PreviousTreasury`
+values emitted by the `staking_configured` event if a reconfiguration occurred.
 
 ### Storage compatibility
 
@@ -417,23 +478,23 @@ code wrote:
   downstream callers can branch on `get_version()`.
 
 `registry/src/lib.rs`'s test suite deploys the registry from wasm, registers
-contracts, upgrades to `registry-v2/`, and asserts the registrations are still
-readable by the new code — including a rollback back to the previous wasm hash.
+contracts, drives a governance upgrade to `registry-v2/`, and asserts the
+registrations are still readable by the new code.
 
 ### Rollback
 
+Rolling back is the same proposal flow, pointed at the hash you recorded in
+step 2:
+
 ```bash
-stellar contract invoke \
-  --id lumina-registry \
-  --source lumina-deployer \
-  --network testnet \
-  -- upgrade \
-  --admin <admin-address-G...> \
+stellar contract invoke --id lumina-registry --source lumina-deployer \
+  --network testnet -- propose_upgrade \
+  --proposer <admin-G...> \
   --new_wasm_hash <hash-recorded-in-step-2>
+# ... approve to threshold, wait out the timelock, execute.
 ```
 
-Two caveats. Rolling back restores the old *code* only — any storage the new
-version wrote stays, so a rollback across a migration needs its own reverse
-migration. And rollback runs through the same `upgrade` entrypoint, so it is
-only available while the deployed code still exports one: a version that drops
-`upgrade` is permanent.
+Caveats. Rolling back restores the old *code* only — any storage the new version
+wrote stays, so a rollback across a migration needs its own reverse migration.
+And because there is no single-signer `upgrade`, a rollback needs the same
+governance threshold and timelock as any other upgrade.

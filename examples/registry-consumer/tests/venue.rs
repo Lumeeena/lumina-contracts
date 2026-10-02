@@ -19,9 +19,7 @@ use soroban_sdk::{
 };
 
 mod registry_wasm {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/lumina_registry.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/lumina_registry.wasm");
 }
 
 /// Fee the venue charges a listed-but-unverified counterparty.
@@ -61,6 +59,12 @@ impl TestToken {
             .persistent()
             .get(&TokenKey::Balance(from))
             .unwrap_or(0)
+    }
+
+    /// SEP-41 decimals. The registry probes it when staking is configured, so
+    /// a token without it cannot be opened as the stake token at all.
+    pub fn decimals(_env: Env) -> u32 {
+        7
     }
 
     /// Move `amount` from `from` to `to`, reverting on an insufficient balance.
@@ -153,19 +157,18 @@ impl Fixture {
     /// Approve, wait out the timelock, execute.
     fn execute(&self, proposal: u32) {
         self.advance(20_000);
-        self.registry_client().execute_proposal(&proposal);
+        self.registry_client().execute_proposal(&self.admin, &proposal);
     }
 
     fn register(&self, name: &str, which: &[Category]) -> Address {
         let target = Address::generate(&self.env);
-        self.registry_client()
-            .register_contract(
-                &self.owner,
-                &target,
-                &String::from_str(&self.env, name),
-                &String::from_str(&self.env, "a counterparty"),
-                &self.wasm_categories(which),
-            );
+        self.registry_client().register_contract(
+            &self.owner,
+            &target,
+            &String::from_str(&self.env, name),
+            &String::from_str(&self.env, "a counterparty"),
+            &self.wasm_categories(which),
+        );
         target
     }
 
@@ -173,7 +176,8 @@ impl Fixture {
         let proposal = self
             .registry_client()
             .propose_set_verified(&self.admin, target, &true);
-        self.registry_client().approve_proposal(&self.admin, &proposal);
+        self.registry_client()
+            .approve_proposal(&self.admin, &proposal);
         self.execute(proposal);
     }
 
@@ -209,7 +213,14 @@ fn setup() -> Fixture {
     let venue = env.register(LuminaListedVenue, ());
     let token = env.register(TestToken, ());
 
-    let f = Fixture { env, registry, venue, admin, owner, token };
+    let f = Fixture {
+        env,
+        registry,
+        venue,
+        admin,
+        owner,
+        token,
+    };
 
     // Staking is closed until governance names a token and a treasury, so the
     // discount path is unreachable until this runs. It is also a cross-contract
@@ -229,14 +240,13 @@ fn setup() -> Fixture {
 #[test]
 fn another_contract_queries_registration_status_through_a_typed_interface() {
     let f = setup();
-    f.registry_client()
-        .register_contract(
-            &f.owner,
-            &f.registry,
-            &String::from_str(&f.env, "Lumina Registry"),
-            &String::from_str(&f.env, "The registry itself"),
-            &f.wasm_categories(&[Category::Infrastructure]),
-        );
+    f.registry_client().register_contract(
+        &f.owner,
+        &f.registry,
+        &String::from_str(&f.env, "Lumina Registry"),
+        &String::from_str(&f.env, "The registry itself"),
+        &f.wasm_categories(&[Category::Infrastructure]),
+    );
 
     // This is the integration, in four lines, with no hand-built `Val`s and no
     // symbol strings that could silently be misspelled.
@@ -288,14 +298,12 @@ fn a_listed_counterparty_is_accepted_and_charged_the_standard_fee() {
     let f = setup();
     let target = f.register("Quorum", &[Category::Infrastructure]);
 
-    let listed = f
-        .venue_client()
-        .list_counterparty(
-            &f.owner,
-            &f.registry,
-            &target,
-            &f.interface_categories(&[Category::Infrastructure]),
-        );
+    let listed = f.venue_client().list_counterparty(
+        &f.owner,
+        &f.registry,
+        &target,
+        &f.interface_categories(&[Category::Infrastructure]),
+    );
 
     assert_eq!(listed.operator, target);
     assert!(!listed.verified);
@@ -310,12 +318,8 @@ fn an_unregistered_counterparty_is_rejected() {
     let stranger = Address::generate(&f.env);
 
     assert_eq!(
-        f.venue_client().try_list_counterparty(
-            &f.owner,
-            &f.registry,
-            &stranger,
-            &Vec::new(&f.env),
-        ),
+        f.venue_client()
+            .try_list_counterparty(&f.owner, &f.registry, &stranger, &Vec::new(&f.env),),
         Err(Ok(VenueError::OperatorNotListed))
     );
     assert_eq!(f.venue_client().get_counterparty(&stranger), None);
@@ -342,13 +346,12 @@ fn a_counterparty_in_an_accepted_category_among_several_is_accepted() {
     let f = setup();
     let target = f.register("A Bridge", &[Category::Gaming, Category::Infrastructure]);
 
-    f.venue_client()
-        .list_counterparty(
-            &f.owner,
-            &f.registry,
-            &target,
-            &f.interface_categories(&[Category::Infrastructure, Category::Payments]),
-        );
+    f.venue_client().list_counterparty(
+        &f.owner,
+        &f.registry,
+        &target,
+        &f.interface_categories(&[Category::Infrastructure, Category::Payments]),
+    );
 }
 
 #[test]
@@ -358,9 +361,9 @@ fn a_verified_staked_counterparty_earns_the_discount() {
     f.stake(&target, STAKE);
     f.verify(&target);
 
-    let listed = f
-        .venue_client()
-        .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
+    let listed =
+        f.venue_client()
+            .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
 
     assert!(listed.verified);
     assert_eq!(listed.stake, STAKE);
@@ -375,9 +378,9 @@ fn verification_alone_does_not_earn_the_discount() {
     let target = f.register("Quorum", &[Category::Infrastructure]);
     f.verify(&target); // verified, but nothing staked
 
-    let listed = f
-        .venue_client()
-        .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
+    let listed =
+        f.venue_client()
+            .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
 
     assert!(listed.verified);
     assert_eq!(listed.stake, 0);
@@ -390,9 +393,9 @@ fn stake_alone_does_not_earn_the_discount() {
     let target = f.register("Quorum", &[Category::Infrastructure]);
     f.stake(&target, STAKE); // staked, but never verified
 
-    let listed = f
-        .venue_client()
-        .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
+    let listed =
+        f.venue_client()
+            .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
 
     assert!(!listed.verified);
     assert_eq!(listed.fee_bps, STANDARD_FEE_BPS);
@@ -422,7 +425,9 @@ fn deposits_are_routed_through_a_listed_counterparty() {
     TestTokenClient::new(&f.env, &f.token).mint(&f.owner, &10_000);
 
     // 10_000 * 50 / 10_000 = 50
-    let fee = f.venue_client().deposit(&f.owner, &target, &f.token, &10_000);
+    let fee = f
+        .venue_client()
+        .deposit(&f.owner, &target, &f.token, &10_000);
     assert_eq!(fee, 50);
     assert_eq!(
         TestTokenClient::new(&f.env, &f.token).balance(&f.venue),
@@ -451,7 +456,8 @@ fn a_zero_deposit_is_rejected() {
         .list_counterparty(&f.owner, &f.registry, &target, &Vec::new(&f.env));
 
     assert_eq!(
-        f.venue_client().try_deposit(&f.owner, &target, &f.token, &0),
+        f.venue_client()
+            .try_deposit(&f.owner, &target, &f.token, &0),
         Err(Ok(VenueError::InvalidAmount))
     );
 }
