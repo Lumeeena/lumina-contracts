@@ -36,7 +36,7 @@ fn govern_upgrade(
     let pid = client.propose_upgrade(admin, new_wasm_hash);
     client.approve_proposal(admin, &pid);
     advance_ledger(env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(admin, &pid);
 }
 
 /// Build a `Vec<Category>` from a slice.

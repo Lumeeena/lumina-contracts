@@ -197,7 +197,7 @@ fn registry_upgraded_event_is_emitted() {
     let pid = client.propose_upgrade(&admin, &v2_hash);
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "registry_upgraded");
 }
 
@@ -247,7 +247,7 @@ fn proposal_executed_event_is_emitted() {
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
 
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "proposal_executed");
 }
 
@@ -281,7 +281,7 @@ fn admin_added_event_is_emitted() {
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "admin_added");
 }
 
@@ -301,13 +301,13 @@ fn threshold_changed_event_is_emitted() {
     let pid_add = client.propose_add_admin(&admin, &new_admin);
     client.approve_proposal(&admin, &pid_add);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid_add);
+    client.execute_proposal(&admin, &pid_add);
 
     let pid = client.propose_change_threshold(&admin, &2);
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "threshold_changed");
 }
 
@@ -322,7 +322,7 @@ fn verification_set_event_is_emitted() {
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "verification_set");
 }
 
@@ -335,7 +335,7 @@ fn allowlist_mode_changed_event_is_emitted() {
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "allowlist_mode_changed");
 }
 
@@ -349,7 +349,7 @@ fn owner_allowlisted_event_is_emitted() {
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "owner_allowlisted");
 }
 
@@ -362,7 +362,7 @@ fn registration_rate_limit_changed_event_is_emitted() {
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "registration_rate_limit_changed");
 }
 
@@ -375,7 +375,7 @@ fn registration_fee_set_event_is_emitted() {
 
     client.approve_proposal(&admin, &pid);
     advance_ledger(&env, lumina_registry::TIMELOCK_LEDGERS);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_event_emitted(&env, &client.address, "registration_fee_set");
 }
 

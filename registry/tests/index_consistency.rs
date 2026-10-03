@@ -68,11 +68,7 @@ pub fn assert_indexes_consistent(env: &Env, client: &LuminaRegistryClient) {
 
     env.as_contract(contract, || {
         // ── 1. Collect all stored entries ──────────────────────────────────
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllContracts)
-            .unwrap_or(Vec::new(env));
+        let all = LuminaRegistry::all_contracts(env);
 
         for contract_id in all.iter() {
             let entry = env

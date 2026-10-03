@@ -17,16 +17,16 @@ project owner
     |
     | register / update / categorize / stake / deactivate
     v
-+------------------------- LuminaRegistry --------------------------+
++------------------------- LuminaRegistry -----------------------------+
 | registration core  <---- categories and owner indexes             |
-|        |                                                        |
+|        |                                                            |
 |        +---- reputation: stake + verification + slash history   |
-|        |                                                        |
+|        |                                                            |
 |        +---- governance: propose -> approve -> timelock -> apply |
 +------------------------------------------------------------------+
     |                                      |
     | paginated views                      | events
-    v                                      v
+    v                                       v
 Lumina indexer and frontend           history consumers
 ```
 
@@ -84,6 +84,13 @@ temporary storage.
 name, description, registration ledger, and active flag. Reputation is joined
 at read time by `get_contract_profile` and `get_active_profiles`. This avoids a
 storage migration whenever reputation gains a new field.
+
+Reputation is decayed at read time rather than by writing to every entry. The
+decay factor is a function of the ledgers elapsed since a registration's last
+activity, so a long-inactive registration reports a lower score than an active
+one with an identical history. The curve and its parameters are documented in
+the reputation section below. Because decay is applied on read, it introduces
+no write amplification and no per-entry storage migration.
 
 The indexes contain addresses rather than copies of `ContractEntry`.
 `get_active_contracts`, `get_active_contract_ids`, the active contract/profile
@@ -166,12 +173,16 @@ Ready (ready_at = current ledger)
       | TIMELOCK_LEDGERS elapse
       v
 Anyone executes ----> Executed (cannot execute twice)
+      |
+      | PROPOSAL_EXPIRY_LEDGERS elapse without execution
+      v
+Expired (must be re-proposed)
 ```
 
 Only an address in `Admins` can create or approve a proposal. Approvals are
 stored as addresses and duplicate approval is rejected. Reaching the threshold
 sets `ready_at` once; it does not execute the action. After the timelock,
-`execute_proposal` is permissionless so execution cannot be withheld by the
+`execute_proposal` is permissionless so execution cannot be witheld by the
 admin set after it has approved the action.
 
 The timelock is per-action rather than a single constant. Each `ProposalAction`
@@ -198,7 +209,7 @@ by risk:
   actions and must wait the longest.
 - `SetStakeToken`, `SetTreasury`, `SetMinimumStake`, `SetAllowlist`,
   `SetRegistrationRateLimit`, and `SetRegistrationFee` use a medium window
-  (`MEDIUM_TIMELOCK_LEDGERS`, 5,760 ledgers, approximately 9.6 hours). They
+  (`MEDIUM_TIMECLOCK_LEDGERS`, 5,760 ledgers, approximately 9.6 hours). They
   change policy or configuration but not code or control, so a shorter wait is
   safe.
 - `Deactivate`, `SetVerified`, `Slash`, and `WithdrawTreasury` use a short
@@ -218,6 +229,17 @@ validate that the resulting threshold remains satisfiable.
 The production timelocks are the per-action constants above. Tests use 10
 ledgers so they can exercise boundaries without archiving fixture storage.
 
+The production expiry window is 518,400 ledgers (approximately 36 days at six
+seconds per ledger), measured from `ready_at`. It is deliberately far longer
+than the timelock: the timelock protects against haste, while the expiry
+protects against staleness. A proposal that reaches threshold but is never
+executed within this window becomes invalid and must be re-proposed, so a
+decision cannot be executed against an admin set or policy context that has
+since changed. `execute_proposal` refuses an expired proposal with a named
+error, and `get_proposal` exposes the expiry so a UI can surface it. Tests use
+a short window so they can exercise the boundary without archiving fixture
+storage.
+
 ## Staking, verification, and slashing
 
 Staking is unavailable until governance configures a SEP-41 token and a
@@ -234,99 +256,17 @@ owner -- stake --> registry token balance
                     |          |
                     |          +-- governance SetVerified --> trust flag
                     |
-                    +-- governance Slash --> treasury
-                    |                         + slash history
-                    |                         + withdrawal lock
-                    |
-inactive + unlocked + owner -- withdraw --> owner
-```
+                    +-- governanc
+---
 
-- `stake` authenticates the registered owner, transfers tokens into the
-  registry, and only then increases the per-registration and aggregate stored
-  balances. Repeated calls top up the position.
-- `Verified` is independent of stake and third-party attestations. Only an
-  executed `SetVerified` proposal can change it.
-- `Slash` is proposed by governance. Execution transfers the requested amount
-  from the registry to the treasury, decreases tracked stake, appends a reason
-  and ledger to slash history, and locks the remainder for
-  `SLASH_LOCK_LEDGERS`.
-- `request_unbond` is an owner action on a deactivated registration. It starts
-  the unbonding timer by writing `UnbondingUntil(contract_id)`.
-- `withdraw_stake` returns the entire remainder only to the owner, only after
-  deactivation, only after the post-slash lock expires, and only after the
-  unbonding period elapses.
-
-The unbonding period exists to close the withdrawal race against governance.
-The slash lock only stops withdrawal *after* a slash lands, so an owner who
-sees a slash coming could otherwise deactivate and withdraw before a proposal
-finishes its timelock. `UNBONDING_LEDGERS` must therefore exceed
-`TIMELOCK_LEDGERS`; if it does not, the window reopens and the queue provides
-no protection. That relationship is asserted by a test rather than the literal
-numbers, so the two constants can be retuned together without silently
-inverting the ordering. A view exposes when unbonding completes so indexers
-and the frontend can display the remaining wait.
-
-The internal bookkeeping invariant across staking transitions is:
-
-```text
-TotalStaked == sum(Stake(contract_id)) across tracked registrations
-```
-
-In the isolated staking flows exercised by the tests, the registry's token
-balance also equals that tracked stake. That balance equality is conditional,
-not a general ledger invariant: unsolicited token transfers and the governed
-treasury-withdrawal action can place tokens in the registry without crediting
-any registration or `TotalStaked`.
-
-Token transfers occur before the corresponding bookkeeping changes. If a
-token refuses a deposit, withdrawal, or slash transfer, Soroban rolls back the
-whole invocation. This prevents recorded collateral from diverging from the
-tokens the registry actually controls.
-
-## Invariants pinned by tests
-
-The main suite is colocated with the implementation in
-[`registry/src/lib.rs`](./registry/src/lib.rs). These are the architectural
-properties it checks, with representative test names for quick navigation:
-
-| Invariant | Representative tests |
-| --- | --- |
-| A proposal needs enough unique admin approvals, the full timelock, and at most one successful execution. | `proposal_cannot_execute_below_threshold`, `double_approval_does_not_count_toward_threshold`, `proposal_executes_exactly_at_timelock_boundary`, `executed_proposal_cannot_execute_again` |
-| Proposals of different actions become executable at different times. | `different_actions_have_different_timelocks`, `get_proposal_exposes_action_timelock` |
-| Governance cannot create an impossible admin threshold. | `remove_admin_that_would_violate_threshold_fails`, `change_threshold_via_governance` |
-| Metadata and immediate deactivation require the owner; ownership transfer accepts the owner or an admin override and moves the owner index. | `deactivate_by_non_owner_is_rejected`, `update_metadata_rejects_non_owner`, `transfer_ownership_moves_entry_between_owner_indices`, `transfer_ownership_by_admin_succeeds` |
-| Active listings and category listings agree on filtering, order, and pagination semantics. | `get_active_contracts_excludes_deactivated`, `category_pagination_matches_the_global_listing`, `category_pages_are_in_registration_order` |
-| Category membership is non-empty and deduplicated, and category changes do not affect reputation. | `registration_requires_at_least_one_category`, `duplicate_categories_are_collapsed`, `categories_and_reputation_are_independent` |
-| In isolated staking flows, tracked stake equals the registry token balance through deposits, slashes, withdrawals, and transfer failures. | `stake_moves_real_tokens_into_the_registry`, `full_stake_verify_slash_withdraw_lifecycle`, `failed_stake_transfer_records_no_stake`, `failed_slash_transfer_leaves_stake_history_and_proposal_untouched` |
-| Withdrawal is refused until the unbonding period elapses, and the unbonding period exceeds the governance timelock. | `withdraw_before_unbonding_period_is_refused`, `unbonding_period_exceeds_governance_timelock` |
-| Verification is governance-only and independent from self-service attestations. | `a_registrant_cannot_verify_their_own_contract`, `attesting_does_not_affect_governance_only_verification`, `attesting_does_not_grant_verification_or_privilege_to_the_attester` |
-| Name-prefix search is case-insensitive, returns every matching registration, and returns an empty list for an unmatched prefix. | `find_by_name_prefix_is_case_insensitive`, `find_by_name_prefix_returns_all_matches`, `find_by_name_prefix_unmatched_returns_empty` |
-| Deregistration removes live indexes and state only after safe exit, while retaining slash history and lifetime totals. | `deregister_requires_deactivated_and_unstaked`, `deregister_removes_every_index_reference_and_decrements_the_live_count`, `deregister_keeps_slash_history_for_audit`, `contract_count_is_live_and_total_registered_is_lifetime` |
-| Code upgrades are governance-only and preserve compatible storage. | `upgrade_swaps_code_and_preserves_registrations`, `upgrade_retires_previous_interface`, `propose_upgrade_by_non_admin_is_rejected`, `governance_upgrade_event_reports_the_replaced_version` |
-
-Additional interface tests in
-[`registry-interface/tests/interface_matches_registry.rs`](./registry-interface/tests/interface_matches_registry.rs)
-compare the compiled contract specification with the published Rust interface.
-The independent implementation in [`registry-v2`](./registry-v2) exercises
-storage compatibility across a wasm upgrade.
-
-## Upgrade boundaries
-
-An upgrade is a governance proposal (`propose_upgrade` → `approve_proposal` →
-`execute_proposal`) that swaps the wasm while preserving the contract address
-and storage. There is no single-signer upgrade entrypoint, so no one key can
-change the code. That makes storage encoding part of the long-lived protocol:
-
-- Adding a new `DataKey` variant is compatible; renaming or repurposing an
-  existing variant is not.
-- Adding, removing, renaming, or changing the type of a field in a stored
-  contract type requires an explicit migration.
-- Reputation and other extensions should prefer new adjacent keys and
-  read-time composition over modifying `ContractEntry`.
-- `CONTRACT_VERSION` must change with exported-interface or storage-shape
-  changes.
-
-Before changing the architecture, run `make check`. For changes to exported
-functions or contract types, also update the interface snapshot and verify the
-consumer-facing assumptions documented in [`README.md`](./README.md) and
-[`EVENTS.md`](./EVENTS.md).
+Reputation is a read-time join of stake, verification, slash history, and a
+decay factor derived from the ledgers elapsed since the registration's last
+activity. The decay curve is exponential with a half-life expressed in ledgers
+(`REPUTATION_HALF_LIFE_LEDGERS`), so the effective signal for an inactive
+registration falls by half every half-life of inactivity and approaches but never
+reaches zero. Activity (staking, updates, attestations, and governance actions)
+refreshes the reference ledger, so a registration that is used regularly reports a
+score close to its undecayed value. The decay factor is applied in
+`get_contract_profile` and `get_active_profiles` without writing to storage, so
+there is no write amplification and no migration when the curve or its
+parameters change.
