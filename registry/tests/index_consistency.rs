@@ -12,9 +12,7 @@
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{Address, Env, Vec};
 
-use lumina_registry::{
-    Category, ContractEntry, DataKey, LuminaRegistry, LuminaRegistryClient,
-};
+use lumina_registry::{Category, ContractEntry, DataKey, LuminaRegistry, LuminaRegistryClient};
 
 /// Build a `Vec<Category>` from a slice.
 fn cats(env: &Env, list: &[Category]) -> Vec<Category> {
@@ -55,6 +53,7 @@ fn register_sample(env: &Env, client: &LuminaRegistryClient) -> (Address, Addres
 }
 
 /// Advance the mock ledger by `n` ledgers.
+#[allow(dead_code)]
 fn advance_ledger(env: &Env, n: u32) {
     let seq = env.ledger().sequence();
     env.ledger().set_sequence_number(seq + n);
@@ -69,11 +68,7 @@ pub fn assert_indexes_consistent(env: &Env, client: &LuminaRegistryClient) {
 
     env.as_contract(contract, || {
         // ── 1. Collect all stored entries ──────────────────────────────────
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllContracts)
-            .unwrap_or(Vec::new(env));
+        let all = LuminaRegistry::all_contracts(env);
 
         for contract_id in all.iter() {
             let entry = env
@@ -164,8 +159,7 @@ pub fn assert_indexes_consistent(env: &Env, client: &LuminaRegistryClient) {
                     .unwrap_or(Vec::new(env));
                 assert!(
                     index.contains(&contract_id),
-                    "Contract declares category {:?} but is not in ByCategory index",
-                    category
+                    "Contract declares category {category:?} but is not in ByCategory index"
                 );
             }
         }
@@ -308,7 +302,8 @@ fn helper_detects_corrupted_all_contracts_index() {
             .get(&DataKey::ContractCount)
             .unwrap_or(0);
         assert_ne!(
-            all.len() as u32, count,
+            all.len(),
+            count,
             "AllContracts and ContractCount should disagree after corruption"
         );
     });
