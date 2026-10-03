@@ -3011,6 +3011,29 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
+
+    fn normalize_name(env: &Env, name: &String) -> String {
+        let len = (name.len() as usize).min(256);
+        let mut raw = [0u8; 256];
+        let slice = &mut raw[..len];
+        name.copy_into_slice(slice);
+        let start = slice
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(len);
+        let end = slice
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(start);
+        let trimmed = &slice[start..end];
+        let mut out = [0u8; 256];
+        for (i, b) in trimmed.iter().enumerate() {
+            out[i] = if b.is_ascii_uppercase() { *b + 32 } else { *b };
+        }
+        String::from_bytes(env, &out[..trimmed.len()])
+    }
+
     fn save_proposal(env: &Env, proposal: &Proposal) {
         env.storage()
             .instance()
