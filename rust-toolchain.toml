@@ -1,3 +1,4 @@
 [toolchain]
 channel = "1.88.0"
-targets = ["wasm32v1-none"]
+channel = "1.88.0"
+targets = ["wasm32v1-none", "wasm32-unknown-unknown"]

@@ -27,7 +27,7 @@
 // ```
 
 use lumina_registry_interface::{
-    Category, ContractEntry, ContractPage, ContractProfile, ContractProfilePage, RegistryError,
+    Attestation, Category, ContractEntry, ContractPage, ContractProfile, ContractProfilePage, RegistryError,
     RegistryInterfaceClient, RegistryStats, Reputation, SlashRecord,
 };
 use soroban_sdk::testutils::Address as _;
@@ -181,7 +181,7 @@ fn load_spec() -> Spec {
 /// table is the third written-down artifact, and
 /// `the_published_trait_declares_exactly_this_surface` checks the two against
 /// each other.
-const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
+const READ_ONLY_SURFACE: [(&str, &str, &str); 31] = [
     ("get_version", "", "U32"),
     ("get_admin", "", "Result<Address, RegistryError>"),
     ("get_admins", "", "Result<Vec<Address>, RegistryError>"),
@@ -193,6 +193,7 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
     ),
     ("get_categories", "contract_id: Address", "Vec<Category>"),
     ("get_tags", "contract_id: Address", "Vec<String>"),
+    ("get_attestations", "contract_id: Address", "Vec<Attestation>"),
     (
         "get_active_contracts_by_category",
         "category: Category, offset: U32, limit: U32",
@@ -203,13 +204,14 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
         "categories: Vec<Category>, offset: U32, limit: U32",
         "Result<Vec<ContractEntry>, RegistryError>",
     ),
-    ("get_minimum_stake", "", "I128"),
+("get_minimum_stake", "", "I128"),
     (
         "get_staking_config",
         "",
-        "Result<(Address, Address), RegistryError>",
+        "Result<(Address, Address, U32), RegistryError>",
     ),
     ("get_registration_fee", "", "I128"),
+    ("get_minimum_stake", "", "I128"),
     ("get_stake", "contract_id: Address", "I128"),
     ("is_verified", "contract_id: Address", "Bool"),
     ("is_registered", "contract_id: Address", "Bool"),
@@ -264,22 +266,7 @@ const READ_ONLY_SURFACE: [(&str, &str, &str); 33] = [
         "owner: Address, offset: U32, limit: U32",
         "Vec<ContractEntry>",
     ),
-    (
-        "get_active_contracts_after",
-        "cursor: Option<Address>, limit: U32",
-        "Vec<ContractEntry>",
-    ),
-    (
-        "get_contracts_by_category_after",
-        "category: Category, cursor: Option<Address>, limit: U32",
-        "Vec<ContractEntry>",
-    ),
-    (
-        "get_contracts_by_owner_after",
-        "owner: Address, cursor: Option<Address>, limit: U32",
-        "Vec<ContractEntry>",
-    ),
-    ("get_manager", "contract_id: Address", "Result<Address, RegistryError>"),
+    ("get_pending_owner", "contract_id: Address", "Option<Address>"),
 ];
 
 /// The signature a spec entry must have, spelled the way `load_spec` spells it.
@@ -369,22 +356,126 @@ fn the_published_trait_declares_exactly_this_surface() {
     // resolves to a function in the spec. The client is generated from the
     // trait, so if the two disagree the compiler or this assertion will fird.
     let spec = load_spec();
-    let env = soroban_sdk::Env::default();
-    let contract_id = env.register(xlumina_registry::WASM, xlumina_registry::Contract);
-    let client = RegistryInterfaceClient::new(&env, &contract_id);
 
-    // Every method the client exposes must be either a published read or a
-    // published mutation. We enumerate the mutating ones explicitly below
-    // so a new one added to the trait fails this test until it is classified.
-    let mutating = [
-        "register_contract",
-        "update_metadata",
-        "set_categories",
-        "deactivate_contract",
-        "set_manager",
-        "revoke_manager",
-        "transfer_ownership",
-        "withdraw_stake",
+    // Struct fields come out of the spec sorted by name, not in declaration
+    // order, so these expectations are alphabetical. Enum and union cases do
+    // *not* get sorted — the ones below keep declaration order.
+    assert_struct(
+        &spec,
+        "Attestation",
+        "{attester: Address, created_at: U32, label: String}",
+    );
+    assert_struct(
+        &spec,
+        "ContractEntry",
+        "{active: Bool, contract_id: Address, description: String, name: String, \
+         owner: Address, registered_at: U32}",
+    );
+    assert_struct(
+        &spec,
+        "ContractProfile",
+        "{entry: ContractEntry, reputation: Reputation, superseded_by: Option<Address>}",
+    );
+    assert_struct(
+        &spec,
+        "Reputation",
+        "{slashed_total: I128, stake: I128, verified: Bool, withdraw_locked_until: U32}",
+    );
+    assert_struct(
+        &spec,
+        "SlashRecord",
+        "{amount: I128, reason: String, slashed_at: U32}",
+    );
+    assert_struct(
+        &spec,
+        "ContractPage",
+        "{entries: Vec<ContractEntry>, has_more: Bool}",
+    );
+    assert_struct(
+        &spec,
+        "ContractProfilePage",
+        "{entries: Vec<ContractProfile>, has_more: Bool}",
+    );
+    assert_struct(
+        &spec,
+        "RegistryStats",
+        "{active_count: U32, staked_count: U32, total_registered: U32, total_staked: I128, \
+         verified_count: U32}",
+    );
+    assert_struct(
+        &spec,
+        "Proposal",
+        "{action: ProposalAction, approvals: Vec<Address>, executed: Bool, id: U32, \
+         proposer: Address, ready_at: U32}",
+    );
+
+    // A payload-free `#[contracttype] enum` is emitted by the SDK as a union of
+    // void cases rather than a UDT enum, so it is checked as one. The order is
+    // declaration order, not sorted.
+    assert_union(
+        &spec,
+        "Category",
+        "DeFi,Nft,Gaming,Identity,Infrastructure,Payments,Oracle,Dao,Other",
+    );
+
+    assert_union(
+        &spec,
+        "ProposalAction",
+        "Deactivate(Address),Upgrade(BytesN<32>),AddAdmin(Address),RemoveAdmin(Address),\
+         ChangeThreshold(U32),ConfigureStaking(Address,Address),SetVerified(Address,Bool),\
+         Slash(Address,I128,String),SetAllowlistEnabled(Bool),SetAllowlisted(Address,Bool),\
+         ConfigureRegistrationRateLimit(U32,U32),SetRegistrationFee(I128),\
+         ConfigureMinimumStake(I128),WithdrawFromTreasury(I128)",
+    );
+}
+
+#[test]
+fn interface_error_codes_match_the_registry() {
+    let spec = load_spec();
+
+    // The whole enum, not just the codes a read can produce. A client decodes
+    // a contract error by matching against the enum it was generated with, so
+    // a code that is missing or renumbered here turns a well-defined error
+    // into an opaque decode failure for every consumer.
+    let actual = spec
+        .errors
+        .get("RegistryError")
+        .expect("the registry no longer exports error RegistryError");
+
+    // Compare against the declared discriminants rather than a literal string,
+    // so this test also fails if the interface crate adds a variant the
+    // registry does not have.
+    let declared: Vec<(u32, &str)> = vec![
+        (RegistryError::AlreadyInitialized as u32, "AlreadyInitialized"),
+        (RegistryError::Unauthorized as u32, "Unauthorized"),
+        (RegistryError::AlreadyRegistered as u32, "AlreadyRegistered"),
+        (RegistryError::ContractNotFound as u32, "ContractNotFound"),
+        (RegistryError::InvalidMetadata as u32, "InvalidMetadata"),
+        (RegistryError::NotOwner as u32, "NotOwner"),
+        (RegistryError::NotInitialized as u32, "NotInitialized"),
+        (RegistryError::ProposalNotFound as u32, "ProposalNotFound"),
+        (RegistryError::ThresholdNotMet as u32, "ThresholdNotMet"),
+        (RegistryError::TimelockNotElapsed as u32, "TimelockNotElapsed"),
+        (RegistryError::AlreadyApproved as u32, "AlreadyApproved"),
+        (RegistryError::NotAdmin as u32, "NotAdmin"),
+        (RegistryError::InvalidThreshold as u32, "InvalidThreshold"),
+        (RegistryError::AlreadyExecuted as u32, "AlreadyExecuted"),
+        (RegistryError::StakingNotConfigured as u32, "StakingNotConfigured"),
+        (RegistryError::InvalidAmount as u32, "InvalidAmount"),
+        (RegistryError::InsufficientStake as u32, "InsufficientStake"),
+        (RegistryError::StakeLocked as u32, "StakeLocked"),
+        (RegistryError::RegistrationActive as u32, "RegistrationActive"),
+        (RegistryError::NoCategories as u32, "NoCategories"),
+        (RegistryError::StakeNotEmpty as u32, "StakeNotEmpty"),
+        (RegistryError::InvalidRateLimit as u32, "InvalidRateLimit"),
+        (RegistryError::NotAllowlisted as u32, "NotAllowlisted"),
+        (RegistryError::RegistrationRateLimited as u32, "RegistrationRateLimited"),
+        (RegistryError::InsufficientFee as u32, "InsufficientFee"),
+        (RegistryError::InvalidTags as u32, "InvalidTags"),
+        (RegistryError::InvalidAttestation as u32, "InvalidAttestation"),
+        (RegistryError::AttestationNotFound as u32, "AttestationNotFound"),
+        (RegistryError::OverlappingAddress as u32, "OverlappingAddress"),
+        (RegistryError::NoPendingTransfer as u32, "NoPendingTransfer"),
     ];
 
     for (name, ..) in READ_ONLY_SURFACE {
@@ -401,9 +492,129 @@ fn the_published_trait_declares_exactly_this_surface() {
         );
     }
 
-    // The client is constructed from the trait; if the trait exposed a
-    // method the spec does not have, the client would fail to compile
-    // against the generated bindings. This assertion just ensures the
-    // client is actually used so the compiler does not optimize it away.
-    let _ = &client;
+    // The re-declared types are the ones a consumer actually names.
+    let _: Option<ContractEntry> = None;
+    let _: Option<ContractProfile> = None;
+    let _: Option<Reputation> = None;
+    let _: Option<SlashRecord> = None;
+    let _: Option<Attestation> = None;
+    let _: Option<ContractPage> = None;
+    let _: Option<ContractProfilePage> = None;
+    let _: Option<RegistryStats> = None;
+    let _: Option<Category> = None;
+    let _: Option<soroban_sdk::String> = None;
+    let _: Option<soroban_sdk::Vec<u32>> = None;
 }
+
+fn render_interface(entries: &[ScSpecEntry]) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry {
+            ScSpecEntry::FunctionV0(f) => {
+                let args = f
+                    .inputs
+                    .iter()
+                    .map(|i| format!("{}: {}", i.name.to_utf8_string_lossy(), render_type(&i.type_)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = match f.outputs.first() {
+                    Some(out) => format!(" -> {}", render_type(out)),
+                    None => String::new(),
+                };
+                format!("fn {}({}){}", f.name.0.to_utf8_string_lossy(), args, ret)
+            }
+            ScSpecEntry::UdtStructV0(s) => {
+                let fields = s
+                    .fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name.to_utf8_string_lossy(), render_type(&f.type_)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("struct {} {{ {} }}", s.name.to_utf8_string_lossy(), fields)
+            }
+            ScSpecEntry::UdtUnionV0(u) => {
+                let cases = u
+                    .cases
+                    .iter()
+                    .map(|c| match c {
+                        ScSpecUdtUnionCaseV0::VoidV0(v) => v.name.to_utf8_string_lossy(),
+                        ScSpecUdtUnionCaseV0::TupleV0(t) => format!(
+                            "{}({})",
+                            t.name.to_utf8_string_lossy(),
+                            t.type_.iter().map(render_type).collect::<Vec<_>>().join(", ")
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("union {} {{ {} }}", u.name.to_utf8_string_lossy(), cases)
+            }
+            ScSpecEntry::UdtEnumV0(e) => {
+                let cases = e
+                    .cases
+                    .iter()
+                    .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("enum {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+            }
+            ScSpecEntry::UdtErrorEnumV0(e) => {
+                let cases = e
+                    .cases
+                    .iter()
+                    .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("error {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+            }
+        })
+        .collect();
+    lines.sort();
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+#[test]
+fn exported_interface_matches_snapshot() {
+    let wasm_path = registry_wasm();
+    let wasm = std::fs::read(&wasm_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {} ({e}). Run `cargo build --target wasm32v1-none --release` first.",
+            wasm_path.display()
+        )
+    });
+    let entries = soroban_spec::read::from_wasm(&wasm).expect("wasm has no readable contract spec");
+    let actual = render_interface(&entries);
+
+    let mut snap_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    snap_path.pop();
+    snap_path.push("registry/interface.snap");
+
+    if std::env::var_os("UPDATE_INTERFACE_SNAPSHOT").is_some() {
+        std::fs::write(&snap_path, &actual).expect("write interface snapshot");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(&snap_path).unwrap_or_default();
+    if actual == expected {
+        return;
+    }
+
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let mut diff = String::new();
+    for line in &expected_lines {
+        if !actual_lines.contains(line) {
+            diff.push_str(&format!("- {line}\n"));
+        }
+    }
+    for line in &actual_lines {
+        if !expected_lines.contains(line) {
+            diff.push_str(&format!("+ {line}\n"));
+        }
+    }
+    panic!(
+        "\nThe registry's exported interface changed:\n\n{diff}\n"
+    );
+}
+

@@ -13,14 +13,17 @@
 //! Lumina Registry v2 — the upgrade target used by the registry's upgrade tests.
 //!
 //! This crate exists so `registry`'s test suite can perform a *real* Soroban
-//! upgrade: deploy v1 from its wasm, register contracts, call `upgrade()` with
-//! this crate's wasm hash, and then prove that the swapped-in code both sees the
-//! v1 storage and exposes functionality v1 never had.
+//! upgrade: deploy the current release from its wasm, register contracts, drive
+//! `propose_upgrade` → `approve_proposal` → `execute_proposal` with this crate's
+//! wasm hash, and then prove that the swapped-in code both sees the v1 storage
+//! and exposes functionality v1 never had.
 //!
 //! It is deliberately **not** a full re-implementation of the registry. It
-//! carries only what the upgrade test needs to observe, plus `upgrade()` itself
-//! so an upgraded registry stays upgradeable. It is not deployed anywhere; a
-//! real v2 would be the registry crate itself with `CONTRACT_VERSION` bumped.
+//! carries only what the upgrade test needs to observe. It deliberately does
+//! **not** export an `upgrade` entrypoint: code changes are governance-only
+//! (#36), and a fixture with a single-signer upgrade would model the very path
+//! that was removed. It is not deployed anywhere; a real v2 would be the
+//! registry crate itself with `CONTRACT_VERSION` bumped.
 //!
 //! ## Why the types are duplicated rather than imported
 //!
@@ -47,6 +50,7 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
 };
+
 /// Always `lumina_registry::CONTRACT_VERSION + 1` — the value the upgrade test
 /// reads back to confirm the new code is the one now executing. The tests
 /// assert the relationship rather than the literal, so bumping the registry's
@@ -63,7 +67,9 @@ pub enum RegistryError {
     /// Referenced contract was not found.
     ContractNotFound = 4,
     /// The registry has no admin set.
-    NotInitialized = 7,
+NotInitialized   = 7,
+    /// Stake accounting would overflow i128.
+    StakeOverflow    = 8,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -103,13 +109,29 @@ pub enum DataKey {
     Contract(Address),
     /// List of contract addresses owned by an address.
     OwnerContracts(Address),
-    /// List of all registered contract addresses.
+    /// Legacy single-vector index kept only for migration compatibility.
     AllContracts,
+    /// Number of addresses in the chunked persistent global registration index.
+    AllContractsLength,
+    /// One chunk of the global registration index.
+    AllContractsPage(u32),
 }
 
 /// Upgraded v2 registry contract target used for upgrade testing.
 #[contract]
 pub struct LuminaRegistryV2;
+
+/// Event emitted when a category remap migration completes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CategoryRemapped {
+    /// The category variant being migrated away from.
+    pub from_category: u32,
+    /// The category variant being migrated to.
+    pub to_category: u32,
+    /// Number of registrations remapped in this call.
+    pub remapped: u32,
+}
 
 /// Compile-time guard: the fixture's `ContractEntry` must have the same field
 /// names and types as the real one. This mirrors the runtime check in the
@@ -178,26 +200,106 @@ impl LuminaRegistryV2 {
     /// real registry ever gains `count_active`, update this fixture instead.
     /// confirm the upgrade shipped new behaviour, not just a new version number.
     pub fn count_active(env: Env) -> u32 {
-        let all: Vec<Address> = env
+        let len: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::AllContracts)
-            .unwrap_or(Vec::new(&env));
+            .persistent()
+            .get(&DataKey::AllContractsLength)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::AllContracts)
+                    .map(|all: Vec<Address>| all.len())
+                    .unwrap_or(0)
+            });
 
         let mut active = 0u32;
-        for contract_id in all.iter() {
-            if let Some(entry) = env
+        let page_size = 64u32;
+        let pages = len.div_ceil(page_size);
+        for page in 0..pages {
+            let chunk: Vec<Address> = env
                 .storage()
                 .persistent()
-                .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
-            {
-                if entry.active {
-                    active += 1;
+                .get(&DataKey::AllContractsPage(page))
+                .unwrap_or(Vec::new(&env));
+            for contract_id in chunk.iter() {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+                {
+                    if entry.active {
+                        active += 1;
+                    }
                 }
             }
         }
 
         active
+    }
+
+    /// Record a slash against a registration.
+    ///
+    /// The retained history is capped at [`MAX_SLASH_HISTORY`] records: once
+    /// the cap is reached the oldest record is dropped before appending the
+    /// new one, so the entry never grows without bound. The aggregate
+    /// `slashed_total` is accumulated separately and therefore stays correct
+    /// regardless of which individual records have been pruned.
+    pub fn slash(env: Env, contract_id: Address, amount: i128) -> Result<(), RegistryError> {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
+            return Err(RegistryError::ContractNotFound);
+        }
+
+        let mut history: Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Slashes(contract_id.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        while history.len() >= MAX_SLASH_HISTORY {
+            history.remove(0);
+        }
+        history.push_back(amount);
+
+        let total: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashedTotal(contract_id.clone()))
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Slashes(contract_id.clone()), &history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashedTotal(contract_id), &(total + amount));
+
+        Ok(())
+    }
+
+    /// Return the retained slash history for a registration.
+    ///
+    /// At most [`MAX_SLASH_HISTORY`] most-recent records are returned; older
+    /// records have been pruned and are not recoverable from this entry.
+    pub fn get_slashes(env: Env, contract_id: Address) -> Vec<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Slashes(contract_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return the aggregate amount slashed for a registration.
+    ///
+    /// This value is maintained independently of the bounded history, so it
+    /// remains accurate after records have been pruned.
+    pub fn get_slashed_total(env: Env, contract_id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashedTotal(contract_id))
+            .unwrap_or(0)
     }
 
     /// Same admin gate as v1, so an upgraded registry can be upgraded again.

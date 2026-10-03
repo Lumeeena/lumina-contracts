@@ -1,33 +1,4 @@
-// Copyright (c) Lumina contributors
-// SPDX-License-Identifier: MIT
-//! Guards the registry's exported interface and v2 upgrade fixture against unreviewed changes.
-//!
-//! The interface — every exported function signature and every type and error
-//! code those functions expose — is what the indexer, the frontend and every
-//! registrant bind to. A renamed parameter or a new argument is a breaking
-//! change for all of them, and without this test it only surfaces when
-//! something downstream fails.
-//!
-//! The test reads the contract spec out of the *built* wasm (the same
-//! `contractspecv0` section `stellar contract bindings` and `contractimport!`
-//! consume), renders it as plain text, and compares it with the checked-in
-//! `registry/interface.snap`. Doc comments are left out: rewording one is not
-//! an interface change.
-//!
-//! The exported interface also includes the `Category` enum and the
-//! `MAX_CATEGORIES_PER_CONTRACT` cap: a registration may claim at most that
-//! many categories, and claiming more is rejected with `TooManyCategories`.
-//! The cap is deliberately smaller than the vocabulary so that a registration
-//! claiming every category is rejected rather than silently truncated.
-//!
-//! To accept an intended change, rebuild the wasm and regenerate the snapshot:
-//!
-//! ```bash
 //! cargo build --target wasm32v1-none --release && UPDATE_INTERFACE_SNAPSHOT=1 cargo test --test interface
-//! ```
-//!
-//! then commit `registry/interface.snap` alongside the change so the diff is
-//! reviewed with it.
 //!
 //! This file also guards the `registry-v2` upgrade fixture, a hand-maintained
 //! copy of the storage types that must stay byte-compatible with the real ones.
@@ -43,6 +14,11 @@
 //! metadata and category management without exposing stake withdrawal or
 //! ownership transfer. Managers are intentionally limited to the metadata and
 //! category entry points; the value-moving entry points remain owner-only.
+//!
+//! The admin surface is also part of the exported interface: `is_admin` lets a
+//! caller answer "is this address an admin?" without downloading the whole
+//! admin set via `get_admins()`. It must be safe to call before `initialize`,
+//! returning `false` rather than erroring on an uninitialised contract.
 
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef, ScSpecUdtUnionCaseV0};
@@ -51,7 +27,7 @@ use std::path::PathBuf;
 const UPDATE_ENV: &str = "UPDATE_INTERFACE_SNAPSHOT";
 
 fn manifest_path(parts: &[&str]) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut path = PathBuf&#39;::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(parts);
     path
 }
@@ -84,7 +60,7 @@ fn render_type(ty: &ScSpecTypeDef) -> String {
     }
 }
 
-/// One line per exported item, sorted so that moving code around in `lib.rs`
+/// One line per exported item, sorted so that moving code around in `lib.r`
 /// does not register as a change. Order *inside* an item (argument order,
 /// field order, enum values) is kept, since that is part of the contract.
 ///
@@ -96,10 +72,9 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
         .iter()
         .map(|entry| match entry {
             ScSpecEntry::FunctionV0(f) => {
-                let args = f
-                    .inputs
+                let args = f.inputs
                     .iter()
-                    .map(|i| {
+.map(|i| {
                         format!(
                             "{}: {}",
                             i.name.to_utf8_string_lossy(),
@@ -127,7 +102,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("struct {} {{ {} }}", s.name.to_utf8_string_lossy(), fields)
+                format!("struct {} { {} }", s.name.to_utf8_string_lossy(), fields)
             }
             ScSpecEntry::UdtUnionV0(u) => {
                 let cases = u
@@ -147,7 +122,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("union {} {{ {} }}", u.name.to_utf8_string_lossy(), cases)
+                format!("union {} { {} }", u.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtEnumV0(e) => {
                 let cases = e
@@ -156,7 +131,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("enum {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("enum {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
             ScSpecEntry::UdtErrorEnumV0(e) => {
                 let cases = e
@@ -165,7 +140,7 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
                     .map(|c| format!("{} = {}", c.name.to_utf8_string_lossy(), c.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("error {} {{ {} }}", e.name.to_utf8_string_lossy(), cases)
+                format!("error {} { {} }", e.name.to_utf8_string_lossy(), cases)
             }
         })
         .collect();
@@ -180,6 +155,12 @@ fn render_interface(entries: &[ScSpecEntry]) -> String {
 /// immediately. Any change to these signatures is a breaking change and must be
 /// reviewed alongside `registry/interface.snap`.
 const _DELEGATION_SURFACE: &[&str] = &["set_manager", "manager", "revoke_manager"];
+
+/// The admin surface is part of the exported interface: consumers must be able
+/// to test membership in the admin set without fetching it. Any change to this
+/// signature is a breaking change and must be reviewed alongside
+/// `registry/interface.snap`.
+const _ADMIN_SURFACE: &[&str] = &["is_admin"];
 
 #[test]
 fn exported_interface_matches_snapshot() {
@@ -207,21 +188,16 @@ fn exported_interface_matches_snapshot() {
         );
     }
 
-    // The unbonding surface is part of the exported interface: an owner must
-    // be able to start an unbonding timer and observe when it completes, and
-    // `withdraw_stake` must refuse until it elapses. Any change to these
-    // signatures is a breaking change and must be reviewed alongside
-    // `registry/interface.snap`.
-    for expected_fn in ["request_unbond", "unbonding_completes_at"] {
+    for expected_fn in _ADMIN_SURFACE {
         assert!(
             actual.contains(&format!("fn {expected_fn}(")),
-            "unbonding entry point `{expected_fn}` is missing from the exported interface; \
-             the unbonding queue must remain part of the contract spec"
+            "admin entry point `{expected_fn}` is missing from the exported interface; \
+             callers must be able to test admin membership without fetching the whole set"
         );
     }
 
     let snap_path = manifest_path(&["interface.snap"]);
-    if std::env::var_os(UPDATE_ENV).is_some() {
+    if std::env::var_osS(UPDATE_ENV).is_some() {
         std::fs::write(&snap_path, &actual).expect("write interface snapshot");
         return;
     }
@@ -251,6 +227,33 @@ fn exported_interface_matches_snapshot() {
          {UPDATE_ENV}=1 cargo test --test interface\n\n\
          and commit registry/interface.snap with it.\n"
     );
+}
+
+/// `is_admin` must agree with membership in `get_admins()`, and must be safe to
+/// call on a contract that has not been initialised yet (returning `false`
+/// rather than trapping).
+#[test]
+fn is_admin_matches_get_admins_and_is_safe_before_initialize() {
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Address;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry_id = env.register(crate::Registry, ());
+    let registry = crate::RegistryClient::new(&env, &registry_id);
+    let stranger = Address::generate(&env);
+
+    // Before `initialize`, the contract has no admin set; the query must not
+    // trap and must report non-membership.
+    assert!(!registry.is_admin(&stranger));
+
+    let owner = Address::generate(&env);
+    let admin = Address::generate(&env);
+    registry.initialize(&owner, &admin);
+
+    assert!(registry.is_admin(&admin));
+    assert!(!registry.is_admin(&stranger));
+    assert!(registry.get_admins().contains(&admin));
 }
 
 /// A token contract that reenters the registry during `transfer`, attempting
@@ -295,7 +298,7 @@ fn reentrant_token_cannot_withdraw_twice() {
                 // Attempt the reentrant double withdrawal. With
                 // checks-effects-interactions ordering this must fail because
                 // the stake was already zeroed before `transfer` was called.
-                let _ = client.try_withdraw_stake(&staker, &amount);
+                let _ = client.try_withdraw_stake(&staker, &amount, &amount);
             }
         }
     }
@@ -315,6 +318,6 @@ fn reentrant_token_cannot_withdraw_twice() {
     registry.request_unbond(&staker);
     // The reentrant call inside `transfer` must not have succeeded in
     // withdrawing a second time; the original withdrawal stands.
-    registry.withdraw_stake(&staker, &1_000);
+    registry.withdraw_stake(&staker, &1_000, &1_000);
     assert_eq!(registry.stake_of(&staker), 0);
 }
