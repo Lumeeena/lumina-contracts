@@ -13,9 +13,7 @@
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, Env, Vec};
 
-use lumina_registry::{
-    Category, LuminaRegistry, LuminaRegistryClient, RegistryError,
-};
+use lumina_registry::{Category, LuminaRegistry, LuminaRegistryClient, RegistryError};
 
 /// Deploy the contract with the constructor (which sets up a single bootstrap
 /// admin) but do NOT call `initialize` (which sets up the full multi-sig admin
@@ -119,7 +117,7 @@ fn is_registered_works_before_initialize() {
 /// `get_active_contracts` works before initialization (returns empty list).
 #[test]
 fn get_active_contracts_works_before_initialize() {
-    let (env, client, _admin) = setup_uninitialized();
+    let (_env, client, _admin) = setup_uninitialized();
     let active = client.get_active_contracts(&0, &10);
     assert_eq!(active.len(), 0);
 }

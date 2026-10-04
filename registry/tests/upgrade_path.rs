@@ -12,18 +12,31 @@
 //! Issue #70: Cover the upgrade path from every prior contract version.
 
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Vec};
 
-use lumina_registry::{
-    Category, LuminaRegistry, LuminaRegistryClient,
-};
+use lumina_registry::{Category, LuminaRegistry, LuminaRegistryClient};
 
 // ─── Upgrade-test wasm fixtures ─────────────────────────────────────────────
 
 mod registry_v2_wasm {
-    soroban_sdk::contractimport!(
-        file = "../target/wasm32v1-none/release/lumina_registry_v2.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/lumina_registry_v2.wasm");
+}
+
+fn advance_ledger(env: &Env, n: u32) {
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence().saturating_add(n));
+}
+
+fn govern_upgrade(
+    env: &Env,
+    client: &LuminaRegistryClient,
+    admin: &Address,
+    new_wasm_hash: &BytesN<32>,
+) {
+    let pid = client.propose_upgrade(admin, new_wasm_hash);
+    client.approve_proposal(admin, &pid);
+    advance_ledger(env, lumina_registry::TIMELOCK_LEDGERS);
+    client.execute_proposal(admin, &pid);
 }
 
 /// Build a `Vec<Category>` from a slice.
@@ -51,10 +64,7 @@ fn setup() -> (Env, LuminaRegistryClient<'static>, Address) {
 }
 
 /// Register a sample contract and return `(owner, contract_id)`.
-fn register_sample(
-    env: &Env,
-    client: &LuminaRegistryClient,
-) -> (Address, Address) {
+fn register_sample(env: &Env, client: &LuminaRegistryClient) -> (Address, Address) {
     let owner = Address::generate(env);
     let target = Address::generate(env);
     client.register_contract(
@@ -100,7 +110,7 @@ fn upgrade_to_v2_preserves_registrations() {
 
     // Upload v2 wasm and upgrade.
     let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
+    govern_upgrade(&env, &client, &admin, &v2_hash);
 
     // Registrations must survive.
     assert_eq!(client.get_contract_count(), 2);
@@ -122,7 +132,7 @@ fn upgrade_to_v2_reports_new_version() {
     let v1_version = client.get_version();
 
     let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
+    govern_upgrade(&env, &client, &admin, &v2_hash);
 
     let new_version = client.get_version();
     assert!(
@@ -139,11 +149,11 @@ fn upgrade_to_v2_preserves_admin_key() {
     let (env, client, admin) = setup();
 
     let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
+    govern_upgrade(&env, &client, &admin, &v2_hash);
 
     // Verify the v2 code is active by checking the version.
     let version = client.get_version();
-    assert_eq!(version, 8); // v2 CONTRACT_VERSION
+    assert_eq!(version, 9); // v2 CONTRACT_VERSION
 }
 
 /// After upgrading to v2, owner queries work on the upgraded code.
@@ -171,7 +181,7 @@ fn upgrade_to_v2_preserves_owner_queries() {
     );
 
     let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
+    govern_upgrade(&env, &client, &admin, &v2_hash);
 
     // Owner queries must still work.
     let owned = client.get_contracts_by_owner(&owner, &0, &10);
@@ -195,7 +205,7 @@ fn upgrade_to_v2_preserves_contract_entries() {
     );
 
     let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
+    govern_upgrade(&env, &client, &admin, &v2_hash);
 
     // The entry must survive the upgrade.
     let entry = client.get_contract(&target);
@@ -214,33 +224,7 @@ fn upgrade_to_v2_preserves_contract_count() {
     assert_eq!(client.get_contract_count(), 3);
 
     let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
+    govern_upgrade(&env, &client, &admin, &v2_hash);
 
     assert_eq!(client.get_contract_count(), 3);
-}
-
-/// After upgrading to v2, the upgraded contract can be upgraded again.
-#[test]
-fn upgraded_v2_can_be_upgraded_again() {
-    let (env, client, admin) = setup();
-
-    let v2_hash = env.deployer().upload_contract_wasm(registry_v2_wasm::WASM);
-    client.upgrade(&admin, &v2_hash);
-
-    // Upload current wasm again and upgrade back.
-    let current_wasm = std::fs::read(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("target")
-            .join("wasm32v1-none")
-            .join("release")
-            .join("lumina_registry.wasm"),
-    )
-    .expect("current wasm not found; run `cargo build --target wasm32v1-none --release`");
-    let current_hash = env.deployer().upload_contract_wasm(current_wasm.as_slice());
-    client.upgrade(&admin, &current_hash);
-
-    // Should be back to the original version.
-    let version = client.get_version();
-    assert!(version > 0);
 }

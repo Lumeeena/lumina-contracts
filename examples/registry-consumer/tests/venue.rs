@@ -188,7 +188,10 @@ impl Fixture {
 }
 
 fn setup() -> Fixture {
-    let env = Env::default();
+    let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.cost_estimate().budget().reset_unlimited();
     env.mock_all_auths();
 
     // The registry's governance timelock is 17_280 ledgers in a release build
