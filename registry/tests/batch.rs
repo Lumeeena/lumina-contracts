@@ -60,7 +60,7 @@ fn batch_rotates_admins_in_order_under_one_proposal() {
     assert_eq!(client.get_admins(), Vec::from_slice(&env, &[admin.clone()]));
     client.approve_proposal(&admin, &pid);
     wait(&env);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
 
     assert_eq!(
         client.get_admins(),
@@ -69,7 +69,7 @@ fn batch_rotates_admins_in_order_under_one_proposal() {
     assert_eq!(client.get_threshold(), 2);
     assert!(client.get_proposal(&pid).executed);
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::AlreadyExecuted))
     );
 }
@@ -95,7 +95,7 @@ fn failing_action_rolls_back_earlier_changes_and_execution_marker() {
     wait(&env);
     let before = client.get_proposal(&pid);
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::InvalidThreshold))
     );
     assert_eq!(client.get_admins(), Vec::from_slice(&env, &[admin.clone()]));
@@ -108,8 +108,8 @@ fn failing_action_rolls_back_earlier_changes_and_execution_marker() {
     let add = client.propose_add_admin(&admin, &extra_admin);
     client.approve_proposal(&admin, &add);
     wait(&env);
-    client.execute_proposal(&add);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &add);
+    client.execute_proposal(&admin, &pid);
     assert!(client.get_admins().contains(&new_admin));
     assert_eq!(client.get_threshold(), 3);
     assert_eq!(client.get_registration_fee(), 50);
@@ -126,7 +126,7 @@ fn failed_batch_rolls_back_cross_contract_token_transfer() {
     let config = client.propose_configure_staking(&admin, &token_id, &treasury);
     client.approve_proposal(&admin, &config);
     wait(&env);
-    client.execute_proposal(&config);
+    client.execute_proposal(&admin, &config);
     token::StellarAssetClient::new(&env, &token_id).mint(&treasury, &100);
     // execute_proposal is permissionless. The treasury separately authorizes
     // the nested token transfer, without a root require_auth invocation.
@@ -144,7 +144,7 @@ fn failed_batch_rolls_back_cross_contract_token_transfer() {
     client.approve_proposal(&admin, &pid);
     wait(&env);
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::InvalidThreshold))
     );
     let token = token::Client::new(&env, &token_id);
@@ -166,7 +166,7 @@ fn maximum_length_batch_executes_every_action() {
     let pid = client.propose_batch(&admin, &batch);
     client.approve_proposal(&admin, &pid);
     wait(&env);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     let admins = client.get_admins();
     assert_eq!(admins.len(), MAX_BATCH_ACTIONS + 1);
     for address in added.iter() {
@@ -224,17 +224,17 @@ fn batch_obeys_approval_threshold_and_timelock() {
         &actions(&env, &[ProposalAction::SetRegistrationFee(10)]),
     );
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::ThresholdNotMet))
     );
     client.approve_proposal(&admin, &pid);
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::TimelockNotElapsed))
     );
     assert_eq!(client.get_registration_fee(), 0);
     wait(&env);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_eq!(client.get_registration_fee(), 10);
 }
 
@@ -254,7 +254,7 @@ fn batch_requires_the_full_multisig_threshold() {
     );
     client.approve_proposal(&admin, &configure);
     wait(&env);
-    client.execute_proposal(&configure);
+    client.execute_proposal(&admin, &configure);
     let pid = client.propose_batch(
         &admin,
         &actions(&env, &[ProposalAction::SetRegistrationFee(10)]),
@@ -262,16 +262,16 @@ fn batch_requires_the_full_multisig_threshold() {
     client.approve_proposal(&admin, &pid);
     wait(&env);
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::ThresholdNotMet))
     );
     client.approve_proposal(&second_admin, &pid);
     assert_eq!(
-        client.try_execute_proposal(&pid),
+        client.try_execute_proposal(&admin, &pid),
         Err(Ok(RegistryError::TimelockNotElapsed))
     );
     wait(&env);
-    client.execute_proposal(&pid);
+    client.execute_proposal(&admin, &pid);
     assert_eq!(client.get_registration_fee(), 10);
 }
 

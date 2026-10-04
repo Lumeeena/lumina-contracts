@@ -10,7 +10,7 @@
 /// It also guards the hand-maintained `registry-v2` upgrade fixture: the
 /// duplicated v2 storage types must match the real ones field-for-field,
 /// otherwise the fixture silently stops testing anything.
- use std::path::PathBuf;
+use std::path::PathBuf;
 
 const FIXTURES: [&str; 2] = ["lumina_registry.wasm", "lumina_registry_v2.wasm"];
 
@@ -159,8 +159,8 @@ fn check_v2_types_in_sync() {
     let mut failed = false;
 
     for (canonical, duplicate, type_names) in TYPE_PACKAGES {
-        println!("cargo::rerun-if-changed={}", canonical);
-        println!("cargo::rerun-if-changed={}", duplicate);
+        println!("cargo::rerun-if-changed={canonical}");
+        println!("cargo::rerun-if-changed={duplicate}");
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
         let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
@@ -261,10 +261,9 @@ fn check_v2_types_in_sync() {
                 }
                 (None, Some(_)) => {
                     println!(
-                        "cargo::warning=could not locate `{type_name}` in {}. \
-                         The `registry-v2` check needs this type to compare against {}. \
+                        "cargo::warning=could not locate `{type_name}` in {canonical}. \
+                         The `registry-v2` check needs this type to compare against {duplicate}. \
                          Update TYPE_PACKAGES in build.rs if it was renamed or moved.",
-                        canonical, duplicate,
                     );
                     failed = true;
                 }

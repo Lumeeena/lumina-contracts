@@ -67,9 +67,9 @@ pub enum RegistryError {
     /// Referenced contract was not found.
     ContractNotFound = 4,
     /// The registry has no admin set.
-NotInitialized   = 7,
+    NotInitialized = 7,
     /// Stake accounting would overflow i128.
-    StakeOverflow    = 8,
+    StakeOverflow = 8,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -235,71 +235,6 @@ impl LuminaRegistryV2 {
         }
 
         active
-    }
-
-    /// Record a slash against a registration.
-    ///
-    /// The retained history is capped at [`MAX_SLASH_HISTORY`] records: once
-    /// the cap is reached the oldest record is dropped before appending the
-    /// new one, so the entry never grows without bound. The aggregate
-    /// `slashed_total` is accumulated separately and therefore stays correct
-    /// regardless of which individual records have been pruned.
-    pub fn slash(env: Env, contract_id: Address, amount: i128) -> Result<(), RegistryError> {
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Contract(contract_id.clone()))
-        {
-            return Err(RegistryError::ContractNotFound);
-        }
-
-        let mut history: Vec<i128> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Slashes(contract_id.clone()))
-            .unwrap_or(Vec::new(&env));
-
-        while history.len() >= MAX_SLASH_HISTORY {
-            history.remove(0);
-        }
-        history.push_back(amount);
-
-        let total: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SlashedTotal(contract_id.clone()))
-            .unwrap_or(0);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Slashes(contract_id.clone()), &history);
-        env.storage()
-            .persistent()
-            .set(&DataKey::SlashedTotal(contract_id), &(total + amount));
-
-        Ok(())
-    }
-
-    /// Return the retained slash history for a registration.
-    ///
-    /// At most [`MAX_SLASH_HISTORY`] most-recent records are returned; older
-    /// records have been pruned and are not recoverable from this entry.
-    pub fn get_slashes(env: Env, contract_id: Address) -> Vec<i128> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Slashes(contract_id))
-            .unwrap_or(Vec::new(&env))
-    }
-
-    /// Return the aggregate amount slashed for a registration.
-    ///
-    /// This value is maintained independently of the bounded history, so it
-    /// remains accurate after records have been pruned.
-    pub fn get_slashed_total(env: Env, contract_id: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SlashedTotal(contract_id))
-            .unwrap_or(0)
     }
 
     /// Same admin gate as v1, so an upgraded registry can be upgraded again.
