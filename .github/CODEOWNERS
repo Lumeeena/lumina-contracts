@@ -1,0 +1,23 @@
+# Mandatory review for the paths used by the Oct 2026 malware campaign.
+# A pull request touching any of these requires an explicit approval from an
+# owner listed here, regardless of who opened it.
+
+# Editor and container config: the campaign's entry point was an auto-running
+# VS Code task (`runOn: folderOpen`) paired with `task.allowAutomaticTasks`.
+/.vscode/        @DeborahOlaboye
+/.devcontainer/  @DeborahOlaboye
+
+# Package manifests: `preinstall` / `postinstall` hooks execute on `npm install`.
+package.json     @DeborahOlaboye
+**/package.json  @DeborahOlaboye
+
+# Binary and font assets: the payload shipped as a fake `.woff2` among real
+# ones. This is a Rust workspace; it has no legitimate need for either path.
+/public/         @DeborahOlaboye
+/dist/           @DeborahOlaboye
+
+# The ignore file itself was altered to hide the attacker's own tooling.
+/.gitignore      @DeborahOlaboye
+
+# CI can execute arbitrary code on every push.
+/.github/        @DeborahOlaboye
