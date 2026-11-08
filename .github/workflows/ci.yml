@@ -7,6 +7,56 @@ on:
     branches: [main]
 
 jobs:
+  repository:
+    name: Repository Checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      # Only these authors may change CI config or the ignore file.
+      TRUSTED_AUTHORS: DeborahOlaboye
+    steps:
+      - uses: actions/checkout@v4
+      # This is a Rust workspace: it has no editor config, build output, web
+      # assets or fonts, so none of them belong in a pull request.
+      - name: Check for disallowed paths
+        run: |
+          bad=$(git ls-files | grep -E '^(\.vscode|\.devcontainer|dist|public)/|(^|/)fa-(solid|regular|brands)[^/]*$|\.(lfk|lkf|llf|woff2?|eot|ttf|otf)$' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::path not allowed in this repository"; done
+            exit 1
+          fi
+      - name: Check for install hooks
+        run: |
+          bad=$(git ls-files '*package.json' | xargs -r grep -lE '"(preinstall|install|postinstall|prepare)"[[:space:]]*:' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::package.json install hook"; done
+            exit 1
+          fi
+      # .github/ is excluded because this file names the strings itself; the
+      # protected-files step covers it instead.
+      - name: Check for known malicious strings
+        run: |
+          bad=$(git grep -lF -e 'rmcej%otb%' -e 'Cot%3t=shtP' -e '_$_1e42' -e 'folderOpen' -e 'allowAutomaticTasks' -- ':!.github/' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::known malicious string or editor auto-run setting"; done
+            exit 1
+          fi
+      - name: Check protected files
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          case " $TRUSTED_AUTHORS " in *" $AUTHOR "*) exit 0;; esac
+          bad=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' | grep -E '^\.github/|^\.gitignore$' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::only a maintainer may change this file"; done
+            exit 1
+          fi
+
   license-headers:
     name: License Headers
     runs-on: ubuntu-latest
