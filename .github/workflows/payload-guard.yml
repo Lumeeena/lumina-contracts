@@ -1,0 +1,75 @@
+name: Payload Guard
+
+# Blocks the Oct 2026 malware campaign (PolinRider) from re-entering main.
+# Contributor forks still carry its payload: an auto-running VS Code task
+# (`runOn: folderOpen`) that executes `node` on a fake font file.
+#
+# `pull_request_target` runs this file as it exists on main, not the PR's copy,
+# so a pull request cannot edit the guard to pass itself. The PR's files are
+# only listed and searched as text here; nothing from the PR is built or run.
+
+on:
+  pull_request_target:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: Payload Guard
+    runs-on: ubuntu-latest
+    env:
+      # Only these authors may change CI config or the ignore file in a PR.
+      TRUSTED_AUTHORS: DeborahOlaboye
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Reject payload paths and fake fonts
+        run: |
+          # This is a Rust workspace: it has no editor config, build output,
+          # web assets or fonts. The payload hid in exactly these places.
+          bad=$(git ls-files | grep -E '^(\.vscode|\.devcontainer|dist|public)/|(^|/)fa-(solid|regular|brands)[^/]*$|\.(lfk|lkf|llf|woff2?|eot|ttf|otf)$' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::forbidden path (malware campaign hiding place)"; done
+            exit 1
+          fi
+
+      - name: Reject install hooks
+        run: |
+          # `npm install` runs these automatically.
+          bad=$(git ls-files '*package.json' | xargs -r grep -lE '"(preinstall|install|postinstall|prepare)"[[:space:]]*:' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::package.json install hook"; done
+            exit 1
+          fi
+
+      - name: Reject known payload markers
+        run: |
+          # .github/ names these markers itself; the next step guards it instead.
+          bad=$(git grep -lF -e 'rmcej%otb%' -e 'Cot%3t=shtP' -e '_$_1e42' -e 'folderOpen' -e 'allowAutomaticTasks' -- ':!.github/' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::known malware marker or auto-run setting"; done
+            exit 1
+          fi
+
+      - name: Reject CI and ignore-file changes from untrusted authors
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          case " $TRUSTED_AUTHORS " in *" $AUTHOR "*) echo "trusted author: $AUTHOR"; exit 0;; esac
+          bad=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' | grep -E '^\.github/|^\.gitignore$' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do echo "::error file=$f::only a maintainer may change this file"; done
+            exit 1
+          fi
