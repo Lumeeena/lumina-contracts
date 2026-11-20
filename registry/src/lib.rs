@@ -617,6 +617,20 @@ pub struct Proposal {
     pub executor: Option<Address>,
 }
 
+/// When a `Categories` entry's remaining TTL drops below this many ledgers it
+/// is extended. Roughly 30 days at ~6 s per ledger.
+pub const CATEGORIES_TTL_THRESHOLD: u32 = 518_400;
+
+/// Number of ledgers a `Categories` entry is extended to once it falls under
+/// [`CATEGORIES_TTL_THRESHOLD`]. Roughly 180 days, comfortably under the
+/// network's maximum entry TTL.
+///
+/// An archived `Categories` entry reads as an empty list, which makes
+/// `get_categories` lie about a live registration and, worse, makes
+/// `deregister` and `set_categories` skip removing it from its `ByCategory`
+/// indexes, leaving dead references behind.
+pub const CATEGORIES_TTL_EXTEND_TO: u32 = 3_110_400;
+
 /// Storage keys used by the Lumina Registry contract.
 ///
 /// ## Storage keys, storage types and lifetimes
@@ -645,7 +659,7 @@ pub struct Proposal {
 /// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
 /// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
 /// | `MinimumStake` | instance | `i128` — minimum stake threshold | Instance lifetime; zero disables it. |
-/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
+/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. TTL is extended on every write (`register_contract`, `set_categories`, via `index_categories`) and every read through `categories_of` (`get_categories`, `deregister`, `set_categories`) — see [`CATEGORIES_TTL_THRESHOLD`] / [`CATEGORIES_TTL_EXTEND_TO`]. |
 /// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
 /// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
 /// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
@@ -3727,7 +3741,6 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
-
     fn normalize_name(env: &Env, name: &String) -> String {
         let len = (name.len() as usize).min(256);
         let mut raw = [0u8; 256];
@@ -4236,11 +4249,28 @@ impl LuminaRegistry {
         Ok(unique)
     }
 
+    /// Read a registration's declared categories, keeping the entry alive.
     fn categories_of(env: &Env, contract_id: &Address) -> Vec<Category> {
-        env.storage()
+        let key = DataKey::Categories(contract_id.clone());
+        match env
+            .storage()
             .persistent()
-            .get(&DataKey::Categories(contract_id.clone()))
-            .unwrap_or(Vec::new(env))
+            .get::<DataKey, Vec<Category>>(&key)
+        {
+            Some(categories) => {
+                Self::extend_categories_ttl(env, &key);
+                categories
+            }
+            None => Vec::new(env),
+        }
+    }
+
+    fn extend_categories_ttl(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            CATEGORIES_TTL_THRESHOLD,
+            CATEGORIES_TTL_EXTEND_TO,
+        );
     }
 
     fn category_index(env: &Env, category: &Category) -> Vec<Address> {
@@ -4254,9 +4284,9 @@ impl LuminaRegistry {
     /// index. Idempotent per category, so re-declaring an existing category
     /// does not list the registration under it twice.
     fn index_categories(env: &Env, contract_id: &Address, categories: &Vec<Category>) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Categories(contract_id.clone()), categories);
+        let key = DataKey::Categories(contract_id.clone());
+        env.storage().persistent().set(&key, categories);
+        Self::extend_categories_ttl(env, &key);
 
         for category in categories.iter() {
             let mut index = Self::category_index(env, &category);
@@ -4405,7 +4435,9 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{
+        storage::Persistent as _, Address as _, Events, Ledger, MockAuth, MockAuthInvoke,
+    };
     use soroban_sdk::{IntoVal, TryFromVal};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
@@ -6521,6 +6553,97 @@ mod test {
         assert_eq!(recorded.len(), 2);
         assert!(recorded.contains(Category::DeFi));
         assert!(recorded.contains(Category::Payments));
+    }
+
+    /// Keep the contract instance loadable while the ledger moves far past the
+    /// default entry TTL, so the test isolates the `Categories` key.
+    fn keep_instance_live_for_categories(env: &Env, client: &LuminaRegistryClient) {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .extend_ttl(CATEGORIES_TTL_THRESHOLD, CATEGORIES_TTL_EXTEND_TO);
+        });
+    }
+
+    fn categories_ttl(env: &Env, client: &LuminaRegistryClient, contract_id: &Address) -> u32 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Categories(contract_id.clone()))
+        })
+    }
+
+    #[test]
+    fn categories_ttl_is_extended_on_write() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        assert!(categories_ttl(&env, &client, &target) >= CATEGORIES_TTL_EXTEND_TO - 1);
+
+        // `set_categories` rewrites the entry and must extend it too.
+        // Keep the other persistent keys `set_categories` touches live so the
+        // test isolates `Categories`; they have their own TTL coverage.
+        env.as_contract(&client.address, || {
+            let persistent = env.storage().persistent();
+            for key in [
+                DataKey::Contract(target.clone()),
+                DataKey::ByCategory(Category::DeFi),
+                DataKey::ByCategory(Category::Payments),
+            ] {
+                if persistent.has(&key) {
+                    persistent.extend_ttl(&key, CATEGORIES_TTL_EXTEND_TO, CATEGORIES_TTL_EXTEND_TO);
+                }
+            }
+        });
+        keep_instance_live_for_categories(&env, &client);
+        advance_ledger(
+            &env,
+            CATEGORIES_TTL_EXTEND_TO - CATEGORIES_TTL_THRESHOLD + 1_000,
+        );
+        keep_instance_live_for_categories(&env, &client);
+        assert!(categories_ttl(&env, &client, &target) < CATEGORIES_TTL_THRESHOLD);
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+        assert!(categories_ttl(&env, &client, &target) >= CATEGORIES_TTL_EXTEND_TO - 1);
+    }
+
+    #[test]
+    fn categories_survive_a_ledger_advance_past_the_default_ttl() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Payments]);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+
+        keep_instance_live_for_categories(&env, &client);
+        advance_ledger(&env, default_ttl + 1_000);
+
+        let recorded = client.get_categories(&target);
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.contains(Category::DeFi));
+        assert!(recorded.contains(Category::Payments));
+    }
+
+    #[test]
+    fn categories_ttl_is_extended_on_read() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        keep_instance_live_for_categories(&env, &client);
+        // Move far enough that the remaining TTL has fallen below the
+        // extension threshold, then confirm a plain read tops it back up.
+        advance_ledger(
+            &env,
+            CATEGORIES_TTL_EXTEND_TO - CATEGORIES_TTL_THRESHOLD + 1_000,
+        );
+        keep_instance_live_for_categories(&env, &client);
+        assert!(categories_ttl(&env, &client, &target) < CATEGORIES_TTL_THRESHOLD);
+
+        assert_eq!(
+            client.get_categories(&target),
+            cats(&env, &[Category::DeFi])
+        );
+
+        assert!(categories_ttl(&env, &client, &target) >= CATEGORIES_TTL_EXTEND_TO - 1);
     }
 
     #[test]
