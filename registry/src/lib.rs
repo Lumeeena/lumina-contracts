@@ -617,6 +617,19 @@ pub struct Proposal {
     pub executor: Option<Address>,
 }
 
+/// When an `Allowlisted` entry's remaining TTL drops below this many ledgers
+/// it is extended. Roughly 30 days at ~6 s per ledger.
+pub const ALLOWLISTED_TTL_THRESHOLD: u32 = 518_400;
+
+/// Number of ledgers an `Allowlisted` entry is extended to once it falls under
+/// [`ALLOWLISTED_TTL_THRESHOLD`]. Roughly 180 days, comfortably under the
+/// network's maximum entry TTL.
+///
+/// Membership is a governance decision. An archived entry reads as "not
+/// allowlisted", so an approved owner would be silently locked out of
+/// registering while permissioned mode is on, until governance re-approves.
+pub const ALLOWLISTED_TTL_EXTEND_TO: u32 = 3_110_400;
+
 /// Storage keys used by the Lumina Registry contract.
 ///
 /// ## Storage keys, storage types and lifetimes
@@ -648,7 +661,7 @@ pub struct Proposal {
 /// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
 /// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
 /// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
-/// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
+/// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. TTL is extended on that write and on every membership check (`register_contract`, `register_contracts`) — see [`ALLOWLISTED_TTL_THRESHOLD`] / [`ALLOWLISTED_TTL_EXTEND_TO`]. |
 /// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
 /// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
 /// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
@@ -1849,11 +1862,7 @@ impl LuminaRegistry {
             .instance()
             .get(&DataKey::AllowlistEnabled)
             .unwrap_or(false)
-            && !env
-                .storage()
-                .persistent()
-                .get(&DataKey::Allowlisted(owner.clone()))
-                .unwrap_or(false)
+            && !Self::is_allowlisted(&env, &owner)
         {
             return Err(RegistryError::NotAllowlisted);
         }
@@ -1967,11 +1976,7 @@ impl LuminaRegistry {
             .instance()
             .get(&DataKey::AllowlistEnabled)
             .unwrap_or(false)
-            && !env
-                .storage()
-                .persistent()
-                .get(&DataKey::Allowlisted(owner.clone()))
-                .unwrap_or(false)
+            && !Self::is_allowlisted(&env, &owner)
         {
             return Err(RegistryError::NotAllowlisted);
         }
@@ -3727,7 +3732,6 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
-
     fn normalize_name(env: &Env, name: &String) -> String {
         let len = (name.len() as usize).min(256);
         let mut raw = [0u8; 256];
@@ -4057,9 +4061,7 @@ impl LuminaRegistry {
                     .publish((Symbol::new(env, "allowlist_mode_changed"),), (*enabled,));
             }
             ProposalAction::SetAllowlisted(owner, allowed) => {
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Allowlisted(owner.clone()), allowed);
+                Self::set_allowlisted(env, owner, *allowed);
                 env.events().publish(
                     (Symbol::new(env, "owner_allowlisted"),),
                     (owner.clone(), *allowed),
@@ -4243,6 +4245,33 @@ impl LuminaRegistry {
             .unwrap_or(Vec::new(env))
     }
 
+    /// Whether governance has allowlisted `owner`, keeping the entry alive.
+    fn is_allowlisted(env: &Env, owner: &Address) -> bool {
+        let key = DataKey::Allowlisted(owner.clone());
+        match env.storage().persistent().get::<DataKey, bool>(&key) {
+            Some(allowed) => {
+                Self::extend_allowlisted_ttl(env, &key);
+                allowed
+            }
+            None => false,
+        }
+    }
+
+    /// Record allowlist membership and extend the entry's TTL.
+    fn set_allowlisted(env: &Env, owner: &Address, allowed: bool) {
+        let key = DataKey::Allowlisted(owner.clone());
+        env.storage().persistent().set(&key, &allowed);
+        Self::extend_allowlisted_ttl(env, &key);
+    }
+
+    fn extend_allowlisted_ttl(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            ALLOWLISTED_TTL_THRESHOLD,
+            ALLOWLISTED_TTL_EXTEND_TO,
+        );
+    }
+
     fn category_index(env: &Env, category: &Category) -> Vec<Address> {
         env.storage()
             .persistent()
@@ -4405,7 +4434,9 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{
+        storage::Persistent as _, Address as _, Events, Ledger, MockAuth, MockAuthInvoke,
+    };
     use soroban_sdk::{IntoVal, TryFromVal};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
@@ -5032,6 +5063,108 @@ mod test {
             &default_cats(&env),
         );
         assert!(client.is_registered(&target));
+    }
+
+    /// Enable permissioned mode and allowlist `owner`, then keep the instance
+    /// loadable so a test can isolate the `Allowlisted` key across a long
+    /// ledger advance.
+    fn allowlist_owner(env: &Env, client: &LuminaRegistryClient, admin: &Address, owner: &Address) {
+        let enable = client.propose_set_allowlist_enabled(admin, &true);
+        pass_proposal(env, client, admin, enable);
+        let allow = client.propose_set_allowlisted(admin, owner, &true);
+        pass_proposal(env, client, admin, allow);
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .extend_ttl(ALLOWLISTED_TTL_THRESHOLD, ALLOWLISTED_TTL_EXTEND_TO);
+            // Other persistent keys read on the registration path have their
+            // own TTL coverage; keep them live so the test isolates
+            // `Allowlisted`.
+            let persistent = env.storage().persistent();
+            let key = DataKey::AllContractsLength;
+            if persistent.has(&key) {
+                persistent.extend_ttl(&key, ALLOWLISTED_TTL_EXTEND_TO, ALLOWLISTED_TTL_EXTEND_TO);
+            }
+        });
+    }
+
+    fn allowlisted_ttl(env: &Env, client: &LuminaRegistryClient, owner: &Address) -> u32 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Allowlisted(owner.clone()))
+        })
+    }
+
+    fn register_as_allowed(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        owner: &Address,
+    ) -> Result<(), RegistryError> {
+        let target = Address::generate(env);
+        match client.try_register_contract(
+            owner,
+            &target,
+            &String::from_str(env, "Allowed"),
+            &String::from_str(env, "Allowed"),
+            &default_cats(env),
+        ) {
+            Ok(_) => Ok(()),
+            Err(Ok(e)) => Err(e),
+            Err(Err(e)) => panic!("unexpected invocation error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlisted_ttl_is_extended_on_write() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        allowlist_owner(&env, &client, &admin, &owner);
+
+        assert!(allowlisted_ttl(&env, &client, &owner) >= ALLOWLISTED_TTL_EXTEND_TO - 1);
+    }
+
+    #[test]
+    fn allowlisted_survives_a_ledger_advance_past_the_default_ttl() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        allowlist_owner(&env, &client, &admin, &owner);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+
+        advance_ledger(&env, default_ttl + 1_000);
+
+        let allowed = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, bool>(&DataKey::Allowlisted(owner.clone()))
+        });
+        assert_eq!(allowed, Some(true));
+        // The owner can still register while permissioned mode is on.
+        assert!(register_as_allowed(&env, &client, &owner).is_ok());
+    }
+
+    #[test]
+    fn allowlisted_ttl_is_extended_on_read() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        allowlist_owner(&env, &client, &admin, &owner);
+
+        // Move far enough that the remaining TTL has fallen below the
+        // extension threshold, then confirm the membership check tops it up.
+        advance_ledger(
+            &env,
+            ALLOWLISTED_TTL_EXTEND_TO - ALLOWLISTED_TTL_THRESHOLD + 1_000,
+        );
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .extend_ttl(ALLOWLISTED_TTL_THRESHOLD, ALLOWLISTED_TTL_EXTEND_TO);
+        });
+        assert!(allowlisted_ttl(&env, &client, &owner) < ALLOWLISTED_TTL_THRESHOLD);
+
+        assert!(register_as_allowed(&env, &client, &owner).is_ok());
+
+        assert!(allowlisted_ttl(&env, &client, &owner) >= ALLOWLISTED_TTL_EXTEND_TO - 1);
     }
 
     #[test]
