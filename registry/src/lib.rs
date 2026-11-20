@@ -587,6 +587,20 @@ pub enum ProposalAction {
 /// Maximum number of actions in one governance proposal batch.
 pub const MAX_BATCH_ACTIONS: u32 = 10;
 
+/// When a `RegistrationWindow` entry's remaining TTL drops below this many
+/// ledgers it is extended. Roughly 30 days at ~6 s per ledger.
+pub const REGISTRATION_WINDOW_TTL_THRESHOLD: u32 = 518_400;
+
+/// Minimum number of ledgers a `RegistrationWindow` entry is extended to.
+/// Roughly 180 days. The actual horizon is `max(this, window)`, capped at the
+/// network's maximum entry TTL.
+///
+/// The counter is only *meaningful* for one window, but it must stay loadable
+/// well past that: once archived, the owner's next registration touches an
+/// archived key, which a real network refuses to invoke until the entry is
+/// restored.
+pub const REGISTRATION_WINDOW_TTL_EXTEND_TO: u32 = 3_110_400;
+
 /// Fixed-window registration counter for one owner.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -651,7 +665,7 @@ pub struct Proposal {
 /// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
 /// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
 /// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
-/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
+/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. TTL is extended on every successful write in `consume_registration_rate` to `max(REGISTRATION_WINDOW_TTL_EXTEND_TO, window)` (capped at the network max), well beyond the window itself, so the counter is never archived mid-window or immediately after it. The only read is in that same function, and every non-failing path writes and extends; a rate-limited rejection reverts and the window it rejects on is still inside the TTL set by the write that opened it. |
 /// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
 /// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
 /// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
@@ -3652,7 +3666,16 @@ impl LuminaRegistry {
         }
         state.count += 1;
         env.storage().persistent().set(&key, &state);
-        env.storage().persistent().extend_ttl(&key, window, window);
+        // Extend past the window itself, not just to it: an entry that
+        // archives exactly when its window ends would force a restore on the
+        // owner's next registration.
+        let extend_to = REGISTRATION_WINDOW_TTL_EXTEND_TO
+            .max(window)
+            .min(env.storage().max_ttl());
+        let threshold = REGISTRATION_WINDOW_TTL_THRESHOLD.min(extend_to);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
         Ok(())
     }
 
@@ -3726,7 +3749,6 @@ impl LuminaRegistry {
             .get(&DataKey::ProposalData(proposal_id))
             .ok_or(RegistryError::ProposalNotFound)
     }
-
 
     fn normalize_name(env: &Env, name: &String) -> String {
         let len = (name.len() as usize).min(256);
@@ -4405,7 +4427,9 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{
+        storage::Persistent as _, Address as _, Events, Ledger, MockAuth, MockAuthInvoke,
+    };
     use soroban_sdk::{IntoVal, TryFromVal};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
@@ -5068,6 +5092,120 @@ mod test {
             &default_cats(&env),
         );
         assert!(client.is_registered(&second));
+    }
+
+    /// Keep the contract instance loadable while the ledger moves past the
+    /// default entry TTL, so the test isolates the `RegistrationWindow` key.
+    fn keep_instance_live_for_rate_window(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        owner: &Address,
+        ttl: u32,
+    ) {
+        env.as_contract(&client.address, || {
+            env.storage().instance().extend_ttl(ttl, ttl);
+            // Other persistent keys read on the registration path are covered
+            // by their own TTL work; keep them live so this test only
+            // exercises `RegistrationWindow`.
+            let persistent = env.storage().persistent();
+            for key in [
+                DataKey::AllContractsLength,
+                DataKey::AllContractsPage(0),
+                DataKey::OwnerContracts(owner.clone()),
+                DataKey::ByCategory(Category::Infrastructure),
+            ] {
+                if persistent.has(&key) {
+                    persistent.extend_ttl(&key, ttl, ttl);
+                }
+            }
+        });
+    }
+
+    fn register_named(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        owner: &Address,
+    ) -> Result<(), RegistryError> {
+        let target = Address::generate(env);
+        match client.try_register_contract(
+            owner,
+            &target,
+            &String::from_str(env, "Windowed"),
+            &String::from_str(env, "Windowed"),
+            &default_cats(env),
+        ) {
+            Ok(_) => Ok(()),
+            Err(Ok(e)) => Err(e),
+            Err(Err(e)) => panic!("unexpected invocation error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn registration_window_survives_a_short_window_past_the_default_ttl() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+
+        let configure = client.propose_set_rate_limit(&admin, &1, &3);
+        pass_proposal(&env, &client, &admin, configure);
+        assert!(register_named(&env, &client, &owner).is_ok());
+
+        let key = DataKey::RegistrationWindow(owner.clone());
+        let ttl_after_write =
+            env.as_contract(&client.address, || env.storage().persistent().get_ttl(&key));
+        assert!(ttl_after_write >= REGISTRATION_WINDOW_TTL_EXTEND_TO - 1);
+
+        // The window is only 3 ledgers, so the counter is long dead state by
+        // now, but it must still be loadable rather than archived.
+        keep_instance_live_for_rate_window(&env, &client, &owner, default_ttl * 3);
+        advance_ledger(&env, default_ttl + 1_000);
+
+        let state = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, RegistrationWindow>(&key)
+        });
+        assert_eq!(state.map(|w| w.count), Some(1));
+        assert!(register_named(&env, &client, &owner).is_ok());
+    }
+
+    #[test]
+    fn registration_window_survives_a_ledger_advance_past_the_default_ttl() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+        // A window longer than the network's default TTL is the case where the
+        // explicit extension matters: without it the counter would be archived
+        // mid-window and the owner's limit would silently reset.
+        let window = default_ttl + 2_000;
+
+        let configure = client.propose_set_rate_limit(&admin, &1, &window);
+        pass_proposal(&env, &client, &admin, configure);
+
+        assert!(register_named(&env, &client, &owner).is_ok());
+        let key = DataKey::RegistrationWindow(owner.clone());
+        let ttl_after_write =
+            env.as_contract(&client.address, || env.storage().persistent().get_ttl(&key));
+        assert!(ttl_after_write >= window);
+
+        // Move past the default TTL but stay inside the rate-limit window.
+        keep_instance_live_for_rate_window(&env, &client, &owner, window * 2);
+        advance_ledger(&env, default_ttl + 1_000);
+
+        let state = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, RegistrationWindow>(&key)
+        });
+        assert_eq!(state.map(|w| w.count), Some(1));
+        assert_eq!(
+            register_named(&env, &client, &owner),
+            Err(RegistryError::RegistrationRateLimited),
+        );
+
+        // Once the window has elapsed the owner can register again.
+        advance_ledger(&env, 1_100);
+        assert!(register_named(&env, &client, &owner).is_ok());
     }
 
     #[test]
