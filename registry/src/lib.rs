@@ -3727,7 +3727,7 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
-
+    #[allow(dead_code)]
     fn normalize_name(env: &Env, name: &String) -> String {
         let len = (name.len() as usize).min(256);
         let mut raw = [0u8; 256];
@@ -4405,8 +4405,11 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{IntoVal, TryFromVal};
+    use soroban_sdk::testutils::{
+        Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger, MockAuth,
+        MockAuthInvoke,
+    };
+    use soroban_sdk::{IntoVal, TryFromVal, Val};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
 
@@ -4526,6 +4529,30 @@ mod test {
     fn advance_ledger(env: &Env, n: u32) {
         let seq = env.ledger().sequence();
         env.ledger().set_sequence_number(seq + n);
+    }
+
+    fn assert_single_auth(
+        env: &Env,
+        signer: &Address,
+        contract: &Address,
+        fn_name: &str,
+        args: Vec<Val>,
+        sub_invocations: std::vec::Vec<AuthorizedInvocation>,
+    ) {
+        assert_eq!(
+            env.auths(),
+            std::vec![(
+                signer.clone(),
+                AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        contract.clone(),
+                        Symbol::new(env, fn_name),
+                        args,
+                    )),
+                    sub_invocations,
+                },
+            )],
+        );
     }
 
     // ── Initialization ──────────────────────────────────────────────────────
@@ -5492,6 +5519,14 @@ mod test {
             },
         }]);
         client.transfer_ownership(&owner, &target, &new_owner);
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "transfer_ownership",
+            (owner.clone(), target.clone(), new_owner.clone()).into_val(&env),
+            std::vec![],
+        );
         assert_eq!(client.get_contract(&target).owner, new_owner);
     }
 
@@ -5541,6 +5576,14 @@ mod test {
             },
         }]);
         client.update_metadata(&owner, &target, &name, &desc);
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "update_metadata",
+            (owner.clone(), target.clone(), name.clone(), desc.clone()).into_val(&env),
+            std::vec![],
+        );
         assert_eq!(client.get_contract(&target).name, name);
     }
 
@@ -5700,9 +5743,25 @@ mod test {
         let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_sample(&env, &client);
         mint(&env, &token_id, &owner, 1_000);
+        let amount = 400i128;
 
-        client.stake(&owner, &target, &400);
+        client.stake(&owner, &target, &amount);
 
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "stake",
+            (owner.clone(), target.clone(), amount).into_val(&env),
+            std::vec![AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    token_id.clone(),
+                    Symbol::new(&env, "transfer"),
+                    (owner.clone(), client.address.clone(), amount).into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            }],
+        );
         assert_eq!(client.get_stake(&target), 400);
         assert_eq!(balance(&env, &token_id, &owner), 600);
         assert_eq!(balance(&env, &token_id, &client.address), 400);
@@ -8419,6 +8478,34 @@ mod test {
     }
 
     #[test]
+    fn set_tags_succeeds_with_real_owner_signature() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "tag"));
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_tags",
+                args: (owner.clone(), target.clone(), tags.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_tags(&owner, &target, &tags);
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "set_tags",
+            (owner.clone(), target.clone(), tags.clone()).into_val(&env),
+            std::vec![],
+        );
+        assert_eq!(client.get_tags(&target), tags);
+    }
+
+    #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn set_tags_without_owner_signature_panics() {
         let (env, client, _admin) = setup();
@@ -8505,21 +8592,33 @@ mod test {
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn stake_without_owner_signature_panics() {
-        let (env, client, admin) = setup();
-        let _ = admin;
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
         let stranger = Address::generate(&env);
+        let amount = 400i128;
 
-        env.mock_auths(&[MockAuth {
-            address: &stranger,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "stake",
-                args: (owner.clone(), target.clone(), 100i128).into_val(&env),
-                sub_invokes: &[],
+        env.mock_auths(&[
+            MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "stake",
+                    args: (owner.clone(), target.clone(), amount).into_val(&env),
+                    sub_invokes: &[],
+                },
             },
-        }]);
-        client.stake(&owner, &target, &100);
+            MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &token_id,
+                    fn_name: "transfer",
+                    args: (owner.clone(), client.address.clone(), amount).into_val(&env),
+                    sub_invokes: &[],
+                },
+            },
+        ]);
+        client.stake(&owner, &target, &amount);
     }
 
     #[test]
