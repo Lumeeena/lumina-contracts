@@ -131,6 +131,19 @@ pub const EXPIRY_LEDGERS: u32 = 5_256_000;
 #[cfg(test)]
 pub const EXPIRY_LEDGERS: u32 = 20;
 
+/// When a `Stake` entry's remaining TTL drops below this many ledgers it is
+/// extended. Roughly 30 days at ~6 s per ledger.
+pub const STAKE_TTL_THRESHOLD: u32 = 518_400;
+
+/// Number of ledgers a `Stake` entry is extended to once it falls under
+/// [`STAKE_TTL_THRESHOLD`]. Roughly 180 days, comfortably under the network's
+/// maximum entry TTL.
+///
+/// Stake is collateral held against a registration. If the entry were archived
+/// it would read as absent (zero) while the tokens are still held by the
+/// registry, breaking solvency and stranding the owner's withdrawal.
+pub const STAKE_TTL_EXTEND_TO: u32 = 3_110_400;
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 /// Errors returned by the Lumina Registry contract operations.
@@ -640,7 +653,7 @@ pub struct Proposal {
 /// | `AllContracts` | instance | `Vec<Address>` — global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, `prune_all_contracts` for archival. |
 /// | `StakeToken` | instance | `Address` — SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
 /// | `Treasury` | instance | `Address` — slash destination | Instance lifetime; set once via `ConfigureStaking`. |
-/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
+/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. TTL is extended on every write (`stake`, `withdraw_stake`, slash) and every read through `stake_of` (`get_stake`, `get_reputation`) — see [`STAKE_TTL_THRESHOLD`] / [`STAKE_TTL_EXTEND_TO`]. |
 /// | `Verified(Address)` | persistent | `bool` — governance-attested status | Persistent; removed by `deregister`. |
 /// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
 /// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
@@ -2374,9 +2387,7 @@ impl LuminaRegistry {
 
         let old_stake = Self::stake_of(&env, &contract_id);
         let staked = old_stake + amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stake(contract_id.clone()), &staked);
+        Self::set_stake(&env, &contract_id, staked);
 
         let mut stakers = Self::stakers_of(&env, &contract_id);
         if !stakers.contains(&staker) {
@@ -2475,9 +2486,7 @@ impl LuminaRegistry {
             &0i128,
         );
         let remaining = Self::stake_of(&env, &contract_id) - staked;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stake(contract_id.clone()), &remaining);
+        Self::set_stake(&env, &contract_id, remaining);
         if remaining == 0 {
             env.storage()
                 .persistent()
@@ -2847,11 +2856,7 @@ impl LuminaRegistry {
             .unwrap_or(0);
 
         let reputation = Reputation {
-            stake: env
-                .storage()
-                .persistent()
-                .get(&DataKey::Stake(contract_id.clone()))
-                .unwrap_or(0),
+            stake: Self::stake_of(&env, &contract_id),
             verified: env
                 .storage()
                 .persistent()
@@ -3727,7 +3732,6 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
-
     fn normalize_name(env: &Env, name: &String) -> String {
         let len = (name.len() as usize).min(256);
         let mut raw = [0u8; 256];
@@ -3973,9 +3977,7 @@ impl LuminaRegistry {
                 );
 
                 let new_stake = staked - *amount;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Stake(contract_id.clone()), &new_stake);
+                Self::set_stake(env, contract_id, new_stake);
 
                 let stakers = Self::stakers_of(env, contract_id);
                 if !stakers.is_empty() {
@@ -4150,11 +4152,33 @@ impl LuminaRegistry {
         Ok(())
     }
 
+    /// Read a registration's tracked stake, keeping the entry alive.
+    ///
+    /// Extending on read means a registration that is only ever queried (and
+    /// never staked against again) still keeps its collateral record from
+    /// being archived.
     fn stake_of(env: &Env, contract_id: &Address) -> i128 {
+        let key = DataKey::Stake(contract_id.clone());
+        match env.storage().persistent().get::<DataKey, i128>(&key) {
+            Some(stake) => {
+                Self::extend_stake_ttl(env, &key);
+                stake
+            }
+            None => 0,
+        }
+    }
+
+    /// Write a registration's tracked stake and extend its TTL.
+    fn set_stake(env: &Env, contract_id: &Address, amount: i128) {
+        let key = DataKey::Stake(contract_id.clone());
+        env.storage().persistent().set(&key, &amount);
+        Self::extend_stake_ttl(env, &key);
+    }
+
+    fn extend_stake_ttl(env: &Env, key: &DataKey) {
         env.storage()
             .persistent()
-            .get(&DataKey::Stake(contract_id.clone()))
-            .unwrap_or(0)
+            .extend_ttl(key, STAKE_TTL_THRESHOLD, STAKE_TTL_EXTEND_TO);
     }
 
     fn stakers_of(env: &Env, contract_id: &Address) -> Vec<Address> {
@@ -4405,7 +4429,9 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{
+        storage::Persistent as _, Address as _, Events, Ledger, MockAuth, MockAuthInvoke,
+    };
     use soroban_sdk::{IntoVal, TryFromVal};
 
     // ── Upgrade-path wasm fixtures ──────────────────────────────────────────
@@ -5879,6 +5905,66 @@ mod test {
         assert_eq!(slashes.get(1).unwrap().reason, second);
         assert_eq!(client.get_reputation(&target).slashed_total, 500);
         assert_solvency(&env, &client, &token_id);
+    }
+
+    /// Keep the contract instance (and thus the test's other state) loadable
+    /// while the ledger moves far past the default entry TTL, so a test can
+    /// isolate the TTL behaviour of a single persistent key.
+    fn keep_instance_alive(env: &Env, client: &LuminaRegistryClient) {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .extend_ttl(STAKE_TTL_THRESHOLD, STAKE_TTL_EXTEND_TO);
+        });
+    }
+
+    fn stake_ttl(env: &Env, client: &LuminaRegistryClient, contract_id: &Address) -> u32 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Stake(contract_id.clone()))
+        })
+    }
+
+    #[test]
+    fn stake_ttl_is_extended_on_write() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        // A freshly written entry only has the network's default minimum TTL;
+        // the contract must have pushed it out to the configured horizon.
+        assert!(stake_ttl(&env, &client, &target) >= STAKE_TTL_EXTEND_TO - 1);
+    }
+
+    #[test]
+    fn stake_survives_a_ledger_advance_past_the_default_ttl() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+
+        keep_instance_alive(&env, &client);
+        advance_ledger(&env, default_ttl + 1_000);
+
+        assert_eq!(client.get_stake(&target), 100);
+        assert_eq!(client.get_reputation(&target).stake, 100);
+    }
+
+    #[test]
+    fn stake_ttl_is_extended_on_read() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        keep_instance_alive(&env, &client);
+        // Move far enough that the remaining TTL has fallen below the
+        // extension threshold, then confirm a plain read tops it back up.
+        advance_ledger(&env, STAKE_TTL_EXTEND_TO - STAKE_TTL_THRESHOLD + 1_000);
+        keep_instance_alive(&env, &client);
+        let before = stake_ttl(&env, &client, &target);
+        assert!(before < STAKE_TTL_THRESHOLD);
+
+        assert_eq!(client.get_stake(&target), 100);
+
+        assert!(stake_ttl(&env, &client, &target) >= STAKE_TTL_EXTEND_TO - 1);
     }
 
     #[test]
