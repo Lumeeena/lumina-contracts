@@ -8579,4 +8579,75 @@ mod test {
         }]);
         client.renew(&owner, &target);
     }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_rate_limit_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_rate_limit",
+                args: (admin.clone(), 5u32, 100u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_rate_limit(&admin, &5, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_set_allowlisted_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        let owner = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_set_allowlisted",
+                args: (admin.clone(), owner.clone(), true).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_set_allowlisted(&admin, &owner, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_remove_admin_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_remove_admin",
+                args: (admin.clone(), admin.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_remove_admin(&admin, &admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_deactivate_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_deactivate",
+                args: (admin.clone(), target.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_deactivate(&admin, &target);
+    }
+
 }
