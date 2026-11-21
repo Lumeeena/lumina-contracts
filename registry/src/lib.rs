@@ -8761,4 +8761,30 @@ mod test {
         }]);
         client.renew(&owner, &target);
     }
+
+    // Issue #305: execute_proposal has a negative authorization test.
+    // `executor.require_auth()` is the first statement, so it fires before
+    // any proposal-state checks. A stranger signing on behalf of the named
+    // executor must panic with `Error(Auth, InvalidAction)`.
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn execute_proposal_without_executor_signature_panics() {
+        let (env, client, admin) = setup();
+        let (_owner, target) = register_sample(&env, &client);
+        let pid = client.propose_deactivate(&admin, &target);
+        client.approve_proposal(&admin, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "execute_proposal",
+                args: (admin.clone(), pid).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.execute_proposal(&admin, &pid);
+    }
 }
