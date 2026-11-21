@@ -8762,3 +8762,70 @@ mod test {
         client.renew(&owner, &target);
     }
 }
+
+    // ── #277 #278 #279: dedicated error-path tests ──────────────────────
+
+    #[test]
+    fn test_invalid_rate_limit_zero_window() {
+        // #277: InvalidRateLimit — zero window with non-zero limit
+        let (env, client, admin) = setup();
+        let result = client.try_configure_registration_rate_limit(
+            &admin,
+            &1u32,   // limit > 0
+            &0u32,   // window_ledgers = 0 (invalid)
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidRateLimit)));
+    }
+
+    #[test]
+    fn test_not_allowlisted_blocked() {
+        // #278: NotAllowlisted — allowlist enabled, owner not on it
+        let (env, client, admin) = setup();
+        // Enable the allowlist
+        let pid = client.propose_set_allowlist_enabled(&admin, &true);
+        pass_proposal(&env, &client, &admin, pid);
+        // Try to register as a non-allowlisted owner
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let result = client.try_register(
+            &owner,
+            &target,
+            &String::from_str(&env, "name"),
+            &String::from_str(&env, "desc"),
+            &soroban_sdk::Vec::new(&env),
+            &soroban_sdk::Vec::new(&env),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::NotAllowlisted)));
+    }
+
+    #[test]
+    fn test_registration_rate_limited() {
+        // #279: RegistrationRateLimited — exceed per-owner rate limit
+        let (env, client, admin) = setup();
+        // Configure rate limit: 1 registration per 1000 ledgers
+        let pid = client.propose_configure_registration_rate_limit(&admin, &1u32, &1000u32);
+        pass_proposal(&env, &client, &admin, pid);
+        let owner = Address::generate(&env);
+        let target1 = Address::generate(&env);
+        let target2 = Address::generate(&env);
+        // First registration succeeds
+        client.register(
+            &owner,
+            &target1,
+            &String::from_str(&env, "first"),
+            &String::from_str(&env, "desc"),
+            &soroban_sdk::Vec::new(&env),
+            &soroban_sdk::Vec::new(&env),
+        );
+        // Second registration within the same window is rate-limited
+        let result = client.try_register(
+            &owner,
+            &target2,
+            &String::from_str(&env, "second"),
+            &String::from_str(&env, "desc"),
+            &soroban_sdk::Vec::new(&env),
+            &soroban_sdk::Vec::new(&env),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::RegistrationRateLimited)));
+    }
+}
