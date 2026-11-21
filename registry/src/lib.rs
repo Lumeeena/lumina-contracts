@@ -1896,9 +1896,7 @@ impl LuminaRegistry {
             .set(&DataKey::Contract(contract_id.clone()), &entry);
 
         let ts: u64 = env.ledger().timestamp();
-        env.storage()
-            .persistent()
-            .set(&DataKey::ContractTimestamp(contract_id.clone()), &ts);
+        Self::set_contract_timestamp(&env, &contract_id, ts);
 
         env.storage().persistent().set(
             &DataKey::Expiry(contract_id.clone()),
@@ -2386,10 +2384,7 @@ impl LuminaRegistry {
                 .set(&DataKey::Stakers(contract_id.clone()), &stakers);
         }
         let previous = Self::stake_of_staker(&env, &contract_id, &staker);
-        env.storage().persistent().set(
-            &DataKey::StakeOf(contract_id.clone(), staker.clone()),
-            &(previous + amount),
-        );
+        Self::set_stake_of_staker(&env, &contract_id, &staker, previous + amount);
 
         if old_stake == 0 && staked > 0 {
             let count: u32 = env
@@ -2470,10 +2465,7 @@ impl LuminaRegistry {
             &staked,
         );
 
-        env.storage().persistent().set(
-            &DataKey::StakeOf(contract_id.clone(), staker.clone()),
-            &0i128,
-        );
+        Self::set_stake_of_staker(&env, &contract_id, &staker, 0);
         let remaining = Self::stake_of(&env, &contract_id) - staked;
         env.storage()
             .persistent()
@@ -2840,11 +2832,7 @@ impl LuminaRegistry {
             slashed_total += record.amount;
         }
 
-        let withdraw_locked_until = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
-            .unwrap_or(0);
+        let withdraw_locked_until = Self::withdraw_locked_until(&env, &contract_id);
 
         let reputation = Reputation {
             stake: env
@@ -2873,11 +2861,7 @@ impl LuminaRegistry {
                 .storage()
                 .persistent()
                 .get(&DataKey::MetadataUri(contract_id.clone())),
-            registered_at_ts: env
-                .storage()
-                .persistent()
-                .get(&DataKey::ContractTimestamp(contract_id))
-                .unwrap_or(0),
+            registered_at_ts: Self::contract_timestamp(&env, &contract_id),
         })
     }
 
@@ -2906,11 +2890,7 @@ impl LuminaRegistry {
                                 .storage()
                                 .persistent()
                                 .get(&DataKey::MetadataUri(contract_id.clone())),
-                            registered_at_ts: env
-                                .storage()
-                                .persistent()
-                                .get(&DataKey::ContractTimestamp(contract_id.clone()))
-                                .unwrap_or(0),
+                            registered_at_ts: Self::contract_timestamp(&env, &contract_id),
                             entry,
                         });
                     }
@@ -3131,11 +3111,7 @@ impl LuminaRegistry {
                                 .storage()
                                 .persistent()
                                 .get(&DataKey::MetadataUri(contract_id.clone())),
-                            registered_at_ts: env
-                                .storage()
-                                .persistent()
-                                .get(&DataKey::ContractTimestamp(contract_id.clone()))
-                                .unwrap_or(0),
+                            registered_at_ts: Self::contract_timestamp(&env, &contract_id),
                             entry,
                         });
                     }
@@ -3226,11 +3202,7 @@ impl LuminaRegistry {
                             .storage()
                             .persistent()
                             .get(&DataKey::SupersededBy(contract_id.clone())),
-                        registered_at_ts: env
-                            .storage()
-                            .persistent()
-                            .get(&DataKey::ContractTimestamp(contract_id.clone()))
-                            .unwrap_or(0),
+                        registered_at_ts: Self::contract_timestamp(&env, &contract_id),
                         entry,
                     };
                     active_with_stake.push((reputation.stake, i as u32, profile));
@@ -3727,7 +3699,6 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ProposalNotFound)
     }
 
-
     fn normalize_name(env: &Env, name: &String) -> String {
         let len = (name.len() as usize).min(256);
         let mut raw = [0u8; 256];
@@ -3993,9 +3964,7 @@ impl LuminaRegistry {
                         };
                         remaining_slash -= slash_for_s;
                         let new_s = prev_s.saturating_sub(slash_for_s);
-                        env.storage()
-                            .persistent()
-                            .set(&DataKey::StakeOf(contract_id.clone(), s), &new_s);
+                        Self::set_stake_of_staker(env, contract_id, &s, new_s);
                     }
                 }
 
@@ -4039,10 +4008,7 @@ impl LuminaRegistry {
 
                 // Freeze what is left, so the owner cannot empty the stake
                 // before a second slash can clear the timelock.
-                env.storage().persistent().set(
-                    &DataKey::WithdrawLockedUntil(contract_id.clone()),
-                    &(slashed_at + SLASH_LOCK_LEDGERS),
-                );
+                Self::set_withdraw_locked_until(env, contract_id, slashed_at + SLASH_LOCK_LEDGERS);
 
                 env.events().publish(
                     (Symbol::new(env, "stake_slashed"),),
@@ -4165,10 +4131,18 @@ impl LuminaRegistry {
     }
 
     fn stake_of_staker(env: &Env, contract_id: &Address, staker: &Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::StakeOf(contract_id.clone(), staker.clone()))
-            .unwrap_or(0)
+        let key = DataKey::StakeOf(contract_id.clone(), staker.clone());
+        let stake = env.storage().persistent().get(&key);
+        if stake.is_some() {
+            Self::extend_persistent_ttl(env, &key);
+        }
+        stake.unwrap_or(0)
+    }
+
+    fn set_stake_of_staker(env: &Env, contract_id: &Address, staker: &Address, amount: i128) {
+        let key = DataKey::StakeOf(contract_id.clone(), staker.clone());
+        env.storage().persistent().set(&key, &amount);
+        Self::extend_persistent_ttl(env, &key);
     }
 
     fn attestations_of(env: &Env, contract_id: &Address) -> Vec<Attestation> {
@@ -4186,10 +4160,40 @@ impl LuminaRegistry {
     }
 
     fn withdraw_locked_until(env: &Env, contract_id: &Address) -> u32 {
+        let key = DataKey::WithdrawLockedUntil(contract_id.clone());
+        let until = env.storage().persistent().get(&key);
+        if until.is_some() {
+            Self::extend_persistent_ttl(env, &key);
+        }
+        until.unwrap_or(0)
+    }
+
+    fn set_withdraw_locked_until(env: &Env, contract_id: &Address, until: u32) {
+        let key = DataKey::WithdrawLockedUntil(contract_id.clone());
+        env.storage().persistent().set(&key, &until);
+        Self::extend_persistent_ttl(env, &key);
+    }
+
+    fn contract_timestamp(env: &Env, contract_id: &Address) -> u64 {
+        let key = DataKey::ContractTimestamp(contract_id.clone());
+        let timestamp = env.storage().persistent().get(&key);
+        if timestamp.is_some() {
+            Self::extend_persistent_ttl(env, &key);
+        }
+        timestamp.unwrap_or(0)
+    }
+
+    fn set_contract_timestamp(env: &Env, contract_id: &Address, timestamp: u64) {
+        let key = DataKey::ContractTimestamp(contract_id.clone());
+        env.storage().persistent().set(&key, &timestamp);
+        Self::extend_persistent_ttl(env, &key);
+    }
+
+    fn extend_persistent_ttl(env: &Env, key: &DataKey) {
+        let max_ttl = env.storage().max_ttl();
         env.storage()
             .persistent()
-            .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
-            .unwrap_or(0)
+            .extend_ttl(key, max_ttl / 2, max_ttl);
     }
 
     fn reputation_of(env: &Env, contract_id: &Address) -> Reputation {
@@ -4526,6 +4530,46 @@ mod test {
     fn advance_ledger(env: &Env, n: u32) {
         let seq = env.ledger().sequence();
         env.ledger().set_sequence_number(seq + n);
+    }
+
+    #[test]
+    fn persistent_key_ttls_are_extended_on_write_and_read() {
+        let (env, client, _) = setup();
+        let contract_id = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let max_ttl = env.storage().max_ttl();
+
+        env.as_contract(&client.address, || {
+            LuminaRegistry::set_contract_timestamp(&env, &contract_id, 123);
+            LuminaRegistry::set_withdraw_locked_until(&env, &contract_id, 456);
+            LuminaRegistry::set_stake_of_staker(&env, &contract_id, &staker, 789);
+        });
+
+        advance_ledger(&env, max_ttl / 2 + 1);
+        env.as_contract(&client.address, || {
+            assert_eq!(LuminaRegistry::contract_timestamp(&env, &contract_id), 123);
+            assert_eq!(
+                LuminaRegistry::withdraw_locked_until(&env, &contract_id),
+                456
+            );
+            assert_eq!(
+                LuminaRegistry::stake_of_staker(&env, &contract_id, &staker),
+                789
+            );
+        });
+
+        advance_ledger(&env, max_ttl / 2);
+        env.as_contract(&client.address, || {
+            assert_eq!(LuminaRegistry::contract_timestamp(&env, &contract_id), 123);
+            assert_eq!(
+                LuminaRegistry::withdraw_locked_until(&env, &contract_id),
+                456
+            );
+            assert_eq!(
+                LuminaRegistry::stake_of_staker(&env, &contract_id, &staker),
+                789
+            );
+        });
     }
 
     // ── Initialization ──────────────────────────────────────────────────────
@@ -8578,5 +8622,25 @@ mod test {
             },
         }]);
         client.renew(&owner, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn update_metadata_uri_without_owner_signature_panics() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let stranger = Address::generate(&env);
+        let uri = Some(String::from_str(&env, "https://example.com/metadata.json"));
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "update_metadata_uri",
+                args: (owner.clone(), target.clone(), uri.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.update_metadata_uri(&owner, &target, &uri);
     }
 }
