@@ -592,6 +592,8 @@ pub enum ProposalAction {
     WithdrawFromTreasury(i128),
     /// Remap every registration from one category to another: `(from, to)`.
     MigrateCategory(Category, Category),
+    /// Enable or disable the global pause for the registry.
+    SetPaused(bool),
     /// Execute actions in order in one transaction, reverting all on failure.
     /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
     Batch(Vec<ProposalAction>),
@@ -1435,6 +1437,32 @@ impl LuminaRegistry {
                 proposer,
                 Symbol::new(&env, "withdraw_from_treasury"),
                 amount,
+            ),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Propose to enable or disable the registry pause.
+    pub fn propose_set_paused(
+        env: Env,
+        proposer: Address,
+        paused: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetPaused(paused),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_paused"),
+                paused,
             ),
         );
         Ok(proposal_id)
@@ -4124,6 +4152,13 @@ impl LuminaRegistry {
                 }
                 env.events()
                     .publish((Symbol::new(env, "category_migrated"),), (*from, *to));
+            }
+            ProposalAction::SetPaused(paused) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Paused, paused);
+                env.events()
+                    .publish((Symbol::new(env, "paused_set"),), (*paused,));
             }
         }
         Ok(())
@@ -8760,5 +8795,70 @@ mod test {
             },
         }]);
         client.renew(&owner, &target);
+    }
+
+    // ── Issue #56: test RegistryError::Paused ────────────────────────────────
+
+    /// Test that `register_contract` returns `RegistryError::Paused` when
+    /// the registry is paused via governance.
+    #[test]
+    fn register_contract_fails_when_paused() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let name = String::from_str(&env, "Test Contract");
+        let description = String::from_str(&env, "A test contract");
+        let categories = default_cats(&env);
+
+        // First, register a contract to verify normal operation works
+        env.mock_all_auths();
+        client.register_contract(&owner, &target, &name, &description, &categories);
+
+        // Now propose and execute a set_paused proposal
+        env.mock_all_auths();
+        let pid = client.propose_set_paused(&admin, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Attempting to register another contract while paused should fail
+        let owner2 = Address::generate(&env);
+        let target2 = Address::generate(&env);
+        let name2 = String::from_str(&env, "Test Contract 2");
+        let description2 = String::from_str(&env, "Another test contract");
+
+        env.mock_all_auths();
+        assert_eq!(
+            client.try_register_contract(&owner2, &target2, &name2, &description2, &categories),
+            Err(Ok(RegistryError::Paused))
+        );
+    }
+
+    /// Test that `set_categories` returns `RegistryError::Paused` when
+    /// the registry is paused via governance.
+    #[test]
+    fn set_categories_fails_when_paused() {
+        let (env, client, admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let name = String::from_str(&env, "Test Contract");
+        let description = String::from_str(&env, "A test contract");
+        let categories = default_cats(&env);
+
+        // First, register a contract to verify normal operation works
+        env.mock_all_auths();
+        client.register_contract(&owner, &target, &name, &description, &categories);
+
+        // Now propose and execute a set_paused proposal
+        env.mock_all_auths();
+        let pid = client.propose_set_paused(&admin, &true);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // Attempting to update categories while paused should fail
+        let new_categories = vec![&env, Category::DeFi, Category::Nft];
+
+        env.mock_all_auths();
+        assert_eq!(
+            client.try_set_categories(&owner, &target, &new_categories),
+            Err(Ok(RegistryError::Paused))
+        );
     }
 }
