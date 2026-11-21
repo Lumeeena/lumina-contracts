@@ -8762,3 +8762,84 @@ mod test {
         client.renew(&owner, &target);
     }
 }
+
+    // ── #280 #281 #282 #283: dedicated error-path tests ───────────────────
+
+    #[test]
+    fn test_invalid_tags_exceeds_max_count() {
+        // #281: InvalidTags — too many tags (>10)
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let mut tags = Vec::new(&env);
+        for _ in 0..11 {
+            tags.push_back(String::from_str(&env, "tag"));
+        }
+        let result = client.try_register(
+            &owner,
+            &target,
+            &String::from_str(&env, "name"),
+            &String::from_str(&env, "desc"),
+            &soroban_sdk::Vec::new(&env),
+            &tags,
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidTags)));
+    }
+
+    #[test]
+    fn test_invalid_tags_tag_too_long() {
+        // #281: InvalidTags — a single tag exceeding 16 chars
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = Address::generate(&env);
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "this_tag_is_way_too_long"));
+        let result = client.try_register(
+            &owner,
+            &target,
+            &String::from_str(&env, "name"),
+            &String::from_str(&env, "desc"),
+            &soroban_sdk::Vec::new(&env),
+            &tags,
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidTags)));
+    }
+
+    #[test]
+    fn test_invalid_attestation_empty_label() {
+        // #282: InvalidAttestation — empty label
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let attester = Address::generate(&env);
+        let result = client.try_attest(&attester, &target, &String::from_str(&env, ""));
+        assert_eq!(result, Err(Ok(RegistryError::InvalidAttestation)));
+    }
+
+    #[test]
+    fn test_attestation_not_found_on_revoke() {
+        // #283: AttestationNotFound — revoking an attestation that doesn't exist
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let attester = Address::generate(&env);
+        let result = client.try_revoke_attestation(&attester, &target);
+        assert_eq!(result, Err(Ok(RegistryError::AttestationNotFound)));
+    }
+
+    #[test]
+    fn test_insufficient_fee_not_raised_yet() {
+        // #280: InsufficientFee is defined (variant 25) but currently
+        // the register path does `token::transfer` without first checking
+        // the owner's balance — a failed transfer panics rather than
+        // returning InsufficientFee. This test documents that gap:
+        // when the fee is set to a positive value and the owner has
+        // insufficient balance, the transfer fails at the token level
+        // (panic), not with a typed error.
+        //
+        // If InsufficientFee is ever wired in (checking balance before
+        // transfer), this test should be updated to assert
+        // `Err(Ok(RegistryError::InsufficientFee))`.
+        // For now it documents the unreachable variant.
+        // NOTE: This is the "say so in the issue" case — the variant
+        // exists but no code path raises it.
+    }
+}
