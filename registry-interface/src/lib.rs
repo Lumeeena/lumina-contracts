@@ -479,6 +479,8 @@ pub enum RegistryError {
     ContractBalanceInsufficient = 39,
     /// The stake arithmetic would overflow i128.
     StakeOverflow = 40,
+    /// Registry is paused.
+    Paused = 45,
 }
 
 /// Byte-compatible with `lumina_registry::Category`.
@@ -673,6 +675,8 @@ pub enum ProposalAction {
     WithdrawFromTreasury(i128),
     /// Remap every registration from one category to another: `(from, to)`.
     MigrateCategory(Category, Category),
+    /// Enable or disable the global pause for the registry.
+    SetPaused(bool),
 }
 
 /// Number of ledgers a proposal of a given action must wait before execution.
