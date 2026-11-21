@@ -131,18 +131,8 @@ pub const EXPIRY_LEDGERS: u32 = 5_256_000;
 #[cfg(test)]
 pub const EXPIRY_LEDGERS: u32 = 20;
 
-/// When a `Stake` entry's remaining TTL drops below this many ledgers it is
-/// extended. Roughly 30 days at ~6 s per ledger.
-pub const STAKE_TTL_THRESHOLD: u32 = 518_400;
-
-/// Number of ledgers a `Stake` entry is extended to once it falls under
-/// [`STAKE_TTL_THRESHOLD`]. Roughly 180 days, comfortably under the network's
-/// maximum entry TTL.
-///
-/// Stake is collateral held against a registration. If the entry were archived
-/// it would read as absent (zero) while the tokens are still held by the
-/// registry, breaking solvency and stranding the owner's withdrawal.
-pub const STAKE_TTL_EXTEND_TO: u32 = 3_110_400;
+const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
+const PERSISTENT_TTL_BUMP: u32 = 518_400;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -1907,6 +1897,7 @@ impl LuminaRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
+        Self::extend_persistent_ttl(&env, &DataKey::Contract(contract_id.clone()));
 
         let ts: u64 = env.ledger().timestamp();
         env.storage()
@@ -1917,6 +1908,7 @@ impl LuminaRegistry {
             &DataKey::Expiry(contract_id.clone()),
             &(env.ledger().sequence() + EXPIRY_LEDGERS),
         );
+        Self::extend_persistent_ttl(&env, &DataKey::Expiry(contract_id.clone()));
         let mut owned = Self::owner_index(&env, &owner);
         owned.push_back(contract_id.clone());
         Self::set_owner_index(&env, &owner, &owned);
@@ -2031,11 +2023,13 @@ impl LuminaRegistry {
                 &DataKey::Contract(entry.contract_id.clone()),
                 &contract_entry,
             );
+            Self::extend_persistent_ttl(&env, &DataKey::Contract(entry.contract_id.clone()));
 
             env.storage().persistent().set(
                 &DataKey::Expiry(entry.contract_id.clone()),
                 &(env.ledger().sequence() + EXPIRY_LEDGERS),
             );
+            Self::extend_persistent_ttl(&env, &DataKey::Expiry(entry.contract_id.clone()));
             let mut owned = Self::owner_index(&env, &owner);
             owned.push_back(entry.contract_id.clone());
             Self::set_owner_index(&env, &owner, &owned);
@@ -2987,18 +2981,23 @@ impl LuminaRegistry {
         if !entry.active {
             return false;
         }
+        let expiry_key = DataKey::Expiry(entry.contract_id.clone());
         let expiry: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::Expiry(entry.contract_id.clone()))
+            .get(&expiry_key)
             .unwrap_or(entry.registered_at + EXPIRY_LEDGERS);
+        Self::extend_persistent_ttl(env, &expiry_key);
         env.ledger().sequence() <= expiry
     }
 
     pub fn is_registered(env: Env, contract_id: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Contract(contract_id))
+        let key = DataKey::Contract(contract_id);
+        let exists = env.storage().persistent().has(&key);
+        if exists {
+            Self::extend_persistent_ttl(&env, &key);
+        }
+        exists
     }
 
     /// Paginated list of active registered contracts in registration order.
@@ -3345,6 +3344,7 @@ impl LuminaRegistry {
         let new_expiry = current_ledger.max(current_expiry) + EXPIRY_LEDGERS;
 
         env.storage().persistent().set(&expiry_key, &new_expiry);
+        Self::extend_persistent_ttl(&env, &expiry_key);
 
         env.events().publish(
             (Symbol::new(&env, "contract_renewed"),),
@@ -4293,17 +4293,29 @@ impl LuminaRegistry {
         }
     }
 
+    fn extend_persistent_ttl(env: &Env, key: &DataKey) {
+        if env.storage().persistent().has(key) {
+            env.storage().persistent().extend_ttl(
+                key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_BUMP,
+            );
+        }
+    }
+
     fn owner_index(env: &Env, owner: &Address) -> Vec<Address> {
+        let key = DataKey::OwnerContracts(owner.clone());
+        Self::extend_persistent_ttl(env, &key);
         env.storage()
             .persistent()
-            .get(&DataKey::OwnerContracts(owner.clone()))
+            .get(&key)
             .unwrap_or(Vec::new(env))
     }
 
     fn set_owner_index(env: &Env, owner: &Address, contracts: &Vec<Address>) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::OwnerContracts(owner.clone()), contracts);
+        let key = DataKey::OwnerContracts(owner.clone());
+        env.storage().persistent().set(&key, contracts);
+        Self::extend_persistent_ttl(env, &key);
     }
 
     /// Raw index position a cursor walk resumes from: immediately after
@@ -8760,5 +8772,33 @@ mod test {
             },
         }]);
         client.renew(&owner, &target);
+    }
+
+    #[test]
+    fn contract_owner_contracts_and_expiry_survive_ledger_advance_past_default_ttl() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+
+        // Advance ledger past Soroban's default persistent TTL (~4095 ledgers).
+        env.ledger().set_sequence_number(env.ledger().sequence() + 10_000);
+
+        assert!(client.is_registered(&target));
+        let owned = client.get_contracts_by_owner(&owner);
+        assert!(owned.contains(&target));
+
+        env.as_contract(&client.address, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::Contract(target.clone())));
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::OwnerContracts(owner.clone())));
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::Expiry(target.clone())));
+        });
     }
 }
