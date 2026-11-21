@@ -8729,7 +8729,7 @@ mod test {
     /// Regression: #327 — only the registration owner may respond to a slash.
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
-    fn respond_to_slash_without_owner_signature_panics {
+    fn respond_to_slash_without_owner_signature_panics() {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
         let response = String::from_str(&env, "it was a mistake");
