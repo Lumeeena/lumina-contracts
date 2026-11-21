@@ -7906,6 +7906,75 @@ mod test {
         assert_eq!(res, Err(Ok(RegistryError::AdminNotFound)));
     }
 
+    // ── Dedicated error-path tests (#284, #285, #286, #287) ─────────────────
+
+    // Issue #285: AdminSetTooSmall — raised when execute_proposal would shrink
+    // the admin set below MIN_ADMINS.
+    #[test]
+    fn admin_set_too_small_error_on_execute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let a1 = Address::generate(&env);
+        let a2 = Address::generate(&env);
+        let contract_id = env.register(LuminaRegistry, (&a1,));
+        let client = LuminaRegistryClient::new(&env, &contract_id);
+
+        // Add a2 so we have exactly MIN_ADMINS (2) with threshold 1.
+        let add_a2 = client.propose_add_admin(&a1, &a2);
+        pass_proposal(&env, &client, &a1, add_a2);
+        assert_eq!(client.get_admins().len(), 2);
+
+        // Propose removing a2 — would leave 1 admin, violating MIN_ADMINS.
+        let pid = client.propose_remove_admin(&a1, &a2);
+        client.approve_proposal(&a1, &pid);
+        advance_ledger(&env, TIMELOCK_LEDGERS);
+        let res = client.try_execute_proposal(&a1, &pid);
+        assert_eq!(res, Err(Ok(RegistryError::AdminSetTooSmall)));
+    }
+
+    // Issue #284: OverlappingAddress — raised when propose_configure_staking
+    // receives a token or treasury address that is already a registered contract.
+    #[test]
+    fn overlapping_address_error_when_token_is_registered_contract() {
+        let (env, client, admin) = setup();
+        // Register a contract and then try to use it as a staking token.
+        let (_owner, registered) = register_sample(&env, &client);
+        let treasury = Address::generate(&env);
+        let res = client.try_propose_configure_staking(&admin, &registered, &treasury);
+        assert_eq!(res, Err(Ok(RegistryError::OverlappingAddress)));
+    }
+
+    #[test]
+    fn overlapping_address_error_when_treasury_is_registered_contract() {
+        let (env, client, admin) = setup();
+        // Register a contract and then try to use it as the treasury.
+        let (_owner, registered) = register_sample(&env, &client);
+        let issuer = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(issuer).address();
+        let res = client.try_propose_configure_staking(&admin, &token_id, &registered);
+        assert_eq!(res, Err(Ok(RegistryError::OverlappingAddress)));
+    }
+
+    // Issue #286: AlreadyAdmin — raised when propose_add_admin receives an
+    // address that is already in the admin set.
+    #[test]
+    fn already_admin_error_when_adding_existing_admin() {
+        let (env, client, admin) = setup();
+        // `admin` is already in the set; trying to add them again must fail.
+        let res = client.try_propose_add_admin(&admin, &admin);
+        assert_eq!(res, Err(Ok(RegistryError::AlreadyAdmin)));
+    }
+
+    // Issue #287: AdminNotFound — raised when propose_remove_admin receives an
+    // address that is not currently in the admin set.
+    #[test]
+    fn admin_not_found_error_when_removing_non_admin() {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        let res = client.try_propose_remove_admin(&admin, &stranger);
+        assert_eq!(res, Err(Ok(RegistryError::AdminNotFound)));
+    }
+
     // Issue 1: Reject proposals for actions that are already true (#43)
     #[test]
     fn propose_change_threshold_rejects_current_threshold() {
