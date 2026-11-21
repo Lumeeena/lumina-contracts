@@ -8315,6 +8315,7 @@ mod test {
         client.propose_slash(&admin, &target, &100, &reason);
     }
 
+    /// Regression: #314 — only an admin may create this governance proposal.
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn propose_set_allowlist_enabled_without_proposer_signature_panics() {
@@ -8406,6 +8407,7 @@ mod test {
         client.propose_configure_minimum_stake(&admin, &100);
     }
 
+    /// Regression: #321 — a non-admin cannot authorize a treasury withdrawal proposal.
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn propose_withdraw_from_treasury_without_proposer_signature_panics() {
@@ -8540,6 +8542,7 @@ mod test {
         client.register_contracts(&owner, &entries);
     }
 
+    /// Regression: #330 — category updates require the registered owner or manager.
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn set_categories_without_owner_signature_panics() {
@@ -8723,9 +8726,10 @@ mod test {
         client.withdraw_stake(&owner, &target);
     }
 
+    /// Regression: #327 — only the registration owner may respond to a slash.
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
-    fn respond_to_slash_without_owner_signature_panics() {
+    fn respond_to_slash_without_owner_signature_panics {
         let (env, client, _admin) = setup();
         let (owner, target) = register_sample(&env, &client);
         let response = String::from_str(&env, "it was a mistake");
