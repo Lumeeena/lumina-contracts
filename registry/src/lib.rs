@@ -687,7 +687,7 @@ pub const CATEGORIES_TTL_EXTEND_TO: u32 = 3_110_400;
 /// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
 /// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. TTL is extended on every successful write in `consume_registration_rate` to `max(REGISTRATION_WINDOW_TTL_EXTEND_TO, window)` (capped at the network max), well beyond the window itself, so the counter is never archived mid-window or immediately after it. The only read is in that same function, and every non-failing path writes and extends; a rate-limited rejection reverts and the window it rejects on is still inside the TTL set by the write that opened it. |
 /// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
-/// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
+/// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; TTL renewed on reads and writes; removed by `deregister`. |
 /// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
 /// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
 /// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
@@ -1212,11 +1212,7 @@ impl LuminaRegistry {
             return Err(RegistryError::ContractNotFound);
         }
 
-        let current_verified = env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
-            .unwrap_or(false);
+        let current_verified = Self::verified_of(&env, &contract_id);
         if current_verified == verified {
             return Err(RegistryError::AlreadyVerified);
         }
@@ -1665,9 +1661,7 @@ impl LuminaRegistry {
             let mut index = Self::category_index(&env, &category);
             if let Some(i) = index.first_index_of(&contract_id) {
                 index.remove(i);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ByCategory(category), &index);
+                Self::set_category_index(env, &category, &index);
             }
         }
         env.storage()
@@ -1688,11 +1682,7 @@ impl LuminaRegistry {
 
         // Delete the entry and its live reputation state. Slashes are kept
         // for auditability (see docstring above).
-        let was_verified = env
-            .storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
-            .unwrap_or(false);
+        let was_verified = Self::verified_of(&env, &contract_id);
         let staked = Self::stake_of(&env, &contract_id);
 
         env.storage()
@@ -1794,9 +1784,7 @@ impl LuminaRegistry {
         }
 
         if removed > 0 {
-            env.storage()
-                .persistent()
-                .set(&DataKey::ByCategory(category), &live);
+            Self::set_category_index(&env, &category, &live);
         }
 
         env.events()
@@ -2144,9 +2132,7 @@ impl LuminaRegistry {
                 let mut index = Self::category_index(&env, &previous);
                 if let Some(i) = index.first_index_of(&contract_id) {
                     index.remove(i);
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::ByCategory(previous), &index);
+                    Self::set_category_index(&env, &previous, &index);
                 }
                 if entry.active {
                     Self::change_category_count(&env, &previous, -1);
@@ -2204,9 +2190,7 @@ impl LuminaRegistry {
             }
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Tags(contract_id.clone()), &tags);
+        Self::store_tags(&env, &contract_id, &tags);
 
         env.events().publish(
             (Symbol::new(&env, "tags_updated"),),
@@ -2218,10 +2202,7 @@ impl LuminaRegistry {
 
     /// Get tags for a registration.
     pub fn get_tags(env: Env, contract_id: Address) -> Vec<String> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Tags(contract_id))
-            .unwrap_or(Vec::new(&env))
+        Self::tags_of(&env, &contract_id)
     }
 
     /// Point a registration at its replacement.
@@ -2743,10 +2724,7 @@ impl LuminaRegistry {
     }
 
     pub fn is_verified(env: Env, contract_id: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Verified(contract_id))
-            .unwrap_or(false)
+        Self::verified_of(&env, &contract_id)
     }
 
     /// Aggregate registry statistics running in O(1) time.
@@ -2838,9 +2816,7 @@ impl LuminaRegistry {
         history.set(slash_index, record);
 
         // Save updated history
-        env.storage()
-            .persistent()
-            .set(&DataKey::Slashes(contract_id.clone()), &history);
+        Self::set_slash_history(env, contract_id, &history);
 
         env.events().publish(
             (Symbol::new(&env, "slash_response_added"),),
@@ -2865,11 +2841,7 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ContractNotFound)?;
 
         let mut slashed_total: i128 = 0;
-        let slashes: Vec<SlashRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Slashes(contract_id.clone()))
-            .unwrap_or(Vec::new(&env));
+        let slashes = Self::slash_history(&env, &contract_id);
         for record in slashes.iter() {
             slashed_total += record.amount;
         }
