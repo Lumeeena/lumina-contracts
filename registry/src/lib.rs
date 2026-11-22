@@ -5353,6 +5353,42 @@ impl LuminaRegistry {
     }
 
     #[test]
+    fn prune_category_is_permissionless() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Contract(target));
+        });
+
+        // Pruning is deliberately permissionless so indexers and scheduled
+        // cleanup workers can perform it without an owner or admin signature.
+        env.mock_auths(&[]);
+        assert_eq!(client.prune_category(&Category::DeFi), 1);
+    }
+
+    #[test]
+    fn prune_all_contracts_is_permissionless() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Contract(target));
+        });
+
+        // The global index has the same permissionless, idempotent contract as
+        // category pruning; no authorization should be required here either.
+        env.mock_auths(&[]);
+        assert_eq!(client.prune_all_contracts(), 1);
+    }
+
+    #[test]
     fn contract_count_is_live_and_total_registered_is_lifetime() {
         let (env, client, _admin) = setup();
         let owner = Address::generate(&env);
