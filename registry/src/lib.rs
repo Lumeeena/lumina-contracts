@@ -585,6 +585,8 @@ pub enum ProposalAction {
     WithdrawFromTreasury(i128),
     /// Remap every registration from one category to another: `(from, to)`.
     MigrateCategory(Category, Category),
+    /// Enable or disable the global pause for the registry.
+    SetPaused(bool),
     /// Execute actions in order in one transaction, reverting all on failure.
     /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
     Batch(Vec<ProposalAction>),
@@ -1451,6 +1453,32 @@ impl LuminaRegistry {
                 proposer,
                 Symbol::new(&env, "withdraw_from_treasury"),
                 amount,
+            ),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Propose to enable or disable the registry pause.
+    pub fn propose_set_paused(
+        env: Env,
+        proposer: Address,
+        paused: bool,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetPaused(paused),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_paused"),
+                paused,
             ),
         );
         Ok(proposal_id)
@@ -3965,6 +3993,13 @@ impl LuminaRegistry {
                 }
                 env.events()
                     .publish((Symbol::new(env, "category_migrated"),), (*from, *to));
+            }
+            ProposalAction::SetPaused(paused) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Paused, paused);
+                env.events()
+                    .publish((Symbol::new(env, "paused_set"),), (*paused,));
             }
         }
         Ok(())
