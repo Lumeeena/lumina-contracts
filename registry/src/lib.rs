@@ -134,6 +134,9 @@ pub const EXPIRY_LEDGERS: u32 = 5_256_000;
 #[cfg(test)]
 pub const EXPIRY_LEDGERS: u32 = 20;
 
+const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
+const PERSISTENT_TTL_BUMP: u32 = 518_400;
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 /// Errors returned by the Lumina Registry contract operations.
@@ -590,6 +593,20 @@ pub enum ProposalAction {
 /// Maximum number of actions in one governance proposal batch.
 pub const MAX_BATCH_ACTIONS: u32 = 10;
 
+/// When a `RegistrationWindow` entry's remaining TTL drops below this many
+/// ledgers it is extended. Roughly 30 days at ~6 s per ledger.
+pub const REGISTRATION_WINDOW_TTL_THRESHOLD: u32 = 518_400;
+
+/// Minimum number of ledgers a `RegistrationWindow` entry is extended to.
+/// Roughly 180 days. The actual horizon is `max(this, window)`, capped at the
+/// network's maximum entry TTL.
+///
+/// The counter is only *meaningful* for one window, but it must stay loadable
+/// well past that: once archived, the owner's next registration touches an
+/// archived key, which a real network refuses to invoke until the entry is
+/// restored.
+pub const REGISTRATION_WINDOW_TTL_EXTEND_TO: u32 = 3_110_400;
+
 /// Fixed-window registration counter for one owner.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -620,6 +637,20 @@ pub struct Proposal {
     pub executor: Option<Address>,
 }
 
+/// When a `Categories` entry's remaining TTL drops below this many ledgers it
+/// is extended. Roughly 30 days at ~6 s per ledger.
+pub const CATEGORIES_TTL_THRESHOLD: u32 = 518_400;
+
+/// Number of ledgers a `Categories` entry is extended to once it falls under
+/// [`CATEGORIES_TTL_THRESHOLD`]. Roughly 180 days, comfortably under the
+/// network's maximum entry TTL.
+///
+/// An archived `Categories` entry reads as an empty list, which makes
+/// `get_categories` lie about a live registration and, worse, makes
+/// `deregister` and `set_categories` skip removing it from its `ByCategory`
+/// indexes, leaving dead references behind.
+pub const CATEGORIES_TTL_EXTEND_TO: u32 = 3_110_400;
+
 /// Storage keys used by the Lumina Registry contract.
 ///
 /// ## Storage keys, storage types and lifetimes
@@ -643,18 +674,18 @@ pub struct Proposal {
 /// | `AllContracts` | instance | `Vec<Address>` — global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, `prune_all_contracts` for archival. |
 /// | `StakeToken` | instance | `Address` — SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
 /// | `Treasury` | instance | `Address` — slash destination | Instance lifetime; set once via `ConfigureStaking`. |
-/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
+/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. TTL is extended on every write (`stake`, `withdraw_stake`, slash) and every read through `stake_of` (`get_stake`, `get_reputation`) — see [`STAKE_TTL_THRESHOLD`] / [`STAKE_TTL_EXTEND_TO`]. |
 /// | `Verified(Address)` | persistent | `bool` — governance-attested status | Persistent; removed by `deregister`. |
 /// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
 /// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
 /// | `MinimumStake` | instance | `i128` — minimum stake threshold | Instance lifetime; zero disables it. |
-/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
+/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. TTL is extended on every write (`register_contract`, `set_categories`, via `index_categories`) and every read through `categories_of` (`get_categories`, `deregister`, `set_categories`) — see [`CATEGORIES_TTL_THRESHOLD`] / [`CATEGORIES_TTL_EXTEND_TO`]. |
 /// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
 /// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
 /// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
 /// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
 /// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
-/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
+/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. TTL is extended on every successful write in `consume_registration_rate` to `max(REGISTRATION_WINDOW_TTL_EXTEND_TO, window)` (capped at the network max), well beyond the window itself, so the counter is never archived mid-window or immediately after it. The only read is in that same function, and every non-failing path writes and extends; a rate-limited rejection reverts and the window it rejects on is still inside the TTL set by the write that opened it. |
 /// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
 /// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
 /// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
@@ -1897,6 +1928,7 @@ impl LuminaRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Contract(contract_id.clone()), &entry);
+        Self::extend_persistent_ttl(&env, &DataKey::Contract(contract_id.clone()));
 
         let ts: u64 = env.ledger().timestamp();
         env.storage()
@@ -1907,6 +1939,7 @@ impl LuminaRegistry {
             &DataKey::Expiry(contract_id.clone()),
             &(env.ledger().sequence() + EXPIRY_LEDGERS),
         );
+        Self::extend_persistent_ttl(&env, &DataKey::Expiry(contract_id.clone()));
         let mut owned = Self::owner_index(&env, &owner);
         owned.push_back(contract_id.clone());
         Self::set_owner_index(&env, &owner, &owned);
@@ -2021,11 +2054,13 @@ impl LuminaRegistry {
                 &DataKey::Contract(entry.contract_id.clone()),
                 &contract_entry,
             );
+            Self::extend_persistent_ttl(&env, &DataKey::Contract(entry.contract_id.clone()));
 
             env.storage().persistent().set(
                 &DataKey::Expiry(entry.contract_id.clone()),
                 &(env.ledger().sequence() + EXPIRY_LEDGERS),
             );
+            Self::extend_persistent_ttl(&env, &DataKey::Expiry(entry.contract_id.clone()));
             let mut owned = Self::owner_index(&env, &owner);
             owned.push_back(entry.contract_id.clone());
             Self::set_owner_index(&env, &owner, &owned);
@@ -2377,9 +2412,7 @@ impl LuminaRegistry {
 
         let old_stake = Self::stake_of(&env, &contract_id);
         let staked = old_stake + amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stake(contract_id.clone()), &staked);
+        Self::set_stake(&env, &contract_id, staked);
 
         let mut stakers = Self::stakers_of(&env, &contract_id);
         if !stakers.contains(&staker) {
@@ -2478,9 +2511,7 @@ impl LuminaRegistry {
             &0i128,
         );
         let remaining = Self::stake_of(&env, &contract_id) - staked;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stake(contract_id.clone()), &remaining);
+        Self::set_stake(&env, &contract_id, remaining);
         if remaining == 0 {
             env.storage()
                 .persistent()
@@ -2850,11 +2881,7 @@ impl LuminaRegistry {
             .unwrap_or(0);
 
         let reputation = Reputation {
-            stake: env
-                .storage()
-                .persistent()
-                .get(&DataKey::Stake(contract_id.clone()))
-                .unwrap_or(0),
+            stake: Self::stake_of(&env, &contract_id),
             verified: env
                 .storage()
                 .persistent()
@@ -2985,18 +3012,23 @@ impl LuminaRegistry {
         if !entry.active {
             return false;
         }
+        let expiry_key = DataKey::Expiry(entry.contract_id.clone());
         let expiry: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::Expiry(entry.contract_id.clone()))
+            .get(&expiry_key)
             .unwrap_or(entry.registered_at + EXPIRY_LEDGERS);
+        Self::extend_persistent_ttl(env, &expiry_key);
         env.ledger().sequence() <= expiry
     }
 
     pub fn is_registered(env: Env, contract_id: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Contract(contract_id))
+        let key = DataKey::Contract(contract_id);
+        let exists = env.storage().persistent().has(&key);
+        if exists {
+            Self::extend_persistent_ttl(&env, &key);
+        }
+        exists
     }
 
     /// Paginated list of active registered contracts in registration order.
@@ -3059,6 +3091,14 @@ impl LuminaRegistry {
             },
         }]);
         client.update_metadata(&owner, &target, &name, &desc);
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "update_metadata",
+            (owner.clone(), target.clone(), name.clone(), desc.clone()).into_val(&env),
+            std::vec![],
+        );
         assert_eq!(client.get_contract(&target).name, name);
     }
 
@@ -3218,9 +3258,25 @@ impl LuminaRegistry {
         let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_sample(&env, &client);
         mint(&env, &token_id, &owner, 1_000);
+        let amount = 400i128;
 
-        client.stake(&owner, &target, &400);
+        client.stake(&owner, &target, &amount);
 
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "stake",
+            (owner.clone(), target.clone(), amount).into_val(&env),
+            std::vec![AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    token_id.clone(),
+                    Symbol::new(&env, "transfer"),
+                    (owner.clone(), client.address.clone(), amount).into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            }],
+        );
         assert_eq!(client.get_stake(&target), 400);
         assert_eq!(balance(&env, &token_id, &owner), 600);
         assert_eq!(balance(&env, &token_id, &client.address), 400);
@@ -3397,6 +3453,66 @@ impl LuminaRegistry {
         assert_eq!(slashes.get(1).unwrap().reason, second);
         assert_eq!(client.get_reputation(&target).slashed_total, 500);
         assert_solvency(&env, &client, &token_id);
+    }
+
+    /// Keep the contract instance (and thus the test's other state) loadable
+    /// while the ledger moves far past the default entry TTL, so a test can
+    /// isolate the TTL behaviour of a single persistent key.
+    fn keep_instance_alive(env: &Env, client: &LuminaRegistryClient) {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .extend_ttl(STAKE_TTL_THRESHOLD, STAKE_TTL_EXTEND_TO);
+        });
+    }
+
+    fn stake_ttl(env: &Env, client: &LuminaRegistryClient, contract_id: &Address) -> u32 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Stake(contract_id.clone()))
+        })
+    }
+
+    #[test]
+    fn stake_ttl_is_extended_on_write() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        // A freshly written entry only has the network's default minimum TTL;
+        // the contract must have pushed it out to the configured horizon.
+        assert!(stake_ttl(&env, &client, &target) >= STAKE_TTL_EXTEND_TO - 1);
+    }
+
+    #[test]
+    fn stake_survives_a_ledger_advance_past_the_default_ttl() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+
+        keep_instance_alive(&env, &client);
+        advance_ledger(&env, default_ttl + 1_000);
+
+        assert_eq!(client.get_stake(&target), 100);
+        assert_eq!(client.get_reputation(&target).stake, 100);
+    }
+
+    #[test]
+    fn stake_ttl_is_extended_on_read() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 100);
+
+        keep_instance_alive(&env, &client);
+        // Move far enough that the remaining TTL has fallen below the
+        // extension threshold, then confirm a plain read tops it back up.
+        advance_ledger(&env, STAKE_TTL_EXTEND_TO - STAKE_TTL_THRESHOLD + 1_000);
+        keep_instance_alive(&env, &client);
+        let before = stake_ttl(&env, &client, &target);
+        assert!(before < STAKE_TTL_THRESHOLD);
+
+        assert_eq!(client.get_stake(&target), 100);
+
+        assert!(stake_ttl(&env, &client, &target) >= STAKE_TTL_EXTEND_TO - 1);
     }
 
     #[test]
@@ -4039,6 +4155,97 @@ impl LuminaRegistry {
         assert_eq!(recorded.len(), 2);
         assert!(recorded.contains(Category::DeFi));
         assert!(recorded.contains(Category::Payments));
+    }
+
+    /// Keep the contract instance loadable while the ledger moves far past the
+    /// default entry TTL, so the test isolates the `Categories` key.
+    fn keep_instance_live_for_categories(env: &Env, client: &LuminaRegistryClient) {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .extend_ttl(CATEGORIES_TTL_THRESHOLD, CATEGORIES_TTL_EXTEND_TO);
+        });
+    }
+
+    fn categories_ttl(env: &Env, client: &LuminaRegistryClient, contract_id: &Address) -> u32 {
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Categories(contract_id.clone()))
+        })
+    }
+
+    #[test]
+    fn categories_ttl_is_extended_on_write() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+        assert!(categories_ttl(&env, &client, &target) >= CATEGORIES_TTL_EXTEND_TO - 1);
+
+        // `set_categories` rewrites the entry and must extend it too.
+        // Keep the other persistent keys `set_categories` touches live so the
+        // test isolates `Categories`; they have their own TTL coverage.
+        env.as_contract(&client.address, || {
+            let persistent = env.storage().persistent();
+            for key in [
+                DataKey::Contract(target.clone()),
+                DataKey::ByCategory(Category::DeFi),
+                DataKey::ByCategory(Category::Payments),
+            ] {
+                if persistent.has(&key) {
+                    persistent.extend_ttl(&key, CATEGORIES_TTL_EXTEND_TO, CATEGORIES_TTL_EXTEND_TO);
+                }
+            }
+        });
+        keep_instance_live_for_categories(&env, &client);
+        advance_ledger(
+            &env,
+            CATEGORIES_TTL_EXTEND_TO - CATEGORIES_TTL_THRESHOLD + 1_000,
+        );
+        keep_instance_live_for_categories(&env, &client);
+        assert!(categories_ttl(&env, &client, &target) < CATEGORIES_TTL_THRESHOLD);
+        client.set_categories(&owner, &target, &cats(&env, &[Category::Payments]));
+        assert!(categories_ttl(&env, &client, &target) >= CATEGORIES_TTL_EXTEND_TO - 1);
+    }
+
+    #[test]
+    fn categories_survive_a_ledger_advance_past_the_default_ttl() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi, Category::Payments]);
+        let default_ttl = env.ledger().get().min_persistent_entry_ttl;
+
+        keep_instance_live_for_categories(&env, &client);
+        advance_ledger(&env, default_ttl + 1_000);
+
+        let recorded = client.get_categories(&target);
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.contains(Category::DeFi));
+        assert!(recorded.contains(Category::Payments));
+    }
+
+    #[test]
+    fn categories_ttl_is_extended_on_read() {
+        let (env, client, _admin) = setup();
+        let owner = Address::generate(&env);
+        let target = register_in(&env, &client, &owner, &[Category::DeFi]);
+
+        keep_instance_live_for_categories(&env, &client);
+        // Move far enough that the remaining TTL has fallen below the
+        // extension threshold, then confirm a plain read tops it back up.
+        advance_ledger(
+            &env,
+            CATEGORIES_TTL_EXTEND_TO - CATEGORIES_TTL_THRESHOLD + 1_000,
+        );
+        keep_instance_live_for_categories(&env, &client);
+        assert!(categories_ttl(&env, &client, &target) < CATEGORIES_TTL_THRESHOLD);
+
+        assert_eq!(
+            client.get_categories(&target),
+            cats(&env, &[Category::DeFi])
+        );
+
+        assert!(categories_ttl(&env, &client, &target) >= CATEGORIES_TTL_EXTEND_TO - 1);
     }
 
     #[test]
@@ -5937,6 +6144,34 @@ impl LuminaRegistry {
     }
 
     #[test]
+    fn set_tags_succeeds_with_real_owner_signature() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "tag"));
+
+        env.mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_tags",
+                args: (owner.clone(), target.clone(), tags.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_tags(&owner, &target, &tags);
+        assert_single_auth(
+            &env,
+            &owner,
+            &client.address,
+            "set_tags",
+            (owner.clone(), target.clone(), tags.clone()).into_val(&env),
+            std::vec![],
+        );
+        assert_eq!(client.get_tags(&target), tags);
+    }
+
+    #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn set_tags_without_owner_signature_panics() {
         let (env, client, _admin) = setup();
@@ -6023,21 +6258,33 @@ impl LuminaRegistry {
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn stake_without_owner_signature_panics() {
-        let (env, client, admin) = setup();
-        let _ = admin;
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_sample(&env, &client);
+        mint(&env, &token_id, &owner, 1_000);
         let stranger = Address::generate(&env);
+        let amount = 400i128;
 
-        env.mock_auths(&[MockAuth {
-            address: &stranger,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "stake",
-                args: (owner.clone(), target.clone(), 100i128).into_val(&env),
-                sub_invokes: &[],
+        env.mock_auths(&[
+            MockAuth {
+                address: &stranger,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "stake",
+                    args: (owner.clone(), target.clone(), amount).into_val(&env),
+                    sub_invokes: &[],
+                },
             },
-        }]);
-        client.stake(&owner, &target, &100);
+            MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &token_id,
+                    fn_name: "transfer",
+                    args: (owner.clone(), client.address.clone(), amount).into_val(&env),
+                    sub_invokes: &[],
+                },
+            },
+        ]);
+        client.stake(&owner, &target, &amount);
     }
 
     #[test]
@@ -6096,5 +6343,33 @@ impl LuminaRegistry {
             },
         }]);
         client.renew(&owner, &target);
+    }
+
+    #[test]
+    fn contract_owner_contracts_and_expiry_survive_ledger_advance_past_default_ttl() {
+        let (env, client, _admin) = setup();
+        let (owner, target) = register_sample(&env, &client);
+
+        // Advance ledger past Soroban's default persistent TTL (~4095 ledgers).
+        env.ledger().set_sequence_number(env.ledger().sequence() + 10_000);
+
+        assert!(client.is_registered(&target));
+        let owned = client.get_contracts_by_owner(&owner);
+        assert!(owned.contains(&target));
+
+        env.as_contract(&client.address, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::Contract(target.clone())));
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::OwnerContracts(owner.clone())));
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::Expiry(target.clone())));
+        });
     }
 }
