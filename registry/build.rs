@@ -204,11 +204,10 @@ fn check_v2_types_in_sync() {
                 (None, None) => {}
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `struct {type_name}` in {}. \
+                        "cargo::warning=could not locate `struct {type_name}` in {duplicate}. \
                          The `registry-v2` fixture is supposed to duplicate this type. \
                          Update it (see the \"Upgrade fixture\" section in the README) \
                          or update TYPE_PACKAGES in build.rs if it was renamed.",
-                        duplicate,
                     );
                     failed = true;
                     continue;
@@ -242,20 +241,18 @@ fn check_v2_types_in_sync() {
                 }
                 (None, None) => {
                     println!(
-                        "cargo::warning=could not locate `{type_name}` in {}. \
-                         The `registry-v2` check needs this type to compare against {}. \
+                        "cargo::warning=could not locate `{type_name}` in {canonical}. \
+                         The `registry-v2` check needs this type to compare against {duplicate}. \
                          Update the check in build.rs if the type was renamed or moved.",
-                        canonical, duplicate,
                     );
                     failed = true;
                 }
                 (Some(_), None) => {
                     println!(
-                        "cargo::warning=could not locate `pub enum {type_name}` in {}. \
+                        "cargo::warning=could not locate `pub enum {type_name}` in {duplicate}. \
                          The `registry-v2` fixture is supposed to duplicate this type. \
                          Update it (see the \"Upgrade fixture\" section in the README) \
                          or update TYPE_PACKAGES in build.rs if it was renamed.",
-                        duplicate,
                     );
                     failed = true;
                 }
