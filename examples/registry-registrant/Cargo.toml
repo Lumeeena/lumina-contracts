@@ -12,8 +12,8 @@ crate-type = ["cdylib", "rlib"]
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
-soroban-sdk = { workspace = true }
+soroban-sdk = { version = "22.0.0", features = ["alloc"] }
 lumina-registry-interface = { path = "../../registry-interface" }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { version = "22.0.0", features = ["alloc", "testutils"] }

@@ -52,13 +52,13 @@ fn propose_deactivate(proposer: Address, contract_id: Address) -> Result<U32, Re
 fn propose_remove_admin(proposer: Address, admin_to_remove: Address) -> Result<U32, RegistryError>
 fn propose_set_allowlist_enabled(proposer: Address, enabled: Bool) -> Result<U32, RegistryError>
 fn propose_set_allowlisted(proposer: Address, owner: Address, allowed: Bool) -> Result<U32, RegistryError>
+fn propose_set_paused(proposer: Address, paused: Bool) -> Result<U32, RegistryError>
 fn propose_set_rate_limit(proposer: Address, limit: U32, window_ledgers: U32) -> Result<U32, RegistryError>
 fn propose_set_registration_fee(proposer: Address, fee: I128) -> Result<U32, RegistryError>
 fn propose_set_verified(proposer: Address, contract_id: Address, verified: Bool) -> Result<U32, RegistryError>
 fn propose_slash(proposer: Address, contract_id: Address, amount: I128, reason: String) -> Result<U32, RegistryError>
 fn propose_upgrade(proposer: Address, new_wasm_hash: BytesN<32>) -> Result<U32, RegistryError>
 fn propose_withdraw_from_treasury(proposer: Address, amount: I128) -> Result<U32, RegistryError>
-fn propose_set_paused(proposer: Address, paused: Bool) -> Result<U32, RegistryError>
 fn prune_all_contracts() -> U32
 fn prune_category(category: Category) -> U32
 fn register_contract(owner: Address, contract_id: Address, name: String, description: String, categories: Vec<Category>) -> Result<(), RegistryError>
