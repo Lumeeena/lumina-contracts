@@ -6673,3 +6673,63 @@ impl LuminaRegistry {
         assert_eq!(result, Err(Ok(RegistryError::RegistrationRateLimited)));
     }
 }
+
+// ── Error-path coverage: #292 #293 #294 #295 ────────────────────────────────
+
+#[test]
+fn slash_not_found_on_out_of_range_index() {
+    let (env, client, admin, token_id, _treasury) = setup_staking();
+    let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+    let reason = String::from_str(&env, "test");
+    let pid = client.propose_slash(&admin, &target, &100, &reason);
+    pass_proposal(&env, &client, &admin, pid);
+    let owner = client.get_contract_entry(&target).unwrap().owner;
+    let response = String::from_str(&env, "my reply");
+    assert_eq!(
+        client.try_respond_to_slash(&owner, &target, &999, &response),
+        Err(Ok(RegistryError::SlashNotFound))
+    );
+}
+
+#[test]
+fn response_already_exists_on_second_submission() {
+    let (env, client, admin, token_id, _treasury) = setup_staking();
+    let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+    let reason = String::from_str(&env, "test");
+    let pid = client.propose_slash(&admin, &target, &100, &reason);
+    pass_proposal(&env, &client, &admin, pid);
+    let first = String::from_str(&env, "first reply");
+    client.respond_to_slash(&owner, &target, &0, &first);
+    let second = String::from_str(&env, "second reply");
+    assert_eq!(
+        client.try_respond_to_slash(&owner, &target, &0, &second),
+        Err(Ok(RegistryError::ResponseAlreadyExists))
+    );
+}
+
+#[test]
+fn contract_balance_insufficient_when_balance_below_total_staked() {
+    let (env, client, admin, token_id, treasury) = setup_staking();
+    let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+    // Drain the contract balance below TotalStaked by burning tokens directly.
+    let contract_addr = client.address.clone();
+    let steal_amount: i128 = 500;
+    token::StellarAssetClient::new(&env, &token_id)
+        .clawback(&contract_addr, &steal_amount);
+    let reason = String::from_str(&env, "misbehaviour");
+    let pid = client.propose_slash(&admin, &target, &200, &reason);
+    pass_proposal(&env, &client, &admin, pid);
+    assert_eq!(
+        client.try_execute_slash(&admin, &pid),
+        Err(Ok(RegistryError::ContractBalanceInsufficient))
+    );
+}
+
+// #295: StakeOverflow — the variant is defined (value 40) but no code path
+// currently raises it. This test documents the unreachable variant so that
+// future renumbering or removal is caught immediately.
+#[test]
+fn stake_overflow_variant_has_expected_discriminant() {
+    // RegistryError is #[repr(u32)]; assert the stable integer value.
+    assert_eq!(RegistryError::StakeOverflow as u32, 40);
+}
