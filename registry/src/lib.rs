@@ -8718,6 +8718,10 @@ mod test {
         client.deactivate(&owner, &target);
     }
 
+    // Issue #304: deregister has a negative authorization test.
+    // owner.require_auth() is the first statement, so it fires before any
+    // state checks. A stranger signing on behalf of the owner must panic
+    // with Error(Auth, InvalidAction).
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn deregister_without_owner_signature_panics() {
