@@ -8761,6 +8761,26 @@ mod test {
 
     #[test]
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
+    fn propose_batch_without_proposer_signature_panics() {
+        let (env, client, admin) = setup();
+        let mut actions = Vec::new(&env);
+        actions.push_back(ProposalAction::SetRegistrationFee(1));
+        let stranger = Address::generate(&env);
+
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_batch",
+                args: (admin.clone(), actions.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.propose_batch(&admin, &actions);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn propose_deactivate_without_proposer_signature_panics() {
         let (env, client, admin) = setup();
         let (_owner, target) = register_sample(&env, &client);
