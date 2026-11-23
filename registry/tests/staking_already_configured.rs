@@ -104,13 +104,9 @@ fn propose_configure_staking_accepts_different_token() {
     let (env, client, admin) = setup();
 
     let issuer_a = Address::generate(&env);
-    let token_a = env
-        .register_stellar_asset_contract_v2(issuer_a)
-        .address();
+    let token_a = env.register_stellar_asset_contract_v2(issuer_a).address();
     let issuer_b = Address::generate(&env);
-    let token_b = env
-        .register_stellar_asset_contract_v2(issuer_b)
-        .address();
+    let token_b = env.register_stellar_asset_contract_v2(issuer_b).address();
     let treasury = Address::generate(&env);
 
     let pid = client.propose_configure_staking(&admin, &token_a, &treasury);
