@@ -106,9 +106,12 @@ pub const TIMELOCK_LEDGERS: u32 = 10;
 /// This is what "good standing" means for [`LuminaRegistry::withdraw_stake`]:
 /// a slash is evidence that something is wrong, and letting the owner pull the
 /// rest of their collateral out in the next ledger would make the first slash
-/// the only one governance ever lands. The window is deliberately the same
-/// ~24 h as [`TIMELOCK_LEDGERS`], which is exactly how long it takes to get a
-/// follow-up slash proposal through the timelock.
+/// the only one governance ever lands. The production window must not be
+/// shorter than [`TIMELOCK_LEDGERS`]: both are 17,280 ledgers (~24 h at six
+/// seconds per ledger), giving a follow-up slash proposal time to clear the
+/// governance timelock before stake unlocks. Do not tune either constant
+/// independently. `follow_up_slash_can_land_before_stake_unlocks` asserts this
+/// relationship with the test constants.
 ///
 /// As with the timelock, tests use a small value so the ledger can be advanced
 /// past it without archiving instance storage.
