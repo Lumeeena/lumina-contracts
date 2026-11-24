@@ -29,6 +29,26 @@ This documents the dedicated tests added for each `RegistryError` variant (#276�
 - **Test**: `registry/tests/already_executed.rs` — asserts both re-execution and late approval return `AlreadyExecuted`, and that a fresh proposal still executes.
 - **Status**: ✅ Covered by dedicated test.
 
+### #261 `NotOwner` (variant 6)
+- **Condition**: a caller who is not the recorded owner calls `deregister` or `update_metadata`.
+- **Test**: `registry/tests/registry_error_paths_261_265.rs` — `deregister_by_a_non_owner_returns_not_owner` and `update_metadata_by_a_non_owner_returns_not_owner`.
+- **Status**: ✅ Covered by dedicated test.
+
+### #263 `ProposalNotFound` (variant 8)
+- **Condition**: `approve_proposal` or `execute_proposal` is called with a proposal id that was never created.
+- **Test**: `approving_an_unknown_proposal_returns_proposal_not_found` and `executing_an_unknown_proposal_returns_proposal_not_found` in `registry/tests/registry_error_paths_261_265.rs`.
+- **Status**: ✅ Covered by dedicated test.
+
+### #264 `ThresholdNotMet` (variant 9)
+- **Condition**: `execute_proposal` is called on a proposal with fewer approvals than the threshold.
+- **Test**: `execute_below_threshold_returns_threshold_not_met` (threshold 2, one approval, timelock passed) and `execute_with_no_approvals_returns_threshold_not_met`.
+- **Status**: ✅ Covered by dedicated test.
+
+### #265 `TimelockNotElapsed` (variant 10)
+- **Condition**: `execute_proposal` is called before `TIMELOCK_LEDGERS` ledgers have passed since the proposal became ready.
+- **Test**: `execute_before_the_timelock_returns_timelock_not_elapsed` — fails straight after approval and one ledger short, succeeds at the boundary.
+- **Status**: ✅ Covered by dedicated test.
+
 ## How to Run
 
 ```sh
