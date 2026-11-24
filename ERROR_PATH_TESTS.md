@@ -24,6 +24,11 @@ This documents the dedicated tests added for each `RegistryError` variant (#276�
 - **Test**: `test_registration_rate_limited` — sets a rate limit of 1 per window, registers once, then attempts a second registration within the same window.
 - **Status**: ✅ Covered by new test.
 
+### #268 `InvalidThreshold` (variant 13)
+- **Condition**: Threshold is zero or exceeds the admin count, or an admin removal would leave the threshold unsatisfiable.
+- **Test**: `registry/tests/invalid_threshold.rs` — covers rejection at proposal time and at execution time for both `ChangeThreshold` and `RemoveAdmin` actions.
+- **Status**: ✅ Covered by dedicated test.
+
 ### #269 `AlreadyExecuted` (variant 14)
 - **Condition**: `execute_proposal` or `approve_proposal` is called on a proposal that has already been executed.
 - **Test**: `registry/tests/already_executed.rs` — asserts both re-execution and late approval return `AlreadyExecuted`, and that a fresh proposal still executes.
