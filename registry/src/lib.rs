@@ -6082,7 +6082,7 @@ mod test {
     ) -> (Address, Address) {
         let (owner, target) = register_sample(env, client);
         mint(env, token_id, &owner, amount);
-        client.stake(&owner, &target, &amount);
+        stake_and_assert_solvency(env, client, token_id, &owner, &target, amount);
         (owner, target)
     }
 
@@ -6121,6 +6121,72 @@ mod test {
             held, tracked,
             "solvency invariant violated: token balance {held} != tracked stake {tracked}",
         );
+    }
+
+    /// Stake and assert solvency immediately afterwards.
+    ///
+    /// Every test that moves stake goes through one of the three wrappers
+    /// below rather than calling the client directly. Attaching the check to
+    /// the operation is what makes an accounting bug surface across the suite
+    /// instead of in the one test that happened to assert it last.
+    fn stake_and_assert_solvency(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        token_id: &Address,
+        staker: &Address,
+        contract_id: &Address,
+        amount: i128,
+    ) {
+        client.stake(staker, contract_id, &amount);
+        assert_solvency(env, client, token_id);
+    }
+
+    /// Withdraw and assert solvency immediately afterwards, returning what
+    /// `withdraw_stake` returned.
+    fn withdraw_and_assert_solvency(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        token_id: &Address,
+        staker: &Address,
+        contract_id: &Address,
+    ) -> i128 {
+        let withdrawn = client.withdraw_stake(staker, contract_id);
+        assert_solvency(env, client, token_id);
+        withdrawn
+    }
+
+    /// Propose, pass and execute a slash, asserting solvency afterwards.
+    fn slash_and_assert_solvency(
+        env: &Env,
+        client: &LuminaRegistryClient,
+        token_id: &Address,
+        admin: &Address,
+        contract_id: &Address,
+        amount: i128,
+        reason: &String,
+    ) {
+        let pid = client.propose_slash(admin, contract_id, &amount, reason);
+        pass_proposal(env, client, admin, pid);
+        assert_solvency(env, client, token_id);
+    }
+
+    /// The shared solvency check is not vacuous: an accounting bug that
+    /// under-reports a tracked stake without moving tokens is caught. Because
+    /// every fund-moving test goes through the wrappers above, the same bug
+    /// fails many tests at once rather than a single assertion.
+    #[test]
+    #[should_panic(expected = "solvency invariant violated")]
+    fn solvency_helper_detects_a_deliberate_accounting_bug() {
+        let (env, client, _admin, token_id, _treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 500);
+
+        // Drop one unit from the registry's books without moving a token.
+        env.as_contract(&client.address, || {
+            let staked = LuminaRegistry::stake_of(&env, &target);
+            LuminaRegistry::set_stake(&env, &target, staked - 1);
+        });
+
+        assert_solvency(&env, &client, &token_id);
     }
 
     // ── Configuration ───────────────────────────────────────────────────────
@@ -6169,7 +6235,7 @@ mod test {
         mint(&env, &token_id, &owner, 1_000);
         let amount = 400i128;
 
-        client.stake(&owner, &target, &amount);
+        stake_and_assert_solvency(&env, &client, &token_id, &owner, &target, amount);
 
         assert_single_auth(
             &env,
@@ -6198,7 +6264,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 300);
 
         mint(&env, &token_id, &owner, 200);
-        client.stake(&owner, &target, &200);
+        stake_and_assert_solvency(&env, &client, &token_id, &owner, &target, 200);
 
         assert_eq!(client.get_stake(&target), 500);
         assert_eq!(balance(&env, &token_id, &client.address), 500);
@@ -6212,7 +6278,7 @@ mod test {
         let stranger = Address::generate(&env);
         mint(&env, &token_id, &stranger, 500);
 
-        client.stake(&stranger, &target, &100);
+        stake_and_assert_solvency(&env, &client, &token_id, &stranger, &target, 100);
         assert_eq!(client.get_stake(&target), 100);
         assert_solvency(&env, &client, &token_id);
     }
@@ -6325,8 +6391,7 @@ mod test {
         let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "indexed a phishing contract");
-        let pid = client.propose_slash(&admin, &target, &400, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 400, &reason);
 
         assert_eq!(client.get_stake(&target), 600);
         assert_eq!(balance(&env, &token_id, &treasury), 400);
@@ -6346,12 +6411,10 @@ mod test {
         let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let first = String::from_str(&env, "first offence");
-        let pid = client.propose_slash(&admin, &target, &200, &first);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 200, &first);
 
         let second = String::from_str(&env, "second offence");
-        let pid = client.propose_slash(&admin, &target, &300, &second);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 300, &second);
 
         assert_eq!(client.get_stake(&target), 500);
         assert_eq!(balance(&env, &token_id, &treasury), 500);
@@ -6563,7 +6626,10 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 750);
 
         client.deactivate(&owner, &target);
-        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(
+            withdraw_and_assert_solvency(&env, &client, &token_id, &owner, &target),
+            750
+        );
 
         assert_eq!(client.get_stake(&target), 0);
         assert_eq!(balance(&env, &token_id, &owner), 750);
@@ -6619,8 +6685,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "under investigation");
-        let pid = client.propose_slash(&admin, &target, &200, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 200, &reason);
 
         client.deactivate(&owner, &target);
 
@@ -6641,14 +6706,16 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "under investigation");
-        let pid = client.propose_slash(&admin, &target, &200, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 200, &reason);
         client.deactivate(&owner, &target);
 
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
 
         // Only what survived the slash comes back.
-        assert_eq!(client.withdraw_stake(&owner, &target), 800);
+        assert_eq!(
+            withdraw_and_assert_solvency(&env, &client, &token_id, &owner, &target),
+            800
+        );
         assert_eq!(balance(&env, &token_id, &owner), 800);
         assert_eq!(client.get_stake(&target), 0);
         assert_solvency(&env, &client, &token_id);
@@ -6750,7 +6817,7 @@ mod test {
         // Register and post collateral.
         let (owner, target) = register_sample(&env, &client);
         mint(&env, &token_id, &owner, 1_000);
-        client.stake(&owner, &target, &1_000);
+        stake_and_assert_solvency(&env, &client, &token_id, &owner, &target, 1_000);
         assert_eq!(client.get_reputation(&target).stake, 1_000);
 
         // Governance attests the project.
@@ -6760,8 +6827,7 @@ mod test {
 
         // The project misbehaves and governance slashes a quarter of the stake.
         let reason = String::from_str(&env, "misreported contract metadata");
-        let pid = client.propose_slash(&admin, &target, &250, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 250, &reason);
 
         let reputation = client.get_reputation(&target);
         assert_eq!(reputation.stake, 750);
@@ -6784,7 +6850,10 @@ mod test {
         // Once the lock expires the remainder — and only the remainder —
         // comes back.
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
-        assert_eq!(client.withdraw_stake(&owner, &target), 750);
+        assert_eq!(
+            withdraw_and_assert_solvency(&env, &client, &token_id, &owner, &target),
+            750
+        );
         assert_eq!(balance(&env, &token_id, &owner), 750);
         assert_eq!(balance(&env, &token_id, &client.address), 0);
 
@@ -7515,7 +7584,7 @@ mod test {
         let new_owner = Address::generate(&env);
 
         mint(&env, &token_id, &owner, 500);
-        client.stake(&owner, &target, &500);
+        stake_and_assert_solvency(&env, &client, &token_id, &owner, &target, 500);
         let pid = client.propose_set_verified(&admin, &target, &true);
         pass_proposal(&env, &client, &admin, pid);
 
@@ -7536,7 +7605,10 @@ mod test {
             client.try_withdraw_stake(&new_owner, &target),
             Err(Ok(RegistryError::InsufficientStake)),
         );
-        assert_eq!(client.withdraw_stake(&owner, &target), 500);
+        assert_eq!(
+            withdraw_and_assert_solvency(&env, &client, &token_id, &owner, &target),
+            500
+        );
         assert_eq!(client.get_stake(&target), 0);
         assert!(client.is_verified(&target));
         assert_solvency(&env, &client, &token_id);
@@ -7549,7 +7621,7 @@ mod test {
         let target = register_in(&env, &client, &owner, &[Category::DeFi]);
 
         mint(&env, &token_id, &owner, 500);
-        client.stake(&owner, &target, &500);
+        stake_and_assert_solvency(&env, &client, &token_id, &owner, &target, 500);
         let pid = client.propose_set_verified(&admin, &target, &true);
         pass_proposal(&env, &client, &admin, pid);
 
@@ -8033,12 +8105,11 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
 
         let reason = String::from_str(&env, "kept for audit");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
         client.deactivate(&owner, &target);
 
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
-        client.withdraw_stake(&owner, &target);
+        withdraw_and_assert_solvency(&env, &client, &token_id, &owner, &target);
         client.deregister(&owner, &target);
 
         assert_eq!(client.get_slashes(&target).len(), 1);
@@ -8053,8 +8124,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "malicious behavior");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         let response = String::from_str(&env, "This was a false accusation");
         client.respond_to_slash(&owner, &target, &0, &response);
@@ -8072,8 +8142,7 @@ mod test {
         let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "policy violation");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         let stranger = Address::generate(&env);
         let response = String::from_str(&env, "Not my contract");
@@ -8090,8 +8159,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "policy violation");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         let response = String::from_str(&env, "This index doesn't exist");
 
@@ -8107,8 +8175,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "policy violation");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         let empty_response = String::from_str(&env, "");
 
@@ -8124,8 +8191,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "malicious behavior");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         let first_response = String::from_str(&env, "First response");
         client.respond_to_slash(&owner, &target, &0, &first_response);
@@ -8143,12 +8209,26 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let first_reason = String::from_str(&env, "first offence");
-        let pid = client.propose_slash(&admin, &target, &100, &first_reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &target,
+            100,
+            &first_reason,
+        );
 
         let second_reason = String::from_str(&env, "second offence");
-        let pid = client.propose_slash(&admin, &target, &100, &second_reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &target,
+            100,
+            &second_reason,
+        );
 
         let first_response = String::from_str(&env, "Response to first");
         client.respond_to_slash(&owner, &target, &0, &first_response);
@@ -8169,8 +8249,7 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
 
         let reason = String::from_str(&env, "governance reason");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         // Initially no response
         let slashes = client.get_slashes(&target);
@@ -8207,15 +8286,14 @@ mod test {
         let (owner, target) = register_and_stake(&env, &client, &token_id, 500);
 
         let reason = String::from_str(&env, "for audit");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
 
         let response = String::from_str(&env, "owner's side of story");
         client.respond_to_slash(&owner, &target, &0, &response);
 
         client.deactivate(&owner, &target);
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
-        client.withdraw_stake(&owner, &target);
+        withdraw_and_assert_solvency(&env, &client, &token_id, &owner, &target);
         client.deregister(&owner, &target);
 
         let slashes = client.get_slashes(&target);
@@ -9481,8 +9559,7 @@ mod test {
         let (env, client, admin, token_id, _treasury) = setup_staking();
         let (owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
         let reason = String::from_str(&env, "test");
-        let pid = client.propose_slash(&admin, &target, &100, &reason);
-        pass_proposal(&env, &client, &admin, pid);
+        slash_and_assert_solvency(&env, &client, &token_id, &admin, &target, 100, &reason);
         let first = String::from_str(&env, "first reply");
         client.respond_to_slash(&owner, &target, &0, &first);
         let second = String::from_str(&env, "second reply");
