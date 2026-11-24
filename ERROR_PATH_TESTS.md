@@ -34,6 +34,11 @@ This documents the dedicated tests added for each `RegistryError` variant (#276�
 - **Test**: `registry/tests/already_executed.rs` — asserts both re-execution and late approval return `AlreadyExecuted`, and that a fresh proposal still executes.
 - **Status**: ✅ Covered by dedicated test.
 
+### #270 `StakingNotConfigured` (variant 15)
+- **Condition**: A staking-dependent operation is attempted before governance has executed `ConfigureStaking`.
+- **Test**: `registry/tests/staking_not_configured.rs` — asserts `get_staking_config`, `stake`, and fee-bearing registration return `StakingNotConfigured`, and that configuring staking clears the guard.
+- **Status**: ✅ Covered by dedicated test.
+
 ## How to Run
 
 ```sh
