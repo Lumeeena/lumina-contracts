@@ -498,3 +498,43 @@ Caveats. Rolling back restores the old *code* only — any storage the new versi
 wrote stays, so a rollback across a migration needs its own reverse migration.
 And because there is no single-signer `upgrade`, a rollback needs the same
 governance threshold and timelock as any other upgrade.
+
+## Release gate: testnet upgrade simulation (#243)
+
+Every tagged release must pass the testnet upgrade simulation **against
+the exact wasm hash that will be proposed on mainnet** before the release
+tag is cut. The `upgrade_persistent_contracts` test proves the mechanism
+against the local Soroban host; this gate proves it against a real
+deployment with real state, which is the only upgrade that matters.
+
+### What the gate does
+
+`scripts/testnet_upgrade_sim.sh <admin-identity> <current-wasm> <next-wasm>`:
+
+1. Deploys `<current-wasm>` to testnet with `<admin-identity>` as the
+   bootstrap admin.
+2. Seeds representative state (a registration and the pre-upgrade
+   `get_contract_count` / `get_contract_config` snapshots).
+3. Installs `<next-wasm>`, submits a governance `propose_upgrade`,
+   approves to threshold, waits out the full `TIMELOCK_LEDGERS`, and
+   executes.
+4. Verifies the seeded state is still intact after the upgrade — the
+   contract count is unchanged, `get_contract_config` still resolves,
+   and the seeded entry is still readable.
+
+Exit `0` means the release gate passed. Exit `3` is a **release blocker**
+— the proposed wasm did not preserve seeded state and MUST NOT be
+proposed on mainnet until the issue is fixed.
+
+### Required before cutting a release tag
+
+| Step | Owner | Artefact |
+|---|---|---|
+| Build current + next wasm reproducibly | release engineer | `target/wasm32-unknown-unknown/release/lumina_registry.wasm` at both commits |
+| Run `scripts/testnet_upgrade_sim.sh …` | release engineer | pass/fail output; attach to the release PR |
+| Record the `NEXT_HASH` the simulation observed | release engineer | pastes into the release PR description |
+| Admin set verifies the `NEXT_HASH` matches the mainnet `propose_upgrade` payload | governance admin | §2.3 "High-risk, consequential" diligence in `GOVERNANCE_PLAYBOOK.md` |
+
+`LUMINA_SIM_FAST_FORWARD` skips the timelock sleep for local iteration only; a
+release gate run MUST leave it unset so the full timelock behaviour is on
+the critical path.

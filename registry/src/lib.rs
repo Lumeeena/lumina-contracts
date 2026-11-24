@@ -286,6 +286,8 @@ pub enum RegistryError {
     SelfRegistration = 44,
     /// Registry is paused.
     Paused = 45,
+    /// The proposed admin weight is zero — remove the admin instead (#247).
+    InvalidAdminWeight = 46,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -548,6 +550,31 @@ pub struct RegistryStats {
     pub total_staked: i128,
 }
 
+/// Snapshot of the registry's configuration, returned by
+/// [`LuminaRegistry::get_contract_config`] (#248). All fields are safe to
+/// read on an uninitialised contract — `initialized` is `false` in that case
+/// and every other field holds its default.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractConfig {
+    /// `CONTRACT_VERSION` baked into the deployed wasm.
+    pub version: u32,
+    /// `true` once `__constructor` or `initialize` has run.
+    pub initialized: bool,
+    /// Size of the current admin set (`0` pre-init).
+    pub admin_count: u32,
+    /// Current approval threshold (`0` pre-init). Under weighted voting this
+    /// is the **minimum summed weight** required to pass a proposal (#247).
+    pub threshold: u32,
+    /// Sum of all admin weights (equals `admin_count` for legacy equal-weight
+    /// sets); `0` pre-init.
+    pub total_weight: u32,
+    /// Staking token / treasury pair, `None` until `ConfigureStaking` has run.
+    pub staking: Option<(Address, Address)>,
+    /// `true` while the pause flag is set.
+    pub paused: bool,
+}
+
 // ─── Proposal types ────────────────────────────────────────────────────────
 
 /// The action a governance proposal will execute once it clears threshold and
@@ -587,6 +614,9 @@ pub enum ProposalAction {
     MigrateCategory(Category, Category),
     /// Enable or disable the global pause for the registry.
     SetPaused(bool),
+    /// Set the voting weight of `admin` to `weight` (0 is not allowed —
+    /// remove the admin instead). See `propose_set_admin_weight` (#247).
+    SetAdminWeight(Address, u32),
     /// Execute actions in order in one transaction, reverting all on failure.
     /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
     Batch(Vec<ProposalAction>),
@@ -708,8 +738,14 @@ pub enum DataKey {
     // ── Governance ──────────────────────────────────────────────────────────
     /// Vec<Address> — the current admin set.
     Admins,
-    /// u32 — number of approvals required to pass a proposal.
+    /// u32 — number of approvals required to pass a proposal. Under weighted
+    /// voting (#247) this is the minimum summed **weight** instead of the
+    /// minimum admin count.
     Threshold,
+    /// u32 — voting weight of a single admin (#247). Any admin missing from
+    /// this map votes with weight 1, so pre-weighting deployments migrate
+    /// to equal weights unchanged.
+    AdminWeight(Address),
     /// u32 — monotonically-increasing proposal counter.
     ProposalCount,
     /// Proposal — the full proposal record.
@@ -1486,6 +1522,45 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// Propose setting `admin`'s voting weight to `weight` (#247).
+    ///
+    /// Zero weights are not accepted — remove the admin via
+    /// `propose_remove_admin` instead. Pre-existing admins who have never
+    /// had a weight set vote with the default weight of `1`, so a
+    /// deployment migrates to weighted voting without a storage write.
+    pub fn propose_set_admin_weight(
+        env: Env,
+        proposer: Address,
+        admin: Address,
+        weight: u32,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+        if weight == 0 {
+            return Err(RegistryError::InvalidAdminWeight);
+        }
+        if !admins.contains(&admin) {
+            return Err(RegistryError::AdminNotFound);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetAdminWeight(admin.clone(), weight),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_admin_weight"),
+                admin,
+                weight,
+            ),
+        );
+        Ok(proposal_id)
+    }
+
     // ── Governance: approval ────────────────────────────────────────────────
 
     /// Record an admin's approval of a proposal.  When the number of unique
@@ -1518,19 +1593,22 @@ impl LuminaRegistry {
             .instance()
             .get(&DataKey::Threshold)
             .unwrap_or(1);
+        // Weighted approval total (#247). Legacy equal-weight admins each
+        // contribute 1, so pre-weighting deployments behave as before.
+        let weight = Self::approval_weight(&env, &proposal.approvals);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_approved"),),
             (
                 proposal_id,
                 admin.clone(),
-                proposal.approvals.len(),
+                weight,
                 threshold,
             ),
         );
 
         // Transition to ready when threshold is first reached.
-        if proposal.ready_at == u32::MAX && proposal.approvals.len() >= threshold {
+        if proposal.ready_at == u32::MAX && weight >= threshold {
             proposal.ready_at = env.ledger().sequence();
             let executable_from = proposal.ready_at + TIMELOCK_LEDGERS;
             env.events().publish(
@@ -1566,7 +1644,8 @@ impl LuminaRegistry {
             .instance()
             .get(&DataKey::Threshold)
             .unwrap_or(1);
-        if proposal.approvals.len() < threshold {
+        // Weighted approval total (#247); matches `approve_proposal`.
+        if Self::approval_weight(&env, &proposal.approvals) < threshold {
             return Err(RegistryError::ThresholdNotMet);
         }
 
@@ -2593,6 +2672,68 @@ impl LuminaRegistry {
             .instance()
             .get(&DataKey::Threshold)
             .ok_or(RegistryError::NotInitialized)
+    }
+
+    /// Voting weight for a single admin (#247). Defaults to `1` for an admin
+    /// whose weight has never been set — mirroring the on-chain migration
+    /// behaviour — so this is also the right call for callers who want to
+    /// know "what would this admin count as in the next vote".
+    pub fn get_admin_weight(env: Env, admin: Address) -> u32 {
+        Self::admin_weight(&env, &admin)
+    }
+
+    /// Sum of voting weights across every current admin (#247). Equals the
+    /// admin count for a deployment that has never set a non-default weight.
+    pub fn get_total_admin_weight(env: Env) -> u32 {
+        Self::total_admin_weight(&env)
+    }
+
+    /// Return the registry's full configuration in a single call (#248).
+    ///
+    /// Safe to call on an uninitialised contract: `initialized` is `false`
+    /// in that case and every other field holds its default. This is the
+    /// view the status dashboard reads so a monitor does not have to make
+    /// four separate calls just to show the configuration band.
+    pub fn get_contract_config(env: Env) -> ContractConfig {
+        let admins = Self::admin_index(&env);
+        let initialized = !admins.is_empty();
+        let admin_count = admins.len();
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(0);
+        let total_weight = if initialized {
+            Self::total_admin_weight(&env)
+        } else {
+            0
+        };
+        let staking = match (
+            env.storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::StakeToken),
+            env.storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::Treasury),
+        ) {
+            (Some(token), Some(treasury)) => Some((token, treasury)),
+            _ => None,
+        };
+        let paused = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        ContractConfig {
+            version: CONTRACT_VERSION,
+            initialized,
+            admin_count,
+            threshold,
+            total_weight,
+            staking,
+            paused,
+        }
     }
 
     /// Retrieve a proposal by ID.
@@ -3737,6 +3878,38 @@ impl LuminaRegistry {
             .unwrap_or(Vec::new(env))
     }
 
+    /// Voting weight for one admin (#247). Any admin missing from the
+    /// `AdminWeight` map votes with weight 1, so a legacy equal-weight
+    /// deployment migrates to the weighted model without a storage write.
+    fn admin_weight(env: &Env, admin: &Address) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminWeight(admin.clone()))
+            .unwrap_or(1)
+    }
+
+    /// Sum of voting weights across every admin in the set (#247). Equals
+    /// `admin_index(env).len()` for a legacy equal-weight deployment.
+    fn total_admin_weight(env: &Env) -> u32 {
+        let admins = Self::admin_index(env);
+        let mut total: u32 = 0;
+        for admin in admins.iter() {
+            total = total.saturating_add(Self::admin_weight(env, &admin));
+        }
+        total
+    }
+
+    /// Sum of voting weights for the approvals already recorded on a proposal
+    /// (#247). Used in place of `approvals.len()` by `approve_proposal` and
+    /// `execute_proposal`.
+    fn approval_weight(env: &Env, approvals: &Vec<Address>) -> u32 {
+        let mut total: u32 = 0;
+        for admin in approvals.iter() {
+            total = total.saturating_add(Self::admin_weight(env, &admin));
+        }
+        total
+    }
+
     fn validate_contract_metadata(
         name: &String,
         description: &String,
@@ -3893,25 +4066,39 @@ impl LuminaRegistry {
                 // After removal the set must still be large enough for the
                 // threshold to be satisfiable.
                 let new_len = admins.len().saturating_sub(1);
-                if new_len < threshold {
-                    return Err(RegistryError::InvalidThreshold);
-                }
                 if new_len < MIN_ADMINS {
                     return Err(RegistryError::AdminSetTooSmall);
+                }
+                // Under weighted voting (#247) the threshold is compared
+                // against remaining **summed weight**, not remaining count,
+                // so removing a heavily-weighted admin can leave the
+                // remaining set unable to satisfy the threshold even when
+                // the count is otherwise sufficient.
+                let removed_weight = Self::admin_weight(env, admin_to_remove);
+                let total_weight = Self::total_admin_weight(env);
+                if total_weight.saturating_sub(removed_weight) < threshold {
+                    return Err(RegistryError::InvalidThreshold);
                 }
 
                 if let Some(i) = admins.first_index_of(admin_to_remove) {
                     admins.remove(i);
                     env.storage().instance().set(&DataKey::Admins, &admins);
                 }
+                // Clear the removed admin's weight so a future re-add starts
+                // from the default weight of 1.
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AdminWeight(admin_to_remove.clone()));
                 env.events().publish(
                     (Symbol::new(env, "admin_removed"),),
                     (admin_to_remove.clone(),),
                 );
             }
             ProposalAction::ChangeThreshold(new_threshold) => {
-                let admins = Self::admin_index(env);
-                if *new_threshold == 0 || *new_threshold > admins.len() {
+                // Under weighted voting (#247) the threshold is a minimum
+                // summed weight, so it cannot exceed `total_admin_weight`.
+                let total_weight = Self::total_admin_weight(env);
+                if *new_threshold == 0 || *new_threshold > total_weight {
                     return Err(RegistryError::InvalidThreshold);
                 }
                 env.storage()
@@ -4190,6 +4377,22 @@ impl LuminaRegistry {
                 env.storage().instance().set(&DataKey::Paused, paused);
                 env.events()
                     .publish((Symbol::new(env, "paused_set"),), (*paused,));
+            }
+            ProposalAction::SetAdminWeight(admin, weight) => {
+                if *weight == 0 {
+                    return Err(RegistryError::InvalidAdminWeight);
+                }
+                let admins = Self::admin_index(env);
+                if !admins.contains(admin) {
+                    return Err(RegistryError::AdminNotFound);
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AdminWeight(admin.clone()), weight);
+                env.events().publish(
+                    (Symbol::new(env, "admin_weight_set"),),
+                    (admin.clone(), *weight),
+                );
             }
         }
         Ok(())
