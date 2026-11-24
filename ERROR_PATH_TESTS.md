@@ -34,9 +34,12 @@ This documents the dedicated tests added for each `RegistryError` variant (#276�
 - **Test**: `registry/tests/already_executed.rs` — asserts both re-execution and late approval return `AlreadyExecuted`, and that a fresh proposal still executes.
 - **Status**: ✅ Covered by dedicated test.
 
-### #270 `StakingNotConfigured` (variant 15)
-- **Condition**: A staking-dependent operation is attempted before governance has executed `ConfigureStaking`.
-- **Test**: `registry/tests/staking_not_configured.rs` — asserts `get_staking_config`, `stake`, and fee-bearing registration return `StakingNotConfigured`, and that configuring staking clears the guard.
+### #259 `ContractNotFound` (variant 4), #262 `NotInitialized` (variant 7), #266 `AlreadyApproved` (variant 11), #267 `NotAdmin` (variant 12)
+- **Tests**: `registry/tests/registry_error_paths_259_262_266_267.rs`, each asserting the exact `Err(Ok(RegistryError::...))`.
+- **#259**: `deactivate` on an address that was never registered returns `ContractNotFound`.
+- **#262**: `__constructor` always installs a bootstrap admin, so `NotInitialized` is not reachable through the public API of a normally deployed registry. The test removes the `Admins`, `Admin` and `Threshold` instance keys with `env.as_contract` to model a deployment whose governance state is missing, then asserts `get_admins`, `get_admin`, `get_threshold` and `propose_deactivate` return it.
+- **#266**: the same admin approving the same proposal twice returns `AlreadyApproved`; approving a different proposal is still allowed.
+- **#267**: a stranger calling `propose_deactivate` or `approve_proposal` returns `NotAdmin`.
 - **Status**: ✅ Covered by dedicated test.
 
 ## How to Run
