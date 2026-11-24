@@ -240,6 +240,12 @@ error, and `get_proposal` exposes the expiry so a UI can surface it. Tests use
 a short window so they can exercise the boundary without archiving fixture
 storage.
 
+If enough admin keys are lost that no proposal can reach the threshold,
+governance is frozen and cannot be recovered on chain. See
+[GOVERNANCE_RECOVERY.md](GOVERNANCE_RECOVERY.md) for what stops working, what
+keeps working, the key management practices that avoid it, and the decision not
+to add an on-chain recovery path.
+
 ## Staking, verification, and slashing
 
 Staking is unavailable until governance configures a SEP-41 token and a
