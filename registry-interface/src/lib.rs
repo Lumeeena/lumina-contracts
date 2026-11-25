@@ -82,34 +82,32 @@
 //!
 //! ## Reentrancy across the token transfer boundary
 //!
-//! The registry moves tokens in three paths: `stake`, `withdraw_stake`, and the
-//! slash path that governance drives. Each of these calls into an external
-//! token contract, which is code the registry does not control. The ordering
-//! therefore matters:
+//! The registry calls out to an external token contract in five entrypoints:
+//! `stake`, `withdraw_stake`, `register_contract`, `register_contracts`, and
+//! `execute_proposal` (`ConfigureStaking`, `Slash`, `WithdrawFromTreasury`,
+//! and `Batch` proposals containing them). External token code is outside the
+//! registry's control, so defence is layered:
 //!
-//! - **State is written before the external call.** Every path that moves
-//!   tokens follows checks-effects-interactions: the stored balance is
-//!   updated first, then the transfer is issued. A token that reenters
-//!   `withdraw_stake` during its own `transfer` sees a zero balance and
-//!   cannot withdraw twice.
+//! - **Checks-effects-interactions (CEI) ordering is the primary defence.**
+//!   State writes belong before external calls so invariants hold even while
+//!   control leaves the contract.
 //!
-//! - **Soroban does not guarantee atomicity of a cross-contract call.**
-//!   The host does not prevent reentrancy, and it does not roll back a
-//!   partially-completed call automatically unless the call returns an
-//!   error or panics. A callee that returns successfully after mutating
-//!   state leaves that mutation in place. The registry therefore cannot
-//!   rely on the host to defend it; it must order its own writes.
+//! - **An explicit reentrancy guard complements — does not replace — ordering.**
+//!   Statement ordering is implicit and easy to undo accidentally in a later
+//!   change. Every token-calling entrypoint therefore acquires a contract-wide
+//!   reentrancy lock in temporary storage (`DataKey::ReentrancyLock`) and
+//!   rejects any nested entry with [`RegistryError::ReentrantCall`]. The lock
+//!   is cleared on drop (`Ok` or `Err`) and rolled back by the host on any
+//!   trap or panic.
 //!
 //! - **Authorization is not a reentrancy defense.** `require_auth` is checked
 //!   once at the entrypoint and does not gate nested calls that the same
-//!   authorized address makes. A token that the registry calls can call back
-//!   into the registry with the registry's own authority still in force.
+//!   authorized address makes. A token that the registry calls can attempt to
+//!   call back into the registry while authority is still in force.
 //!
-//! The guarantee this crate documents is therefore a *contract-level* one,
-//! not a host-level one: every token-moving entrypoint writes its state
-//! before it calls out. The test suite exercises this with a reentrant token
-//! contract that attempts a double withdrawal and asserts the second
-//! attempt fails.
+//! The test suite exercises every external-call path with a reentrant token
+//! contract and asserts that reentrant calls are rejected while legitimate
+//! follow-up calls continue to succeed.
 
 use soroban_sdk::{contractclient, contracterror, contracttype, Address, Env, String, Vec};
 
@@ -142,15 +140,15 @@ use soroban_sdk::{contractclient, contracterror, contracttype, Address, Env, Str
 ///
 /// # Reentrancy
 ///
-/// The write side of the registry moves tokens through an external token
-/// contract in `stake`, `withdraw_stake` and the slash path. Every such
-/// entrypoint writes its stored balance before it issues the transfer
-/// (checks-effects-interactions), so a token that reenters during its own
-/// `transfer` sees the already-updated balance and cannot double-withdraw.
-/// Soroban itself does not prevent reentrancy and does not roll back a
-/// successful call's state mutations, so this ordering is the defense.
-/// See the crate-level docs for the full argument. Consumers that only
-/// read the registry are unaffected by any of this.
+/// The write side of the registry calls out to an external token contract in
+/// `stake`, `withdraw_stake`, `register_contract`, `register_contracts`, and
+/// `execute_proposal` (`ConfigureStaking`, `Slash`, `WithdrawFromTreasury`,
+/// and `Batch` proposals containing them). Checks-effects-interactions
+/// ordering is the primary defence, complemented — not replaced — by an
+/// explicit contract-wide reentrancy guard (`DataKey::ReentrancyLock`) on
+/// every external-call entrypoint that rejects reentrant calls with
+/// [`RegistryError::ReentrantCall`]. See the crate-level docs for details.
+/// Consumers that only read the registry are unaffected by any of this.
 #[contractclient(name = "RegistryInterfaceClient")]
 pub trait RegistryInterface {
     /// Which build of the registry is live at this address.
@@ -481,6 +479,9 @@ pub enum RegistryError {
     StakeOverflow = 40,
     /// Registry is paused.
     Paused = 45,
+    /// A reentrant call entered a guarded external-call entrypoint while
+    /// another external call was already in progress.
+    ReentrantCall = 47,
 }
 
 /// Byte-compatible with `lumina_registry::Category`.
