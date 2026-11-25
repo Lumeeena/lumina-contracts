@@ -569,8 +569,10 @@ pub struct ContractConfig {
     /// Sum of all admin weights (equals `admin_count` for legacy equal-weight
     /// sets); `0` pre-init.
     pub total_weight: u32,
-    /// Staking token / treasury pair, `None` until `ConfigureStaking` has run.
-    pub staking: Option<(Address, Address)>,
+    /// Staking token address, `None` until `ConfigureStaking` has run.
+    pub staking_token: Option<Address>,
+    /// Treasury address, `None` until `ConfigureStaking` has run.
+    pub staking_treasury: Option<Address>,
     /// `true` while the pause flag is set.
     pub paused: bool,
 }
@@ -2708,7 +2710,7 @@ impl LuminaRegistry {
         } else {
             0
         };
-        let staking = match (
+        let (staking_token, staking_treasury) = match (
             env.storage()
                 .instance()
                 .get::<DataKey, Address>(&DataKey::StakeToken),
@@ -2716,8 +2718,8 @@ impl LuminaRegistry {
                 .instance()
                 .get::<DataKey, Address>(&DataKey::Treasury),
         ) {
-            (Some(token), Some(treasury)) => Some((token, treasury)),
-            _ => None,
+            (Some(token), Some(treasury)) => (Some(token), Some(treasury)),
+            _ => (None, None),
         };
         let paused = env
             .storage()
@@ -2731,7 +2733,8 @@ impl LuminaRegistry {
             admin_count,
             threshold,
             total_weight,
-            staking,
+            staking_token,
+            staking_treasury,
             paused,
         }
     }
