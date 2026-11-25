@@ -40,7 +40,8 @@ fn config_is_safe_pre_initialisation_equivalent_to_default_bootstrap() {
     assert_eq!(config.admin_count, 1);
     assert_eq!(config.threshold, 1);
     assert_eq!(config.total_weight, 1);
-    assert!(config.staking.is_none());
+    assert!(config.staking_token.is_none());
+    assert!(config.staking_treasury.is_none());
     assert!(!config.paused);
 }
 
@@ -65,9 +66,8 @@ fn config_reflects_staking_configuration_once_executed() {
     client.execute_proposal(&admin, &pid);
 
     let config = client.get_contract_config();
-    let (cfg_token, cfg_treasury) = config.staking.expect("staking should be set");
-    assert_eq!(cfg_token, token_id);
-    assert_eq!(cfg_treasury, treasury);
+    assert_eq!(config.staking_token, Some(token_id));
+    assert_eq!(config.staking_treasury, Some(treasury));
 }
 
 #[test]
