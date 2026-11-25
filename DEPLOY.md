@@ -394,7 +394,35 @@ on current Rust, a module the Soroban host refuses to load — and an upgrade to
 that hash behind the timelock cannot be recalled, so verify the hash before
 proposing.
 
-### 4. Propose, approve, and execute the upgrade
+### 4. Canary: run the new wasm against copied state
+
+Rollback exists but only works once you *notice* the problem — after the live
+registry has already been swapped. A canary deploys the new wasm as a separate
+instance seeded with representative state and lets you exercise it *before*
+touching the live contract. See `UPGRADE_CANARY.md` for the full walkthrough;
+the headline is:
+
+```bash
+# 1. Deploy a fresh instance from the new wasm hash
+stellar contract deploy \
+  --wasm-hash <hash-from-upload> \
+  --source lumina-deployer --network testnet
+
+# 2. Seed it with a representative subset of registrations and stakes
+#    (copied from the live registry via get_active_contracts_after + get_stake)
+
+# 3. Run the smoke suite against the canary
+scripts/upgrade_canary_smoke.sh <canary-contract-id>
+```
+
+Only proceed to step 5 after the canary passes, and record the canary's
+contract id and tx hash in the upgrade ticket so reviewers can audit it.
+
+Treat a failing canary the same as a failing CI job: do not propose the
+upgrade. If the canary passes and you still hit a problem on the live
+registry, rollback follows the usual path (see "Rollback" below).
+
+### 5. Propose, approve, and execute the upgrade
 
 An upgrade is an ordinary governance proposal. Any admin proposes it:
 
@@ -428,7 +456,7 @@ to completion under the old code and emits a `registry_upgraded` event carrying
 the new hash and the version being replaced. Inspect the proposal at any point
 with `get_proposal`.
 
-### 5. Verify
+### 6. Verify
 
 ```bash
 stellar contract invoke --id lumina-registry --source lumina-deployer \
