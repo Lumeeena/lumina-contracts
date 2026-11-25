@@ -2475,6 +2475,18 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         staker.require_auth();
 
+        // #234: refuse new stake while the registry is paused. Withdrawals
+        // are deliberately not gated — governance can pause a registry to
+        // stop *entries* without trapping funds already inside it.
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(RegistryError::Paused);
+        }
+
         Self::validate_positive_amount(amount)?;
 
         let _entry: ContractEntry = env
@@ -2997,10 +3009,11 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
+        // #236: saturate instead of trapping; matches `reputation_of`.
         let mut slashed_total: i128 = 0;
         let slashes = Self::slash_history(&env, &contract_id);
         for record in slashes.iter() {
-            slashed_total += record.amount;
+            slashed_total = slashed_total.saturating_add(record.amount);
         }
 
         let withdraw_locked_until = Self::withdraw_locked_until(&env, &contract_id);
@@ -4527,9 +4540,14 @@ impl LuminaRegistry {
     }
 
     fn reputation_of(env: &Env, contract_id: &Address) -> Reputation {
+        // #236: slashed_total is read on every reputation query, so an
+        // overflow here would turn a read into a trap. The workspace enables
+        // `overflow-checks` on release, which would otherwise `abort` the
+        // call. `saturating_add` keeps the read infallible and pins the
+        // reported total at `i128::MAX`; see `tests/reputation_boundaries.rs`.
         let mut slashed_total: i128 = 0;
         for record in Self::slash_history(env, contract_id).iter() {
-            slashed_total += record.amount;
+            slashed_total = slashed_total.saturating_add(record.amount);
         }
 
         let withdraw_locked_until = Self::withdraw_locked_until(env, contract_id);
