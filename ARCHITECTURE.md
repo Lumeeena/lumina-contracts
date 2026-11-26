@@ -73,8 +73,9 @@ function.
 
 Soroban instance storage holds registry-wide configuration, counters, the
 global ordered index, and governance proposals. Persistent storage holds
-state keyed by a registration, owner, or category. The contract does not use
-temporary storage.
+state keyed by a registration, owner, or category. Temporary storage holds
+only the transient `ReentrancyLock` flag acquired by external-call entrypoints
+and removed before return.
 
 ### Instance storage
 
@@ -305,3 +306,27 @@ score close to its undecayed value. The decay factor is applied in
 `get_contract_profile` and `get_active_profiles` without writing to storage, so
 there is no write amplification and no migration when the curve or its
 parameters change.
+
+## Reentrancy defence
+
+Checks-effects-interactions (CEI) ordering is the primary defence against
+reentrancy: state updates must be committed before control leaves the contract
+to an external token. Because statement ordering is implicit and easy to regress
+during later changes, every entrypoint that calls out to a token contract also
+acquires an explicit contract-wide `ReentrancyGuard` backed by temporary storage
+(`DataKey::ReentrancyLock`):
+
+- `execute_proposal` (covers `ConfigureStaking`, `Slash`,
+  `WithdrawFromTreasury`, and `Batch` proposals containing them)
+- `register_contract` (registration fee transfer)
+- `register_contracts` (batch registration fee transfer)
+- `stake` (collateral deposit transfer)
+- `withdraw_stake` (collateral withdrawal transfer)
+
+**The explicit guard complements, and does not replace, correct ordering.** It
+makes the external-call boundary visible at the top of each entrypoint and
+rejects any nested call into a guarded entrypoint with
+`RegistryError::ReentrantCall`. The lock lives in temporary storage (which
+flushes immediately to the host ledger map, unlike frame-buffered instance
+storage) and is cleared on drop on both `Ok` and `Err` returns, and rolled back
+by the host on any trap or panic.

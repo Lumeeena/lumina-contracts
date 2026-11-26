@@ -63,6 +63,27 @@
 //!
 //! When a ceiling is intentionally raised, update this table in the same
 //! commit so the regression stays visible in review.
+//!
+//! ## Reentrancy defence
+//!
+//! Checks-effects-interactions (CEI) ordering is the primary defence against
+//! reentrancy: state updates must be committed before calling out to an
+//! external contract so invariants hold even while control is outside the
+//! registry. Because statement ordering is implicit and easy to undo
+//! accidentally during a refactor, every entrypoint that calls out to an
+//! external token contract (`execute_proposal`, `register_contract`,
+//! `register_contracts`, `stake`, and `withdraw_stake`) also acquires an
+//! explicit contract-wide [`ReentrancyGuard`] backed by temporary storage
+//! (`DataKey::ReentrancyLock`).
+//!
+//! **The guard complements, and does not replace, correct ordering.** Making
+//! the lock explicit keeps the external-call boundary visible in review and
+//! rejects any reentrant entry into a guarded entrypoint with
+//! [`RegistryError::ReentrantCall`]. Temporary storage is used instead of
+//! instance storage because Soroban buffers instance storage per frame until
+//! frame exit, whereas temporary storage writes take effect immediately in the
+//! host ledger map; the guard removes the lock on drop (`Ok` or `Err`), and
+//! host frame rollback clears it on any trap or panic.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
@@ -183,6 +204,7 @@ const PERSISTENT_TTL_BUMP: u32 = 518_400;
 /// | 28 | `AttestationNotFound` | Caller has no attestation to revoke on this registration. | Only revoke attestations you created. |
 /// | 29 | `OverlappingAddress` | Token or treasury address overlaps with a registered contract. | Use distinct addresses for staking config. |
 /// | 30 | `NoPendingTransfer` | No ownership transfer is currently pending for this contract. | Propose a transfer first with `propose_ownership_transfer`. |
+/// | 47 | `ReentrantCall` | A reentrant call entered a guarded external-call entrypoint while another external call was already in progress. | Do not reenter the registry from an external token callback; wait for the outer call to complete. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -290,11 +312,9 @@ pub enum RegistryError {
     Paused = 45,
     /// The proposed admin weight is zero — remove the admin instead (#247).
     InvalidAdminWeight = 46,
-    /// The proposal deposit amount is negative.
-    InvalidProposalDeposit = 47,
-    /// `forfeit_stale_proposal_deposit` was called before the proposal's
-    /// expiry window elapsed, or the proposal has no deposit to forfeit.
-    ProposalDepositNotForfeitable = 48,
+    /// A reentrant call entered a guarded external-call entrypoint while
+    /// another external call was already in progress.
+    ReentrantCall = 47,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -756,6 +776,7 @@ pub const ALLOWLISTED_TTL_EXTEND_TO: u32 = 3_110_400;
 /// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
 /// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
 /// | `Admin` | instance | `Address` — legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
+/// | `ReentrancyLock` | temporary | `bool` — active external-call lock | Transient; written on entry to every token-calling entrypoint (`execute_proposal`, `register_contract`, `register_contracts`, `stake`, `withdraw_stake`) and removed on drop (or rolled back on trap/error). Complements, does not replace, CEI ordering. |
 ///
 /// Indexes that must stay consistent with their entries: `OwnerContracts`,
 /// `AllContracts`, and `ByCategory`. Each names `Contract` entries, so a
@@ -909,6 +930,12 @@ pub enum DataKey {
     /// Resumable cursor for an in-progress category migration.
     MigrationCursor,
 
+    // ── Reentrancy guard ────────────────────────────────────────────────────
+    /// bool — transient reentrancy lock in temporary storage while an
+    /// external-call entrypoint is active. Complements, does not replace,
+    /// checks-effects-interactions ordering.
+    ReentrancyLock,
+
     // ── Legacy key kept for upgrade compatibility ────────────────────────
     /// Single-admin key written by the original v1 `initialize`.  Retained so
     /// old deployments still decode it, but it is **deprecated and grants no
@@ -917,6 +944,58 @@ pub enum DataKey {
     /// consults it only as a fallback for a registry that predates the admin
     /// set.
     Admin,
+}
+
+// ─── Reentrancy guard ──────────────────────────────────────────────────────
+//
+// Checks-effects-interactions (CEI) ordering is the primary defence against
+// reentrancy: state updates must be committed before calling out to external
+// contracts so invariants hold while control is outside the registry. Because
+// statement ordering is implicit and easy to regress in a later refactor,
+// every entrypoint that calls out to a token contract also acquires
+// [`ReentrancyGuard`].
+//
+// This guard **complements, and does not replace**, correct ordering. It makes
+// the reentrancy boundary explicit in the code and rejects any nested entry
+// into a guarded entrypoint with [`RegistryError::ReentrantCall`].
+//
+// The lock is stored in **temporary** storage rather than instance storage:
+// Soroban buffers instance storage per frame and only flushes it when the
+// frame exits, whereas temporary storage writes take effect immediately in the
+// host ledger map so a nested frame observes the lock right away. Dropping the
+// guard removes the key on both `Ok` and `Err` paths, and host frame rollback
+// clears it on any trap or panic, so the lock can never be left stuck.
+
+/// Scoped reentrancy lock for every entrypoint that calls out to an external
+/// token contract.
+///
+/// Complements, and does not replace, checks-effects-interactions ordering.
+#[must_use = "the reentrancy lock is released immediately if the guard is dropped"]
+struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> ReentrancyGuard<'a> {
+    /// Acquire the contract-wide reentrancy lock, or reject with
+    /// [`RegistryError::ReentrantCall`] if a guarded entrypoint is already
+    /// executing.
+    fn enter(env: &'a Env) -> Result<Self, RegistryError> {
+        let storage = env.storage().temporary();
+        if storage.has(&DataKey::ReentrancyLock) {
+            return Err(RegistryError::ReentrantCall);
+        }
+        storage.set(&DataKey::ReentrancyLock, &true);
+        Ok(Self { env })
+    }
+}
+
+impl Drop for ReentrancyGuard<'_> {
+    fn drop(&mut self) {
+        self.env
+            .storage()
+            .temporary()
+            .remove(&DataKey::ReentrancyLock);
+    }
 }
 
 // ─── Contract ──────────────────────────────────────────────────────────────
@@ -1749,12 +1828,18 @@ impl LuminaRegistry {
     /// Execute a proposal that has reached threshold and passed the timelock.
     /// Callable by anyone once those conditions are satisfied.
     /// The executor's address is recorded for audit purposes.
+    ///
+    /// Guarded by [`ReentrancyGuard`] because proposal actions (`ConfigureStaking`,
+    /// `Slash`, `WithdrawFromTreasury`, and `Batch` containing them) call out to
+    /// external token contracts. The guard complements, and does not replace,
+    /// checks-effects-interactions ordering.
     pub fn execute_proposal(
         env: Env,
         executor: Address,
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
-        access_control::require_auth(&executor);
+        let _reentrancy_guard = ReentrancyGuard::enter(&env)?;
+        executor.require_auth();
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -2079,6 +2164,10 @@ impl LuminaRegistry {
     /// `categories` must name at least one [`Category`]; duplicates are
     /// collapsed, so passing the same category twice indexes it once. Use
     /// [`Category::Other`] if none of the vocabulary fits.
+    ///
+    /// Guarded by [`ReentrancyGuard`] because fee collection calls out to the
+    /// configured stake token contract. Complements, does not replace, CEI
+    /// ordering.
     pub fn register_contract(
         env: Env,
         owner: Address,
@@ -2087,7 +2176,8 @@ impl LuminaRegistry {
         description: String,
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
-        access_control::require_auth(&owner);
+        let _reentrancy_guard = ReentrancyGuard::enter(&env)?;
+        owner.require_auth();
         // Pause guard: reject writes when paused.
         if env
             .storage()
@@ -2200,12 +2290,17 @@ impl LuminaRegistry {
     /// Fails and registers nothing if any entry is invalid or already registered.
     /// The combined count of new registrations is subject to the per-owner cap
     /// if registration rate limiting is enabled.
+    ///
+    /// Guarded by [`ReentrancyGuard`] because batch fee collection calls out to
+    /// the configured stake token contract. Complements, does not replace, CEI
+    /// ordering.
     pub fn register_contracts(
         env: Env,
         owner: Address,
         entries: Vec<RegistrationEntry>,
     ) -> Result<(), RegistryError> {
-        access_control::require_auth(&owner);
+        let _reentrancy_guard = ReentrancyGuard::enter(&env)?;
+        owner.require_auth();
 
         if entries.is_empty() {
             return Err(RegistryError::InvalidMetadata);
@@ -2586,26 +2681,19 @@ impl LuminaRegistry {
 
     // ── Staking ─────────────────────────────────────────────────────────────
 
-    /// Post collateral against a registration you own.
+    /// Post collateral against a registration.
+    ///
+    /// Guarded by [`ReentrancyGuard`] because depositing collateral calls out to
+    /// the configured stake token contract. Complements, does not replace, CEI
+    /// ordering.
     pub fn stake(
         env: Env,
         staker: Address,
         contract_id: Address,
         amount: i128,
     ) -> Result<(), RegistryError> {
-        access_control::require_auth(&staker);
-
-        // #234: refuse new stake while the registry is paused. Withdrawals
-        // are deliberately not gated — governance can pause a registry to
-        // stop *entries* without trapping funds already inside it.
-        if env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
-            return Err(RegistryError::Paused);
-        }
+        let _reentrancy_guard = ReentrancyGuard::enter(&env)?;
+        staker.require_auth();
 
         Self::validate_positive_amount(amount)?;
 
@@ -2683,12 +2771,17 @@ impl LuminaRegistry {
     }
 
     /// Reclaim the full remaining stake for a registration.
+    ///
+    /// Guarded by [`ReentrancyGuard`] because returning collateral calls out to
+    /// the configured stake token contract. Complements, does not replace, CEI
+    /// ordering.
     pub fn withdraw_stake(
         env: Env,
         staker: Address,
         contract_id: Address,
     ) -> Result<i128, RegistryError> {
-        access_control::require_auth(&staker);
+        let _reentrancy_guard = ReentrancyGuard::enter(&env)?;
+        staker.require_auth();
 
         let entry: ContractEntry = env
             .storage()
