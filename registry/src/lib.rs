@@ -92,6 +92,8 @@ use soroban_sdk::{
 
 extern crate alloc;
 
+mod access_control;
+
 // ─── Version ───────────────────────────────────────────────────────────────
 
 /// Version of the deployed code, returned by [`LuminaRegistry::get_version`].
@@ -644,6 +646,8 @@ pub enum ProposalAction {
     /// Set the voting weight of `admin` to `weight` (0 is not allowed —
     /// remove the admin instead). See `propose_set_admin_weight` (#247).
     SetAdminWeight(Address, u32),
+    /// Set the deposit required to open a new proposal; zero disables it.
+    SetProposalDeposit(i128),
     /// Execute actions in order in one transaction, reverting all on failure.
     /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
     Batch(Vec<ProposalAction>),
@@ -672,6 +676,23 @@ pub const REGISTRATION_WINDOW_TTL_EXTEND_TO: u32 = 3_110_400;
 pub struct RegistrationWindow {
     pub started_at: u32,
     pub count: u32,
+}
+
+/// Window after which an unexecuted proposal's deposit can be forfeited to
+/// the treasury by anyone. Measured from the ledger the deposit was taken on.
+/// ~24 days at 6 s per ledger — comfortably past the standard timelock plus
+/// a long execution grace period, so an honest proposer who wants to see their
+/// proposal executed has ample time.
+pub const PROPOSAL_EXPIRY_LEDGERS: u32 = 345_600;
+
+/// Deposit record stored alongside a proposal while funds sit in escrow.
+/// Lets `execute_proposal` refund the original proposer the exact amount that
+/// was taken, regardless of config changes between propose and execute.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalDepositRecord {
+    pub amount: i128,
+    pub paid_at: u32,
 }
 
 /// State stored for every open (or executed) proposal.
@@ -780,6 +801,13 @@ pub enum DataKey {
     ProposalData(u32),
     /// bool — governance‑controlled pause flag. When true, write entrypoints reject.
     Paused,
+    /// i128 — the deposit required to open a new proposal; zero disables it.
+    /// Settable only through `SetProposalDeposit` governance proposals. See
+    /// `PROPOSAL_EXPIRY_LEDGERS` for the forfeit interaction.
+    ProposalDeposit,
+    /// ProposalDepositRecord — the deposit actually paid for one proposal,
+    /// held in escrow in the contract. Cleared on refund (execute) or forfeit.
+    ProposalDepositPaid(u32),
 
     // ── Registry ────────────────────────────────────────────────────────────
     /// u32 — live registrations (deactivated included, deregistered excluded).
@@ -981,7 +1009,7 @@ impl LuminaRegistry {
     /// Atomically initialize a new deployment with one bootstrap admin.
     /// The deployment transaction must include that admin's authorization.
     pub fn __constructor(env: Env, bootstrap_admin: Address) {
-        bootstrap_admin.require_auth();
+        access_control::require_auth(&bootstrap_admin);
         let mut admins = Vec::new(&env);
         admins.push_back(bootstrap_admin.clone());
         env.storage().instance().set(&DataKey::Admins, &admins);
@@ -1014,7 +1042,7 @@ impl LuminaRegistry {
 
         // Every admin must authorize the initialization.
         for admin in admins.iter() {
-            admin.require_auth();
+            access_control::require_auth(&admin);
         }
 
         env.storage().instance().set(&DataKey::Admins, &admins);
@@ -1048,13 +1076,13 @@ impl LuminaRegistry {
         proposer: Address,
         actions: Vec<ProposalAction>,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
-        Self::assert_is_admin(&Self::admin_index(&env), &proposer)?;
+        access_control::require_auth(&proposer);
+        access_control::assert_admin(&Self::admin_index(&env), &proposer)?;
         Self::validate_batch(&actions)?;
 
         let action_count = actions.len();
         let proposal_id =
-            Self::create_proposal(&env, proposer.clone(), ProposalAction::Batch(actions));
+            Self::create_proposal(&env, proposer.clone(), ProposalAction::Batch(actions))?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1074,9 +1102,9 @@ impl LuminaRegistry {
         proposer: Address,
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         // Make sure the target actually exists.
         if !env
@@ -1091,7 +1119,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::Deactivate(contract_id.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1112,9 +1140,9 @@ impl LuminaRegistry {
         proposer: Address,
         new_admin: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if admins.contains(&new_admin) {
             return Err(RegistryError::AlreadyAdmin);
@@ -1124,7 +1152,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::AddAdmin(new_admin.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1145,9 +1173,9 @@ impl LuminaRegistry {
         proposer: Address,
         admin_to_remove: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if !admins.contains(&admin_to_remove) {
             return Err(RegistryError::AdminNotFound);
@@ -1157,7 +1185,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::RemoveAdmin(admin_to_remove.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1178,9 +1206,9 @@ impl LuminaRegistry {
         proposer: Address,
         new_threshold: u32,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if new_threshold == 0 || new_threshold > admins.len() {
             return Err(RegistryError::InvalidThreshold);
@@ -1199,7 +1227,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ChangeThreshold(new_threshold),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1220,15 +1248,15 @@ impl LuminaRegistry {
         proposer: Address,
         new_wasm_hash: BytesN<32>,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
             ProposalAction::Upgrade(new_wasm_hash.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1265,9 +1293,9 @@ impl LuminaRegistry {
         token: Address,
         treasury: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         // Reject if either address is already a registered contract.
         // See `RegistryError::OverlappingAddress` for the full rationale.
@@ -1303,7 +1331,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ConfigureStaking(token.clone(), treasury.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1328,9 +1356,9 @@ impl LuminaRegistry {
         contract_id: Address,
         verified: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if !env
             .storage()
@@ -1349,7 +1377,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetVerified(contract_id.clone(), verified),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1377,9 +1405,9 @@ impl LuminaRegistry {
         amount: i128,
         reason: String,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if !env
             .storage()
@@ -1394,7 +1422,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::Slash(contract_id.clone(), amount, reason.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1416,14 +1444,14 @@ impl LuminaRegistry {
         proposer: Address,
         enabled: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
             ProposalAction::SetAllowlistEnabled(enabled),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1443,14 +1471,14 @@ impl LuminaRegistry {
         owner: Address,
         allowed: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
             ProposalAction::SetAllowlisted(owner.clone(), allowed),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1475,9 +1503,9 @@ impl LuminaRegistry {
         limit: u32,
         window_ledgers: u32,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
             return Err(RegistryError::InvalidRateLimit);
         }
@@ -1485,7 +1513,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ConfigureRegistrationRateLimit(limit, window_ledgers),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1504,9 +1532,9 @@ impl LuminaRegistry {
         proposer: Address,
         fee: i128,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if fee < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1514,7 +1542,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetRegistrationFee(fee),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1527,15 +1555,103 @@ impl LuminaRegistry {
         Ok(proposal_id)
     }
 
+    /// #245: Set the deposit required to open a new proposal. Zero disables
+    /// the requirement. Non-zero values require staking to be configured —
+    /// the deposit uses the same SEP-41 token the stake does.
+    ///
+    /// Interaction with proposal expiry: the deposit is held in escrow for
+    /// the life of the proposal. `execute_proposal` refunds it on success.
+    /// If a proposal never reaches threshold (or reaches threshold but is
+    /// never executed) the deposit sits in escrow until
+    /// `forfeit_stale_proposal_deposit` is called, which anyone may do once
+    /// `PROPOSAL_EXPIRY_LEDGERS` has elapsed since the deposit was paid;
+    /// forfeit sends the amount to the treasury.
+    pub fn propose_set_proposal_deposit(
+        env: Env,
+        proposer: Address,
+        amount: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+        if amount < 0 {
+            return Err(RegistryError::InvalidProposalDeposit);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetProposalDeposit(amount),
+        )?;
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_proposal_deposit"),
+                amount,
+            ),
+        );
+        Ok(proposal_id)
+    }
+
+    /// #245: Send the deposit of a stale (unexecuted, expired) proposal to
+    /// the treasury. Permissionless — any address can trigger forfeit once
+    /// the proposal is past `PROPOSAL_EXPIRY_LEDGERS` from the ledger the
+    /// deposit was paid on. Executed proposals have their deposit refunded
+    /// during `execute_proposal` and no record remains to forfeit.
+    ///
+    /// Returns `ProposalDepositNotForfeitable` if no deposit sits against
+    /// this proposal, if the proposal has already executed, or if the expiry
+    /// window has not yet elapsed.
+    pub fn forfeit_stale_proposal_deposit(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<(), RegistryError> {
+        let proposal = Self::load_proposal(&env, proposal_id)?;
+        if proposal.executed {
+            return Err(RegistryError::ProposalDepositNotForfeitable);
+        }
+        let record: ProposalDepositRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalDepositPaid(proposal_id))
+            .ok_or(RegistryError::ProposalDepositNotForfeitable)?;
+        if env.ledger().sequence() < record.paid_at + PROPOSAL_EXPIRY_LEDGERS {
+            return Err(RegistryError::ProposalDepositNotForfeitable);
+        }
+        let (token_id, treasury) = Self::staking_config(&env)?;
+        token::Client::new(&env, &token_id).transfer(
+            &env.current_contract_address(),
+            &treasury,
+            &record.amount,
+        );
+        env.storage()
+            .instance()
+            .remove(&DataKey::ProposalDepositPaid(proposal_id));
+        env.events().publish(
+            (Symbol::new(&env, "proposal_deposit_forfeited"),),
+            (proposal_id, treasury, record.amount),
+        );
+        Ok(())
+    }
+
+    /// #245: current configured proposal deposit; zero when disabled.
+    pub fn get_proposal_deposit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalDeposit)
+            .unwrap_or(0)
+    }
+
     /// Set the minimum stake threshold. Zero disables it (no minimum).
     pub fn propose_configure_minimum_stake(
         env: Env,
         proposer: Address,
         minimum: i128,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if minimum < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1543,7 +1659,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ConfigureMinimumStake(minimum),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1562,9 +1678,9 @@ impl LuminaRegistry {
         proposer: Address,
         amount: i128,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if amount <= 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1572,7 +1688,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::WithdrawFromTreasury(amount),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1591,11 +1707,11 @@ impl LuminaRegistry {
         proposer: Address,
         paused: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         let proposal_id =
-            Self::create_proposal(&env, proposer.clone(), ProposalAction::SetPaused(paused));
+            Self::create_proposal(&env, proposer.clone(), ProposalAction::SetPaused(paused))?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1620,9 +1736,9 @@ impl LuminaRegistry {
         admin: Address,
         weight: u32,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if weight == 0 {
             return Err(RegistryError::InvalidAdminWeight);
         }
@@ -1633,7 +1749,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetAdminWeight(admin.clone(), weight),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1657,9 +1773,9 @@ impl LuminaRegistry {
         admin: Address,
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
-        admin.require_auth();
+        access_control::require_auth(&admin);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &admin)?;
+        access_control::assert_admin(&admins, &admin)?;
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -1757,6 +1873,11 @@ impl LuminaRegistry {
 
         Self::apply_action(&env, &proposal.action)?;
 
+        // #245: refund the deposit the proposer paid, if any. Done after
+        // `apply_action` so a failing execution rolls the refund back along
+        // with every other side effect.
+        Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer);
+
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
             (proposal_id, current, executor),
@@ -1775,7 +1896,7 @@ impl LuminaRegistry {
         caller: Address,
         contract_id: Address,
     ) -> Result<(), RegistryError> {
-        caller.require_auth();
+        access_control::require_auth(&caller);
 
         let mut entry: ContractEntry = env
             .storage()
@@ -1785,9 +1906,11 @@ impl LuminaRegistry {
 
         // Owners can self-deactivate instantly.  Admins deactivating someone
         // else's contract must go through the governance flow.
-        if caller != entry.owner {
-            return Err(RegistryError::Unauthorized);
-        }
+        access_control::assert_owner_with_error(
+            &caller,
+            &entry.owner,
+            RegistryError::Unauthorized,
+        )?;
 
         let was_active = entry.active;
         entry.active = false;
@@ -1837,7 +1960,7 @@ impl LuminaRegistry {
     /// covers the one path it does not — the ledger garbage-collecting an
     /// entry out from under an index that still names it.
     pub fn deregister(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -1845,9 +1968,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
         if entry.active {
             return Err(RegistryError::RegistrationActive);
         }
@@ -2301,7 +2422,7 @@ impl LuminaRegistry {
         contract_id: Address,
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
         // Pause guard: reject writes when paused.
         if env
             .storage()
@@ -2318,9 +2439,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         let categories = Self::dedup_categories(&env, &categories)?;
 
@@ -2365,7 +2484,7 @@ impl LuminaRegistry {
         contract_id: Address,
         tags: Vec<String>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -2373,9 +2492,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         const MAX_TAG_COUNT: u32 = 10;
         const MAX_TAG_LEN: u32 = 16;
@@ -2413,7 +2530,7 @@ impl LuminaRegistry {
         contract_id: Address,
         replacement: Address,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let old_entry: ContractEntry = env
             .storage()
@@ -2421,9 +2538,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != old_entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &old_entry.owner)?;
 
         let replacement_entry: ContractEntry = env
             .storage()
@@ -2456,7 +2571,7 @@ impl LuminaRegistry {
         contract_id: Address,
         label: String,
     ) -> Result<(), RegistryError> {
-        attester.require_auth();
+        access_control::require_auth(&attester);
 
         if !env
             .storage()
@@ -2524,7 +2639,7 @@ impl LuminaRegistry {
         attester: Address,
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
-        attester.require_auth();
+        access_control::require_auth(&attester);
 
         if !env
             .storage()
@@ -3050,7 +3165,7 @@ impl LuminaRegistry {
         slash_index: u32,
         response: String,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         if response.is_empty() {
             return Err(RegistryError::InvalidInput);
@@ -3063,9 +3178,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         let mut history = Self::slash_history(&env, &contract_id);
 
@@ -3107,10 +3220,11 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
+        // #236: saturate instead of trapping; matches `reputation_of`.
         let mut slashed_total: i128 = 0;
         let slashes = Self::slash_history(&env, &contract_id);
         for record in slashes.iter() {
-            slashed_total += record.amount;
+            slashed_total = slashed_total.saturating_add(record.amount);
         }
 
         let withdraw_locked_until = Self::withdraw_locked_until(&env, &contract_id);
@@ -3579,7 +3693,7 @@ impl LuminaRegistry {
     /// Renew a registration, adding EXPIRY_LEDGERS to its expiration.
     /// Only the registered owner can call this.
     pub fn renew(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -3587,9 +3701,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         let current_ledger = env.ledger().sequence();
         let expiry_key = DataKey::Expiry(contract_id.clone());
@@ -3625,7 +3737,7 @@ impl LuminaRegistry {
         name: String,
         description: String,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let mut entry: ContractEntry = env
             .storage()
@@ -3633,9 +3745,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         entry.name = name.clone();
         entry.description = description;
@@ -3673,7 +3783,7 @@ impl LuminaRegistry {
         contract_id: Address,
         uri: Option<String>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -3681,9 +3791,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         if let Some(u) = &uri {
             let len = u.len() as usize;
@@ -3730,7 +3838,7 @@ impl LuminaRegistry {
         contract_id: Address,
         new_owner: Address,
     ) -> Result<(), RegistryError> {
-        caller.require_auth();
+        access_control::require_auth(&caller);
 
         let mut entry: ContractEntry = env
             .storage()
@@ -3739,29 +3847,7 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ContractNotFound)?;
 
         // Require caller to be the owner OR a member of the admin set.
-        let is_owner = caller == entry.owner;
-        let admins = Self::admin_index(&env);
-        let is_admin = admins.contains(&caller);
-
-        // Fall back to the legacy single-admin check for the upgrade tests.
-        let is_legacy_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|a| a == caller)
-            .unwrap_or(false);
-
-        if !is_owner && !is_admin && !is_legacy_admin {
-            // Neither the new multi-sig admins nor the legacy admin nor the
-            // owner — check whether we're initialized at all so the error
-            // message stays informative.
-            if !env.storage().instance().has(&DataKey::Admins)
-                && !env.storage().instance().has(&DataKey::Admin)
-            {
-                return Err(RegistryError::NotInitialized);
-            }
-            return Err(RegistryError::Unauthorized);
-        }
+        access_control::assert_owner_or_admin(&env, &caller, &entry.owner)?;
 
         let previous_owner = entry.owner.clone();
         if previous_owner == new_owner {
@@ -4045,24 +4131,41 @@ impl LuminaRegistry {
         Ok(())
     }
 
-    /// Return `NotAdmin` if `addr` is not in the current admin set.
-    fn assert_is_admin(admins: &Vec<Address>, addr: &Address) -> Result<(), RegistryError> {
-        if admins.is_empty() {
-            return Err(RegistryError::NotInitialized);
-        }
-        if !admins.contains(addr) {
-            return Err(RegistryError::NotAdmin);
-        }
-        Ok(())
-    }
-
     /// Allocate a new proposal ID, store the proposal, and return the ID.
-    fn create_proposal(env: &Env, proposer: Address, action: ProposalAction) -> u32 {
+    fn create_proposal(
+        env: &Env,
+        proposer: Address,
+        action: ProposalAction,
+    ) -> Result<u32, RegistryError> {
         let id: u32 = env
             .storage()
             .instance()
             .get(&DataKey::ProposalCount)
             .unwrap_or(0);
+        // #245: if governance has configured a proposal deposit, collect it
+        // from the proposer before the proposal lands in storage. The paid
+        // amount is remembered against this proposal id so the refund amount
+        // on execute is decoupled from any later config changes.
+        let deposit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalDeposit)
+            .unwrap_or(0);
+        if deposit > 0 {
+            let (token_id, _) = Self::staking_config(env)?;
+            token::Client::new(env, &token_id).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &deposit,
+            );
+            env.storage().instance().set(
+                &DataKey::ProposalDepositPaid(id),
+                &ProposalDepositRecord {
+                    amount: deposit,
+                    paid_at: env.ledger().sequence(),
+                },
+            );
+        }
         let proposal = Proposal {
             id,
             proposer,
@@ -4076,7 +4179,7 @@ impl LuminaRegistry {
         env.storage()
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
-        id
+        Ok(id)
     }
 
     fn load_proposal(env: &Env, proposal_id: u32) -> Result<Proposal, RegistryError> {
@@ -4112,6 +4215,38 @@ impl LuminaRegistry {
         env.storage()
             .instance()
             .set(&DataKey::ProposalData(proposal.id), proposal);
+    }
+
+    /// #245: refund the escrowed proposal deposit to `proposer` if one was
+    /// taken for `proposal_id`. Silent no-op when no deposit sits against
+    /// this id, so callers that do not know whether a deposit was configured
+    /// at propose time can call this unconditionally.
+    fn refund_proposal_deposit(env: &Env, proposal_id: u32, proposer: &Address) {
+        let Some(record): Option<ProposalDepositRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalDepositPaid(proposal_id))
+        else {
+            return;
+        };
+        // Staking must be configured for a deposit to have been taken; if the
+        // token has since been reconfigured, `staking_config` returns the
+        // current token, which is the one that actually holds the escrowed
+        // funds (the escrow is on-contract, not on an external vault).
+        if let Ok((token_id, _)) = Self::staking_config(env) {
+            token::Client::new(env, &token_id).transfer(
+                &env.current_contract_address(),
+                proposer,
+                &record.amount,
+            );
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::ProposalDepositPaid(proposal_id));
+        env.events().publish(
+            (Symbol::new(env, "proposal_deposit_refunded"),),
+            (proposal_id, proposer.clone(), record.amount),
+        );
     }
 
     fn validate_batch(actions: &Vec<ProposalAction>) -> Result<(), RegistryError> {
@@ -4451,6 +4586,24 @@ impl LuminaRegistry {
                 env.events()
                     .publish((Symbol::new(env, "registration_fee_set"),), (*fee,));
             }
+            // #245
+            ProposalAction::SetProposalDeposit(amount) => {
+                if *amount < 0 {
+                    return Err(RegistryError::InvalidProposalDeposit);
+                }
+                // A non-zero deposit is only useful if staking is configured —
+                // otherwise the next `propose_*` call would fail with
+                // `StakingNotConfigured`. Guard here so execution does not
+                // land the registry in a broken proposal-closed state.
+                if *amount > 0 {
+                    let _ = Self::staking_config(env)?;
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ProposalDeposit, amount);
+                env.events()
+                    .publish((Symbol::new(env, "proposal_deposit_set"),), (*amount,));
+            }
             ProposalAction::ConfigureMinimumStake(minimum) => {
                 if *minimum < 0 {
                     return Err(RegistryError::InvalidAmount);
@@ -4637,9 +4790,14 @@ impl LuminaRegistry {
     }
 
     fn reputation_of(env: &Env, contract_id: &Address) -> Reputation {
+        // #236: slashed_total is read on every reputation query, so an
+        // overflow here would turn a read into a trap. The workspace enables
+        // `overflow-checks` on release, which would otherwise `abort` the
+        // call. `saturating_add` keeps the read infallible and pins the
+        // reported total at `i128::MAX`; see `tests/reputation_boundaries.rs`.
         let mut slashed_total: i128 = 0;
         for record in Self::slash_history(env, contract_id).iter() {
-            slashed_total += record.amount;
+            slashed_total = slashed_total.saturating_add(record.amount);
         }
 
         let withdraw_locked_until = Self::withdraw_locked_until(env, contract_id);
@@ -5368,7 +5526,7 @@ mod test {
         env.budget().reset_default();
         env.as_contract(&contract_id, || {
             let admins = LuminaRegistry::admin_index(&env);
-            LuminaRegistry::assert_is_admin(&admins, &admin).unwrap();
+            access_control::assert_admin(&admins, &admin).unwrap();
         });
         let cached_cpu = env.budget().cpu_instruction_cost();
         let cached_memory = env.budget().memory_bytes_cost();

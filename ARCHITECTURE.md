@@ -40,6 +40,35 @@ The contract deliberately separates four concerns:
 - Governance controls privileged actions and policy, while ordinary owners
   retain direct control of their own metadata, categories, stake, and exit.
 
+## Contract surface — two impl blocks on purpose
+
+`registry/src/lib.rs` has **two** `impl LuminaRegistry` blocks:
+
+- The first is annotated `#[contractimpl]`. Every `pub fn` in it is exported
+  as a contract entrypoint. Soroban emits each one into the contract spec,
+  and every consumer, indexer, and example binds against that spec.
+- The second is a plain `impl` block. Its `pub fn`s are **not** exported —
+  they are helpers callable from Rust tests and from other Rust code
+  linking against this crate, but no on-chain client can see them. They
+  live here, rather than inside `#[cfg(test)]`, when they are useful to
+  consumers of the crate as a library (the few `pub(crate)`-ish helpers
+  such as `all_contracts` and `set_all_contracts_index`).
+
+Adding a function to the wrong block would silently grow the public
+interface. Two guards catch it:
+
+- `registry/interface.snap` is a checked-in snapshot of the exported spec
+  that `registry/tests/interface.rs` compares against on every test run.
+- `registry/tests/exports_allowlist.rs` (issue #255) asserts the set of
+  exported function names matches an explicit, hand-maintained allowlist.
+  A new entrypoint whose name is not in that list fails the test; a
+  rename or a removal fails it too.
+
+When you add an entrypoint, update both files in the same change so the
+diff reviews the interface change together with the code. See
+`AUTHORIZATION_MATRIX.md` for the caller requirement of every exported
+function.
+
 ## Storage model
 
 Soroban instance storage holds registry-wide configuration, counters, the
