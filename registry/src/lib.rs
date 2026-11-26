@@ -288,6 +288,11 @@ pub enum RegistryError {
     Paused = 45,
     /// The proposed admin weight is zero — remove the admin instead (#247).
     InvalidAdminWeight = 46,
+    /// The proposal deposit amount is negative.
+    InvalidProposalDeposit = 47,
+    /// `forfeit_stale_proposal_deposit` was called before the proposal's
+    /// expiry window elapsed, or the proposal has no deposit to forfeit.
+    ProposalDepositNotForfeitable = 48,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -619,6 +624,8 @@ pub enum ProposalAction {
     /// Set the voting weight of `admin` to `weight` (0 is not allowed —
     /// remove the admin instead). See `propose_set_admin_weight` (#247).
     SetAdminWeight(Address, u32),
+    /// Set the deposit required to open a new proposal; zero disables it.
+    SetProposalDeposit(i128),
     /// Execute actions in order in one transaction, reverting all on failure.
     /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
     Batch(Vec<ProposalAction>),
@@ -647,6 +654,23 @@ pub const REGISTRATION_WINDOW_TTL_EXTEND_TO: u32 = 3_110_400;
 pub struct RegistrationWindow {
     pub started_at: u32,
     pub count: u32,
+}
+
+/// Window after which an unexecuted proposal's deposit can be forfeited to
+/// the treasury by anyone. Measured from the ledger the deposit was taken on.
+/// ~24 days at 6 s per ledger — comfortably past the standard timelock plus
+/// a long execution grace period, so an honest proposer who wants to see their
+/// proposal executed has ample time.
+pub const PROPOSAL_EXPIRY_LEDGERS: u32 = 345_600;
+
+/// Deposit record stored alongside a proposal while funds sit in escrow.
+/// Lets `execute_proposal` refund the original proposer the exact amount that
+/// was taken, regardless of config changes between propose and execute.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalDepositRecord {
+    pub amount: i128,
+    pub paid_at: u32,
 }
 
 /// State stored for every open (or executed) proposal.
@@ -754,6 +778,13 @@ pub enum DataKey {
     ProposalData(u32),
     /// bool — governance‑controlled pause flag. When true, write entrypoints reject.
     Paused,
+    /// i128 — the deposit required to open a new proposal; zero disables it.
+    /// Settable only through `SetProposalDeposit` governance proposals. See
+    /// `PROPOSAL_EXPIRY_LEDGERS` for the forfeit interaction.
+    ProposalDeposit,
+    /// ProposalDepositRecord — the deposit actually paid for one proposal,
+    /// held in escrow in the contract. Cleared on refund (execute) or forfeit.
+    ProposalDepositPaid(u32),
 
     // ── Registry ────────────────────────────────────────────────────────────
     /// u32 — live registrations (deactivated included, deregistered excluded).
@@ -970,7 +1001,7 @@ impl LuminaRegistry {
 
         let action_count = actions.len();
         let proposal_id =
-            Self::create_proposal(&env, proposer.clone(), ProposalAction::Batch(actions));
+            Self::create_proposal(&env, proposer.clone(), ProposalAction::Batch(actions))?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1007,7 +1038,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::Deactivate(contract_id.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1040,7 +1071,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::AddAdmin(new_admin.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1073,7 +1104,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::RemoveAdmin(admin_to_remove.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1115,7 +1146,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ChangeThreshold(new_threshold),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1144,7 +1175,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::Upgrade(new_wasm_hash.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1219,7 +1250,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ConfigureStaking(token.clone(), treasury.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1265,7 +1296,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetVerified(contract_id.clone(), verified),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1310,7 +1341,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::Slash(contract_id.clone(), amount, reason.clone()),
-        );
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
@@ -1339,7 +1370,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetAllowlistEnabled(enabled),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1366,7 +1397,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetAllowlisted(owner.clone(), allowed),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1401,7 +1432,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ConfigureRegistrationRateLimit(limit, window_ledgers),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1430,7 +1461,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetRegistrationFee(fee),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1441,6 +1472,94 @@ impl LuminaRegistry {
             ),
         );
         Ok(proposal_id)
+    }
+
+    /// #245: Set the deposit required to open a new proposal. Zero disables
+    /// the requirement. Non-zero values require staking to be configured —
+    /// the deposit uses the same SEP-41 token the stake does.
+    ///
+    /// Interaction with proposal expiry: the deposit is held in escrow for
+    /// the life of the proposal. `execute_proposal` refunds it on success.
+    /// If a proposal never reaches threshold (or reaches threshold but is
+    /// never executed) the deposit sits in escrow until
+    /// `forfeit_stale_proposal_deposit` is called, which anyone may do once
+    /// `PROPOSAL_EXPIRY_LEDGERS` has elapsed since the deposit was paid;
+    /// forfeit sends the amount to the treasury.
+    pub fn propose_set_proposal_deposit(
+        env: Env,
+        proposer: Address,
+        amount: i128,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
+        if amount < 0 {
+            return Err(RegistryError::InvalidProposalDeposit);
+        }
+        let proposal_id = Self::create_proposal(
+            &env,
+            proposer.clone(),
+            ProposalAction::SetProposalDeposit(amount),
+        )?;
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_proposal_deposit"),
+                amount,
+            ),
+        );
+        Ok(proposal_id)
+    }
+
+    /// #245: Send the deposit of a stale (unexecuted, expired) proposal to
+    /// the treasury. Permissionless — any address can trigger forfeit once
+    /// the proposal is past `PROPOSAL_EXPIRY_LEDGERS` from the ledger the
+    /// deposit was paid on. Executed proposals have their deposit refunded
+    /// during `execute_proposal` and no record remains to forfeit.
+    ///
+    /// Returns `ProposalDepositNotForfeitable` if no deposit sits against
+    /// this proposal, if the proposal has already executed, or if the expiry
+    /// window has not yet elapsed.
+    pub fn forfeit_stale_proposal_deposit(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<(), RegistryError> {
+        let proposal = Self::load_proposal(&env, proposal_id)?;
+        if proposal.executed {
+            return Err(RegistryError::ProposalDepositNotForfeitable);
+        }
+        let record: ProposalDepositRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalDepositPaid(proposal_id))
+            .ok_or(RegistryError::ProposalDepositNotForfeitable)?;
+        if env.ledger().sequence() < record.paid_at + PROPOSAL_EXPIRY_LEDGERS {
+            return Err(RegistryError::ProposalDepositNotForfeitable);
+        }
+        let (token_id, treasury) = Self::staking_config(&env)?;
+        token::Client::new(&env, &token_id).transfer(
+            &env.current_contract_address(),
+            &treasury,
+            &record.amount,
+        );
+        env.storage()
+            .instance()
+            .remove(&DataKey::ProposalDepositPaid(proposal_id));
+        env.events().publish(
+            (Symbol::new(&env, "proposal_deposit_forfeited"),),
+            (proposal_id, treasury, record.amount),
+        );
+        Ok(())
+    }
+
+    /// #245: current configured proposal deposit; zero when disabled.
+    pub fn get_proposal_deposit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalDeposit)
+            .unwrap_or(0)
     }
 
     /// Set the minimum stake threshold. Zero disables it (no minimum).
@@ -1459,7 +1578,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::ConfigureMinimumStake(minimum),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1488,7 +1607,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::WithdrawFromTreasury(amount),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1511,7 +1630,7 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
         let proposal_id =
-            Self::create_proposal(&env, proposer.clone(), ProposalAction::SetPaused(paused));
+            Self::create_proposal(&env, proposer.clone(), ProposalAction::SetPaused(paused))?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1549,7 +1668,7 @@ impl LuminaRegistry {
             &env,
             proposer.clone(),
             ProposalAction::SetAdminWeight(admin.clone(), weight),
-        );
+        )?;
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
             (
@@ -1666,6 +1785,11 @@ impl LuminaRegistry {
         Self::save_proposal(&env, &proposal);
 
         Self::apply_action(&env, &proposal.action)?;
+
+        // #245: refund the deposit the proposer paid, if any. Done after
+        // `apply_action` so a failing execution rolls the refund back along
+        // with every other side effect.
+        Self::refund_proposal_deposit(&env, proposal_id, &proposal.proposer);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
@@ -3947,12 +4071,40 @@ impl LuminaRegistry {
     }
 
     /// Allocate a new proposal ID, store the proposal, and return the ID.
-    fn create_proposal(env: &Env, proposer: Address, action: ProposalAction) -> u32 {
+    fn create_proposal(
+        env: &Env,
+        proposer: Address,
+        action: ProposalAction,
+    ) -> Result<u32, RegistryError> {
         let id: u32 = env
             .storage()
             .instance()
             .get(&DataKey::ProposalCount)
             .unwrap_or(0);
+        // #245: if governance has configured a proposal deposit, collect it
+        // from the proposer before the proposal lands in storage. The paid
+        // amount is remembered against this proposal id so the refund amount
+        // on execute is decoupled from any later config changes.
+        let deposit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalDeposit)
+            .unwrap_or(0);
+        if deposit > 0 {
+            let (token_id, _) = Self::staking_config(env)?;
+            token::Client::new(env, &token_id).transfer(
+                &proposer,
+                &env.current_contract_address(),
+                &deposit,
+            );
+            env.storage().instance().set(
+                &DataKey::ProposalDepositPaid(id),
+                &ProposalDepositRecord {
+                    amount: deposit,
+                    paid_at: env.ledger().sequence(),
+                },
+            );
+        }
         let proposal = Proposal {
             id,
             proposer,
@@ -3966,7 +4118,7 @@ impl LuminaRegistry {
         env.storage()
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
-        id
+        Ok(id)
     }
 
     fn load_proposal(env: &Env, proposal_id: u32) -> Result<Proposal, RegistryError> {
@@ -4002,6 +4154,38 @@ impl LuminaRegistry {
         env.storage()
             .instance()
             .set(&DataKey::ProposalData(proposal.id), proposal);
+    }
+
+    /// #245: refund the escrowed proposal deposit to `proposer` if one was
+    /// taken for `proposal_id`. Silent no-op when no deposit sits against
+    /// this id, so callers that do not know whether a deposit was configured
+    /// at propose time can call this unconditionally.
+    fn refund_proposal_deposit(env: &Env, proposal_id: u32, proposer: &Address) {
+        let Some(record): Option<ProposalDepositRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalDepositPaid(proposal_id))
+        else {
+            return;
+        };
+        // Staking must be configured for a deposit to have been taken; if the
+        // token has since been reconfigured, `staking_config` returns the
+        // current token, which is the one that actually holds the escrowed
+        // funds (the escrow is on-contract, not on an external vault).
+        if let Ok((token_id, _)) = Self::staking_config(env) {
+            token::Client::new(env, &token_id).transfer(
+                &env.current_contract_address(),
+                proposer,
+                &record.amount,
+            );
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::ProposalDepositPaid(proposal_id));
+        env.events().publish(
+            (Symbol::new(env, "proposal_deposit_refunded"),),
+            (proposal_id, proposer.clone(), record.amount),
+        );
     }
 
     fn validate_batch(actions: &Vec<ProposalAction>) -> Result<(), RegistryError> {
@@ -4340,6 +4524,24 @@ impl LuminaRegistry {
                 env.storage().instance().set(&DataKey::RegistrationFee, fee);
                 env.events()
                     .publish((Symbol::new(env, "registration_fee_set"),), (*fee,));
+            }
+            // #245
+            ProposalAction::SetProposalDeposit(amount) => {
+                if *amount < 0 {
+                    return Err(RegistryError::InvalidProposalDeposit);
+                }
+                // A non-zero deposit is only useful if staking is configured —
+                // otherwise the next `propose_*` call would fail with
+                // `StakingNotConfigured`. Guard here so execution does not
+                // land the registry in a broken proposal-closed state.
+                if *amount > 0 {
+                    let _ = Self::staking_config(env)?;
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ProposalDeposit, amount);
+                env.events()
+                    .publish((Symbol::new(env, "proposal_deposit_set"),), (*amount,));
             }
             ProposalAction::ConfigureMinimumStake(minimum) => {
                 if *minimum < 0 {
