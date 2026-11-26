@@ -71,6 +71,8 @@ use soroban_sdk::{
 
 extern crate alloc;
 
+mod access_control;
+
 // ─── Version ───────────────────────────────────────────────────────────────
 
 /// Version of the deployed code, returned by [`LuminaRegistry::get_version`].
@@ -928,7 +930,7 @@ impl LuminaRegistry {
     /// Atomically initialize a new deployment with one bootstrap admin.
     /// The deployment transaction must include that admin's authorization.
     pub fn __constructor(env: Env, bootstrap_admin: Address) {
-        bootstrap_admin.require_auth();
+        access_control::require_auth(&bootstrap_admin);
         let mut admins = Vec::new(&env);
         admins.push_back(bootstrap_admin.clone());
         env.storage().instance().set(&DataKey::Admins, &admins);
@@ -961,7 +963,7 @@ impl LuminaRegistry {
 
         // Every admin must authorize the initialization.
         for admin in admins.iter() {
-            admin.require_auth();
+            access_control::require_auth(&admin);
         }
 
         env.storage().instance().set(&DataKey::Admins, &admins);
@@ -995,8 +997,8 @@ impl LuminaRegistry {
         proposer: Address,
         actions: Vec<ProposalAction>,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
-        Self::assert_is_admin(&Self::admin_index(&env), &proposer)?;
+        access_control::require_auth(&proposer);
+        access_control::assert_admin(&Self::admin_index(&env), &proposer)?;
         Self::validate_batch(&actions)?;
 
         let action_count = actions.len();
@@ -1021,9 +1023,9 @@ impl LuminaRegistry {
         proposer: Address,
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         // Make sure the target actually exists.
         if !env
@@ -1059,9 +1061,9 @@ impl LuminaRegistry {
         proposer: Address,
         new_admin: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if admins.contains(&new_admin) {
             return Err(RegistryError::AlreadyAdmin);
@@ -1092,9 +1094,9 @@ impl LuminaRegistry {
         proposer: Address,
         admin_to_remove: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if !admins.contains(&admin_to_remove) {
             return Err(RegistryError::AdminNotFound);
@@ -1125,9 +1127,9 @@ impl LuminaRegistry {
         proposer: Address,
         new_threshold: u32,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if new_threshold == 0 || new_threshold > admins.len() {
             return Err(RegistryError::InvalidThreshold);
@@ -1167,9 +1169,9 @@ impl LuminaRegistry {
         proposer: Address,
         new_wasm_hash: BytesN<32>,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         let proposal_id = Self::create_proposal(
             &env,
@@ -1212,9 +1214,9 @@ impl LuminaRegistry {
         token: Address,
         treasury: Address,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         // Reject if either address is already a registered contract.
         // See `RegistryError::OverlappingAddress` for the full rationale.
@@ -1275,9 +1277,9 @@ impl LuminaRegistry {
         contract_id: Address,
         verified: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if !env
             .storage()
@@ -1324,9 +1326,9 @@ impl LuminaRegistry {
         amount: i128,
         reason: String,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
 
         if !env
             .storage()
@@ -1363,9 +1365,9 @@ impl LuminaRegistry {
         proposer: Address,
         enabled: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -1390,9 +1392,9 @@ impl LuminaRegistry {
         owner: Address,
         allowed: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -1422,9 +1424,9 @@ impl LuminaRegistry {
         limit: u32,
         window_ledgers: u32,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if limit > 0 && (window_ledgers == 0 || window_ledgers > env.storage().max_ttl()) {
             return Err(RegistryError::InvalidRateLimit);
         }
@@ -1451,9 +1453,9 @@ impl LuminaRegistry {
         proposer: Address,
         fee: i128,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if fee < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1568,9 +1570,9 @@ impl LuminaRegistry {
         proposer: Address,
         minimum: i128,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if minimum < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1597,9 +1599,9 @@ impl LuminaRegistry {
         proposer: Address,
         amount: i128,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if amount <= 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1626,9 +1628,9 @@ impl LuminaRegistry {
         proposer: Address,
         paused: bool,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         let proposal_id =
             Self::create_proposal(&env, proposer.clone(), ProposalAction::SetPaused(paused))?;
         env.events().publish(
@@ -1655,9 +1657,9 @@ impl LuminaRegistry {
         admin: Address,
         weight: u32,
     ) -> Result<u32, RegistryError> {
-        proposer.require_auth();
+        access_control::require_auth(&proposer);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &proposer)?;
+        access_control::assert_admin(&admins, &proposer)?;
         if weight == 0 {
             return Err(RegistryError::InvalidAdminWeight);
         }
@@ -1692,9 +1694,9 @@ impl LuminaRegistry {
         admin: Address,
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
-        admin.require_auth();
+        access_control::require_auth(&admin);
         let admins = Self::admin_index(&env);
-        Self::assert_is_admin(&admins, &admin)?;
+        access_control::assert_admin(&admins, &admin)?;
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -1752,7 +1754,7 @@ impl LuminaRegistry {
         executor: Address,
         proposal_id: u32,
     ) -> Result<(), RegistryError> {
-        executor.require_auth();
+        access_control::require_auth(&executor);
 
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
@@ -1809,7 +1811,7 @@ impl LuminaRegistry {
         caller: Address,
         contract_id: Address,
     ) -> Result<(), RegistryError> {
-        caller.require_auth();
+        access_control::require_auth(&caller);
 
         let mut entry: ContractEntry = env
             .storage()
@@ -1819,9 +1821,11 @@ impl LuminaRegistry {
 
         // Owners can self-deactivate instantly.  Admins deactivating someone
         // else's contract must go through the governance flow.
-        if caller != entry.owner {
-            return Err(RegistryError::Unauthorized);
-        }
+        access_control::assert_owner_with_error(
+            &caller,
+            &entry.owner,
+            RegistryError::Unauthorized,
+        )?;
 
         let was_active = entry.active;
         entry.active = false;
@@ -1871,7 +1875,7 @@ impl LuminaRegistry {
     /// covers the one path it does not — the ledger garbage-collecting an
     /// entry out from under an index that still names it.
     pub fn deregister(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -1879,9 +1883,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
         if entry.active {
             return Err(RegistryError::RegistrationActive);
         }
@@ -2085,7 +2087,7 @@ impl LuminaRegistry {
         description: String,
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
         // Pause guard: reject writes when paused.
         if env
             .storage()
@@ -2203,7 +2205,7 @@ impl LuminaRegistry {
         owner: Address,
         entries: Vec<RegistrationEntry>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         if entries.is_empty() {
             return Err(RegistryError::InvalidMetadata);
@@ -2325,7 +2327,7 @@ impl LuminaRegistry {
         contract_id: Address,
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
         // Pause guard: reject writes when paused.
         if env
             .storage()
@@ -2342,9 +2344,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         let categories = Self::dedup_categories(&env, &categories)?;
 
@@ -2389,7 +2389,7 @@ impl LuminaRegistry {
         contract_id: Address,
         tags: Vec<String>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -2397,9 +2397,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         const MAX_TAG_COUNT: u32 = 10;
         const MAX_TAG_LEN: u32 = 16;
@@ -2437,7 +2435,7 @@ impl LuminaRegistry {
         contract_id: Address,
         replacement: Address,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let old_entry: ContractEntry = env
             .storage()
@@ -2445,9 +2443,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != old_entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &old_entry.owner)?;
 
         let replacement_entry: ContractEntry = env
             .storage()
@@ -2480,7 +2476,7 @@ impl LuminaRegistry {
         contract_id: Address,
         label: String,
     ) -> Result<(), RegistryError> {
-        attester.require_auth();
+        access_control::require_auth(&attester);
 
         if !env
             .storage()
@@ -2548,7 +2544,7 @@ impl LuminaRegistry {
         attester: Address,
         contract_id: Address,
     ) -> Result<u32, RegistryError> {
-        attester.require_auth();
+        access_control::require_auth(&attester);
 
         if !env
             .storage()
@@ -2597,7 +2593,7 @@ impl LuminaRegistry {
         contract_id: Address,
         amount: i128,
     ) -> Result<(), RegistryError> {
-        staker.require_auth();
+        access_control::require_auth(&staker);
 
         // #234: refuse new stake while the registry is paused. Withdrawals
         // are deliberately not gated — governance can pause a registry to
@@ -2692,7 +2688,7 @@ impl LuminaRegistry {
         staker: Address,
         contract_id: Address,
     ) -> Result<i128, RegistryError> {
-        staker.require_auth();
+        access_control::require_auth(&staker);
 
         let entry: ContractEntry = env
             .storage()
@@ -3076,7 +3072,7 @@ impl LuminaRegistry {
         slash_index: u32,
         response: String,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         if response.is_empty() {
             return Err(RegistryError::InvalidInput);
@@ -3089,9 +3085,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         let mut history = Self::slash_history(&env, &contract_id);
 
@@ -3606,7 +3600,7 @@ impl LuminaRegistry {
     /// Renew a registration, adding EXPIRY_LEDGERS to its expiration.
     /// Only the registered owner can call this.
     pub fn renew(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -3614,9 +3608,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         let current_ledger = env.ledger().sequence();
         let expiry_key = DataKey::Expiry(contract_id.clone());
@@ -3652,7 +3644,7 @@ impl LuminaRegistry {
         name: String,
         description: String,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let mut entry: ContractEntry = env
             .storage()
@@ -3660,9 +3652,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         entry.name = name.clone();
         entry.description = description;
@@ -3700,7 +3690,7 @@ impl LuminaRegistry {
         contract_id: Address,
         uri: Option<String>,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        access_control::require_auth(&owner);
 
         let entry: ContractEntry = env
             .storage()
@@ -3708,9 +3698,7 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
+        access_control::assert_owner(&owner, &entry.owner)?;
 
         if let Some(u) = &uri {
             let len = u.len() as usize;
@@ -3757,7 +3745,7 @@ impl LuminaRegistry {
         contract_id: Address,
         new_owner: Address,
     ) -> Result<(), RegistryError> {
-        caller.require_auth();
+        access_control::require_auth(&caller);
 
         let mut entry: ContractEntry = env
             .storage()
@@ -3766,29 +3754,7 @@ impl LuminaRegistry {
             .ok_or(RegistryError::ContractNotFound)?;
 
         // Require caller to be the owner OR a member of the admin set.
-        let is_owner = caller == entry.owner;
-        let admins = Self::admin_index(&env);
-        let is_admin = admins.contains(&caller);
-
-        // Fall back to the legacy single-admin check for the upgrade tests.
-        let is_legacy_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|a| a == caller)
-            .unwrap_or(false);
-
-        if !is_owner && !is_admin && !is_legacy_admin {
-            // Neither the new multi-sig admins nor the legacy admin nor the
-            // owner — check whether we're initialized at all so the error
-            // message stays informative.
-            if !env.storage().instance().has(&DataKey::Admins)
-                && !env.storage().instance().has(&DataKey::Admin)
-            {
-                return Err(RegistryError::NotInitialized);
-            }
-            return Err(RegistryError::Unauthorized);
-        }
+        access_control::assert_owner_or_admin(&env, &caller, &entry.owner)?;
 
         let previous_owner = entry.owner.clone();
         if previous_owner == new_owner {
@@ -4068,17 +4034,6 @@ impl LuminaRegistry {
 
         if description.len() > MAX_DESCRIPTION_LEN {
             return Err(RegistryError::InvalidMetadata);
-        }
-        Ok(())
-    }
-
-    /// Return `NotAdmin` if `addr` is not in the current admin set.
-    fn assert_is_admin(admins: &Vec<Address>, addr: &Address) -> Result<(), RegistryError> {
-        if admins.is_empty() {
-            return Err(RegistryError::NotInitialized);
-        }
-        if !admins.contains(addr) {
-            return Err(RegistryError::NotAdmin);
         }
         Ok(())
     }
@@ -5478,7 +5433,7 @@ mod test {
         env.budget().reset_default();
         env.as_contract(&contract_id, || {
             let admins = LuminaRegistry::admin_index(&env);
-            LuminaRegistry::assert_is_admin(&admins, &admin).unwrap();
+            access_control::assert_admin(&admins, &admin).unwrap();
         });
         let cached_cpu = env.budget().cpu_instruction_cost();
         let cached_memory = env.budget().memory_bytes_cost();
